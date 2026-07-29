@@ -1,7 +1,7 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Bell, Boxes, RadioTower, Wifi, Zap } from "lucide-react";
+import { Bell, Boxes, RadioTower, SunMoon, Wifi, Zap } from "lucide-react";
 import { ActionQueuePanel, AlertPanel } from "@/components/action-alert-panels";
 import { DeviceAgentPanel } from "@/components/device-agent-panel";
 import { DeviceTable } from "@/components/device-table";
@@ -39,6 +39,8 @@ type Session = {
   userId: string;
 };
 
+type ThemeMode = "dark" | "light";
+
 type Workspace = {
   org: Org;
   project: Project;
@@ -58,6 +60,7 @@ type Api = ReturnType<typeof createExcaliburApi>;
 
 const SESSION_KEY = "excalibur.console.session.v1";
 const API_BASE_KEY = "excalibur.console.apiBaseUrl.v1";
+const THEME_KEY = "excalibur.console.theme.v1";
 const DEFAULT_API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8080";
 const SYSTEM_STREAM = "device_agent_system_stats";
 const DEFAULT_SHA256 = "a".repeat(64);
@@ -80,6 +83,10 @@ function formatError(error: unknown) {
     return error.message;
   }
   return "Unknown error";
+}
+
+function isThemeMode(value: string | null | undefined): value is ThemeMode {
+  return value === "dark" || value === "light";
 }
 
 function isRecord(value: JsonValue | undefined): value is Record<string, JsonValue> {
@@ -415,6 +422,13 @@ function makeSampleTelemetry(sequence: number) {
 }
 
 export function ConsoleApp() {
+  const [theme, setTheme] = useState<ThemeMode>(() => {
+    if (typeof window === "undefined") {
+      return "dark";
+    }
+    const savedTheme = window.localStorage.getItem(THEME_KEY);
+    return isThemeMode(savedTheme) ? savedTheme : "dark";
+  });
   const [apiBaseUrl, setApiBaseUrl] = useState(DEFAULT_API_BASE_URL);
   const [authMode, setAuthMode] = useState<"login" | "register">("register");
   const [email, setEmail] = useState("");
@@ -485,6 +499,15 @@ export function ConsoleApp() {
         window.localStorage.removeItem(SESSION_KEY);
       }
     }
+  }, []);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    window.localStorage.setItem(THEME_KEY, theme);
+  }, [theme]);
+
+  const handleToggleTheme = useCallback(() => {
+    setTheme((current) => (current === "dark" ? "light" : "dark"));
   }, []);
 
   useEffect(() => {
@@ -853,27 +876,38 @@ export function ConsoleApp() {
   if (!session) {
     return (
       <main className="grid min-h-screen place-items-center bg-paper px-4 py-10">
-        <form className="w-full max-w-md rounded-md border border-line bg-panel p-5 shadow-sm" onSubmit={handleAuthenticate}>
-          <div className="flex items-center gap-3">
-            <div className="grid h-10 w-10 place-items-center rounded-md bg-teal text-white">
-              <Boxes className="h-5 w-5" aria-hidden="true" />
+        <form className="w-full max-w-md rounded-md border border-line bg-panel p-5 shadow-panel" onSubmit={handleAuthenticate}>
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex items-center gap-3">
+              <div className="grid h-10 w-10 place-items-center rounded-md bg-brand text-ink">
+                <Boxes className="h-5 w-5" aria-hidden="true" />
+              </div>
+              <div>
+                <h1 className="text-lg font-semibold text-ink">Excalibur Console</h1>
+                <p className="text-sm text-muted">Control plane sign-in</p>
+              </div>
             </div>
-            <div>
-              <h1 className="text-lg font-semibold text-ink">Excalibur Console</h1>
-              <p className="text-sm text-ink/54">Control plane sign-in</p>
-            </div>
+            <button
+              className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-line bg-elevated text-muted transition hover:bg-line hover:text-ink"
+              type="button"
+              aria-label="Toggle theme"
+              title="Toggle theme"
+              onClick={handleToggleTheme}
+            >
+              <SunMoon className="h-4 w-4" aria-hidden="true" />
+            </button>
           </div>
 
-          <div className="mt-5 grid grid-cols-2 gap-2 rounded-md bg-paper p-1">
+          <div className="mt-5 grid grid-cols-2 gap-2 rounded-md bg-rail p-1">
             <button
-              className={`h-9 rounded-sm text-sm font-medium ${authMode === "register" ? "bg-white text-ink" : "text-ink/54"}`}
+              className={`h-9 rounded-sm text-sm font-medium transition ${authMode === "register" ? "bg-elevated text-ink" : "text-muted hover:text-ink"}`}
               type="button"
               onClick={() => setAuthMode("register")}
             >
               Register
             </button>
             <button
-              className={`h-9 rounded-sm text-sm font-medium ${authMode === "login" ? "bg-white text-ink" : "text-ink/54"}`}
+              className={`h-9 rounded-sm text-sm font-medium transition ${authMode === "login" ? "bg-elevated text-ink" : "text-muted hover:text-ink"}`}
               type="button"
               onClick={() => setAuthMode("login")}
             >
@@ -881,19 +915,19 @@ export function ConsoleApp() {
             </button>
           </div>
 
-          <label className="mt-4 block text-sm font-medium text-ink/70">
+          <label className="mt-4 block text-sm font-medium text-muted">
             API base URL
             <input
-              className="mt-1 h-10 w-full rounded-md border border-line bg-white px-3 text-sm text-ink"
+              className="mt-1 h-10 w-full rounded-md border border-line bg-elevated px-3 text-sm text-ink transition hover:border-faint"
               value={apiBaseUrl}
               onChange={(event) => setApiBaseUrl(event.target.value)}
               type="url"
             />
           </label>
-          <label className="mt-3 block text-sm font-medium text-ink/70">
+          <label className="mt-3 block text-sm font-medium text-muted">
             Email
             <input
-              className="mt-1 h-10 w-full rounded-md border border-line bg-white px-3 text-sm text-ink"
+              className="mt-1 h-10 w-full rounded-md border border-line bg-elevated px-3 text-sm text-ink transition hover:border-faint"
               value={email}
               onChange={(event) => setEmail(event.target.value)}
               type="email"
@@ -901,20 +935,20 @@ export function ConsoleApp() {
             />
           </label>
           {authMode === "register" ? (
-            <label className="mt-3 block text-sm font-medium text-ink/70">
+            <label className="mt-3 block text-sm font-medium text-muted">
               Display name
               <input
-                className="mt-1 h-10 w-full rounded-md border border-line bg-white px-3 text-sm text-ink"
+                className="mt-1 h-10 w-full rounded-md border border-line bg-elevated px-3 text-sm text-ink transition hover:border-faint"
                 value={displayName}
                 onChange={(event) => setDisplayName(event.target.value)}
                 type="text"
               />
             </label>
           ) : null}
-          <label className="mt-3 block text-sm font-medium text-ink/70">
+          <label className="mt-3 block text-sm font-medium text-muted">
             Password
             <input
-              className="mt-1 h-10 w-full rounded-md border border-line bg-white px-3 text-sm text-ink"
+              className="mt-1 h-10 w-full rounded-md border border-line bg-elevated px-3 text-sm text-ink transition hover:border-faint"
               value={password}
               onChange={(event) => setPassword(event.target.value)}
               type="password"
@@ -926,7 +960,7 @@ export function ConsoleApp() {
           {error ? <p className="mt-3 rounded-sm bg-danger/10 px-3 py-2 text-sm text-danger">{error}</p> : null}
 
           <button
-            className="mt-5 h-10 w-full rounded-md bg-teal text-sm font-semibold text-white transition hover:bg-teal/90 disabled:cursor-not-allowed disabled:bg-ink/20"
+            className="mt-5 h-10 w-full rounded-md bg-brand text-sm font-semibold text-ink transition hover:bg-brand-hover disabled:cursor-not-allowed disabled:bg-elevated disabled:text-faint"
             type="submit"
             disabled={busy}
           >
@@ -938,7 +972,7 @@ export function ConsoleApp() {
   }
 
   return (
-    <main className="min-h-screen pb-20 lg:flex lg:pb-0">
+    <main className="min-h-screen bg-paper pb-20 text-ink lg:flex lg:pb-0">
       <Sidebar />
       <div className="min-w-0 flex-1">
         <ProjectHeader
@@ -948,6 +982,7 @@ export function ConsoleApp() {
           search={search}
           busy={busy}
           onSearch={setSearch}
+          onToggleTheme={handleToggleTheme}
           onRefresh={handleRefresh}
           onBootstrapDemo={handleBootstrapDemo}
           onLogout={handleLogout}
@@ -956,7 +991,7 @@ export function ConsoleApp() {
           {error || notice ? (
             <div
               className={`rounded-md border px-4 py-3 text-sm ${
-                error ? "border-danger/20 bg-danger/10 text-danger" : "border-teal/20 bg-teal/10 text-teal"
+                error ? "border-danger/25 bg-danger/10 text-danger" : "border-success/25 bg-success/10 text-success"
               }`}
             >
               {error ?? notice}
@@ -966,7 +1001,7 @@ export function ConsoleApp() {
           <MetricStrip metrics={metrics} />
 
           <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_360px]">
-            <div className="space-y-5">
+            <div className="min-w-0 space-y-5">
               <TelemetryPanel
                 values={telemetryValues}
                 streams={streamSummaries}
@@ -996,7 +1031,7 @@ export function ConsoleApp() {
               />
             </div>
 
-            <aside className="space-y-5">
+            <aside className="min-w-0 space-y-5">
               <ActionQueuePanel
                 actions={actionSummaries}
                 busy={busy}
@@ -1006,9 +1041,9 @@ export function ConsoleApp() {
                 onCompleteLatest={handleCompleteLatest}
               />
               <AlertPanel rules={alertSummaries} busy={busy} onCreateDefault={handleCreateDefaultAlert} />
-              <section className="panel-in rounded-md border border-line bg-ink p-4 text-paper">
+              <section className="panel-in rounded-md border border-line bg-rail p-4 text-ink">
                 <h2 className="text-base font-semibold">Protocol</h2>
-                <div className="mt-3 space-y-3 text-xs text-paper/68">
+                <div className="mt-3 space-y-3 text-xs text-muted">
                   {protocolDevice && workspace ? (
                     [
                       ["telemetry publish", telemetryTopic(workspace.project.id, protocolDevice.id, SYSTEM_STREAM)],
@@ -1017,29 +1052,29 @@ export function ConsoleApp() {
                       ["command status", commandStatusTopic(workspace.project.id, protocolDevice.id)],
                     ].map(([label, topic]) => (
                       <div key={label}>
-                        <p className="mb-1 text-paper/42">{label}</p>
-                        <code className="block break-all rounded-sm bg-white/8 p-2 text-paper">{topic}</code>
+                        <p className="mb-1 text-faint">{label}</p>
+                        <code className="block break-all rounded-sm bg-elevated p-2 text-ink">{topic}</code>
                       </div>
                     ))
                   ) : (
-                    <p className="text-paper/54">No device selected.</p>
+                    <p className="text-muted">No device selected.</p>
                   )}
                 </div>
               </section>
               <section className="panel-in rounded-md border border-line bg-panel">
                 <div className="border-b border-line px-4 py-3">
                   <h2 className="text-base font-semibold text-ink">Audit</h2>
-                  <p className="text-sm text-ink/54">Recent scoped control-plane writes.</p>
+                  <p className="text-sm text-muted">Recent scoped control-plane writes.</p>
                 </div>
                 <div className="divide-y divide-line">
                   {projectData.audit.slice(0, 6).map((entry) => (
                     <article key={entry.id} className="px-4 py-3">
                       <p className="truncate text-sm font-medium text-ink">{entry.action}</p>
-                      <p className="truncate text-xs text-ink/52">{entry.resource}</p>
+                      <p className="truncate text-xs text-faint">{entry.resource}</p>
                     </article>
                   ))}
                   {projectData.audit.length === 0 ? (
-                    <div className="px-4 py-6 text-center text-sm text-ink/54">No audit entries yet.</div>
+                    <div className="px-4 py-6 text-center text-sm text-muted">No audit entries yet.</div>
                   ) : null}
                 </div>
               </section>

@@ -11,10 +11,10 @@ import { useMemo } from "react";
 import type { DeviceRow, DeviceStatus } from "@/lib/data";
 
 const statusClass: Record<DeviceStatus, string> = {
-  online: "bg-teal/10 text-teal",
-  offline: "bg-danger/10 text-danger",
-  disabled: "bg-ink/10 text-ink/60",
-  provisioned: "bg-amber/10 text-amber",
+  online: "bg-success/15 text-success",
+  offline: "bg-danger/15 text-danger",
+  disabled: "bg-elevated text-faint",
+  provisioned: "bg-warning/15 text-warning",
 };
 
 type DeviceTableProps = {
@@ -44,7 +44,7 @@ export function DeviceTable({
         cell: ({ row }) => (
           <div className="min-w-0">
             <p className="truncate font-medium text-ink">{row.original.name}</p>
-            <p className="truncate text-xs text-ink/48">{row.original.id}</p>
+            <p className="truncate text-xs text-faint">{row.original.id}</p>
           </div>
         ),
       },
@@ -84,7 +84,7 @@ export function DeviceTable({
         cell: ({ row }) => (
           <div className="flex justify-end gap-1">
             <button
-              className="grid h-8 w-8 place-items-center rounded-md text-ink/60 transition hover:bg-ink/5 hover:text-ink disabled:cursor-not-allowed disabled:text-ink/24"
+              className="grid h-8 w-8 place-items-center rounded-md text-muted transition hover:bg-line hover:text-ink disabled:cursor-not-allowed disabled:text-faint"
               type="button"
               aria-label={`Download dev auth for ${row.original.name}`}
               disabled={busy}
@@ -96,7 +96,7 @@ export function DeviceTable({
               <Download className="h-4 w-4" aria-hidden="true" />
             </button>
             <button
-              className="grid h-8 w-8 place-items-center rounded-md text-ink/60 transition hover:bg-ink/5 hover:text-ink disabled:cursor-not-allowed disabled:text-ink/24"
+              className="grid h-8 w-8 place-items-center rounded-md text-muted transition hover:bg-line hover:text-ink disabled:cursor-not-allowed disabled:text-faint"
               type="button"
               aria-label={`Ingest sample telemetry for ${row.original.name}`}
               disabled={busy}
@@ -108,7 +108,7 @@ export function DeviceTable({
               <RadioTower className="h-4 w-4" aria-hidden="true" />
             </button>
             <button
-              className="grid h-8 w-8 place-items-center rounded-md bg-paper text-ink/32"
+              className="grid h-8 w-8 place-items-center rounded-md bg-elevated text-faint"
               type="button"
               aria-label="Remote shell disabled"
               disabled
@@ -116,7 +116,7 @@ export function DeviceTable({
               <Terminal className="h-4 w-4" aria-hidden="true" />
             </button>
             <button
-              className="grid h-8 w-8 place-items-center rounded-md text-ink/60 transition hover:bg-ink/5 hover:text-ink"
+              className="grid h-8 w-8 place-items-center rounded-md text-muted transition hover:bg-line hover:text-ink"
               type="button"
               aria-label={`Select ${row.original.name}`}
               onClick={(event) => {
@@ -139,14 +139,14 @@ export function DeviceTable({
   });
 
   return (
-    <section className="panel-in overflow-hidden rounded-md border border-line bg-panel">
+    <section className="panel-in overflow-hidden rounded-md border border-line bg-panel shadow-panel">
       <div className="flex flex-col gap-2 border-b border-line px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h2 className="text-base font-semibold text-ink">Devices</h2>
-          <p className="text-sm text-ink/54">Provisioning, shadow state, firmware, and diagnostics.</p>
+          <p className="text-sm text-muted">Provisioning, shadow state, firmware, and diagnostics.</p>
         </div>
         <button
-          className="inline-flex h-9 items-center justify-center rounded-md bg-teal px-3 text-sm font-medium text-white transition hover:bg-teal/90 disabled:cursor-not-allowed disabled:bg-ink/20"
+          className="inline-flex h-9 items-center justify-center rounded-md bg-brand px-3 text-sm font-medium text-ink transition hover:bg-brand-hover disabled:cursor-not-allowed disabled:bg-elevated disabled:text-faint"
           type="button"
           disabled={busy}
           onClick={onCreateDevice}
@@ -156,7 +156,7 @@ export function DeviceTable({
       </div>
       <div className="overflow-x-auto">
         <table className="min-w-[920px] table-fixed border-collapse text-left text-sm">
-          <thead className="bg-paper/60 text-xs uppercase text-ink/46">
+          <thead className="bg-rail text-xs uppercase text-faint">
             {table.getHeaderGroups().map((headerGroup) => (
               <tr key={headerGroup.id}>
                 {headerGroup.headers.map((header) => (
@@ -171,13 +171,13 @@ export function DeviceTable({
             {table.getRowModel().rows.map((row) => (
               <tr
                 key={row.id}
-                className={`cursor-pointer transition hover:bg-paper/60 ${
-                  selectedDeviceId === row.original.id ? "bg-teal/5" : ""
+                className={`cursor-pointer transition hover:bg-elevated ${
+                  selectedDeviceId === row.original.id ? "bg-brand/10" : ""
                 }`}
                 onClick={() => onSelectDevice(row.original.id)}
               >
                 {row.getVisibleCells().map((cell) => (
-                  <td key={cell.id} className="px-4 py-3 text-ink/72">
+                  <td key={cell.id} className="px-4 py-3 text-muted">
                     {flexRender(cell.column.columnDef.cell, cell.getContext())}
                   </td>
                 ))}
@@ -185,7 +185,7 @@ export function DeviceTable({
             ))}
             {table.getRowModel().rows.length === 0 ? (
               <tr>
-                <td className="px-4 py-8 text-center text-sm text-ink/54" colSpan={columns.length}>
+                <td className="px-4 py-8 text-center text-sm text-muted" colSpan={columns.length}>
                   No devices in this project yet.
                 </td>
               </tr>

@@ -30,15 +30,15 @@ export function ActionQueuePanel({
   onCompleteLatest,
 }: ActionQueuePanelProps) {
   return (
-    <section className="panel-in rounded-md border border-line bg-panel">
+    <section className="panel-in rounded-md border border-line bg-panel shadow-panel">
       <div className="flex items-start justify-between gap-3 border-b border-line px-4 py-3">
         <div>
           <h2 className="text-base font-semibold text-ink">Actions</h2>
-          <p className="text-sm text-ink/54">OTA, diagnostics, and command progress.</p>
+          <p className="text-sm text-muted">OTA, diagnostics, and command progress.</p>
         </div>
         <div className="flex gap-1">
           <button
-            className="grid h-8 w-8 place-items-center rounded-md border border-line bg-white text-ink/70 transition hover:border-ink/20 hover:text-ink disabled:cursor-not-allowed disabled:text-ink/24"
+            className="grid h-8 w-8 place-items-center rounded-md border border-line bg-elevated text-muted transition hover:bg-line hover:text-ink disabled:cursor-not-allowed disabled:text-faint"
             type="button"
             aria-label="Create diagnostics action"
             disabled={busy || !canRunDeviceAction}
@@ -47,7 +47,7 @@ export function ActionQueuePanel({
             <Wrench className="h-3.5 w-3.5" aria-hidden="true" />
           </button>
           <button
-            className="grid h-8 w-8 place-items-center rounded-md border border-line bg-white text-ink/70 transition hover:border-ink/20 hover:text-ink disabled:cursor-not-allowed disabled:text-ink/24"
+            className="grid h-8 w-8 place-items-center rounded-md border border-line bg-elevated text-muted transition hover:bg-line hover:text-ink disabled:cursor-not-allowed disabled:text-faint"
             type="button"
             aria-label="Create OTA action"
             disabled={busy || !canRunDeviceAction}
@@ -56,7 +56,7 @@ export function ActionQueuePanel({
             <PackageCheck className="h-3.5 w-3.5" aria-hidden="true" />
           </button>
           <button
-            className="grid h-8 w-8 place-items-center rounded-md border border-line bg-white text-ink/70 transition hover:border-ink/20 hover:text-ink disabled:cursor-not-allowed disabled:text-ink/24"
+            className="grid h-8 w-8 place-items-center rounded-md border border-line bg-elevated text-muted transition hover:bg-line hover:text-ink disabled:cursor-not-allowed disabled:text-faint"
             type="button"
             aria-label="Complete latest action"
             disabled={busy || actions.length === 0}
@@ -71,18 +71,18 @@ export function ActionQueuePanel({
           const Icon = actionIcon[action.state as keyof typeof actionIcon] ?? PlayCircle;
           const progress = clampProgress(action.progress);
           return (
-            <article key={action.id} className="rounded-md border border-line bg-white p-3">
+            <article key={action.id} className="rounded-md border border-line bg-elevated p-3">
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
                   <p className="truncate text-sm font-semibold text-ink">{action.name}</p>
-                  <p className="truncate text-xs text-ink/50">{action.target}</p>
+                  <p className="truncate text-xs text-faint">{action.target}</p>
                 </div>
-                <Icon className="h-4 w-4 shrink-0 text-teal" aria-hidden="true" />
+                <Icon className="h-4 w-4 shrink-0 text-brand" aria-hidden="true" />
               </div>
-              <div className="mt-3 h-2 rounded-full bg-paper">
-                <div className="h-2 rounded-full bg-teal" style={{ width: `${progress}%` }} />
+              <div className="mt-3 h-2 rounded-full bg-rail">
+                <div className="h-2 rounded-full bg-brand" style={{ width: `${progress}%` }} />
               </div>
-              <div className="mt-2 flex justify-between text-xs text-ink/54">
+              <div className="mt-2 flex justify-between text-xs text-muted">
                 <span>{action.state}</span>
                 <span>{progress}%</span>
               </div>
@@ -90,7 +90,7 @@ export function ActionQueuePanel({
           );
         })}
         {actions.length === 0 ? (
-          <div className="rounded-md border border-line bg-white px-3 py-6 text-center text-sm text-ink/54">
+          <div className="rounded-md border border-line bg-elevated px-3 py-6 text-center text-sm text-muted">
             No actions queued.
           </div>
         ) : null}
@@ -109,14 +109,14 @@ export function AlertPanel({
   onCreateDefault: () => void;
 }) {
   return (
-    <section className="panel-in rounded-md border border-line bg-panel">
+    <section className="panel-in rounded-md border border-line bg-panel shadow-panel">
       <div className="flex items-start justify-between gap-3 border-b border-line px-4 py-3">
         <div>
           <h2 className="text-base font-semibold text-ink">Alerts</h2>
-          <p className="text-sm text-ink/54">Offline, threshold, and aggregate rules.</p>
+          <p className="text-sm text-muted">Offline, threshold, and aggregate rules.</p>
         </div>
         <button
-          className="grid h-8 w-8 place-items-center rounded-md border border-line bg-white text-ink/70 transition hover:border-ink/20 hover:text-ink disabled:cursor-not-allowed disabled:text-ink/24"
+          className="grid h-8 w-8 place-items-center rounded-md border border-line bg-elevated text-muted transition hover:bg-line hover:text-ink disabled:cursor-not-allowed disabled:text-faint"
           type="button"
           aria-label="Create default alert"
           disabled={busy}
@@ -128,20 +128,20 @@ export function AlertPanel({
       <div className="divide-y divide-line">
         {rules.map((rule) => (
           <article key={rule.id} className="flex items-start gap-3 px-4 py-3">
-            <span className={`mt-0.5 grid h-8 w-8 place-items-center rounded-md ${rule.state === "firing" ? "bg-danger/10 text-danger" : "bg-teal/10 text-teal"}`}>
+            <span className={`mt-0.5 grid h-8 w-8 place-items-center rounded-md ${rule.state === "firing" ? "bg-danger/15 text-danger" : "bg-success/15 text-success"}`}>
               <AlertTriangle className="h-4 w-4" aria-hidden="true" />
             </span>
             <div className="min-w-0 flex-1">
               <div className="flex items-center justify-between gap-3">
                 <p className="truncate text-sm font-semibold text-ink">{rule.name}</p>
-                <span className="text-xs text-ink/46">{rule.kind}</span>
+                <span className="text-xs text-faint">{rule.kind}</span>
               </div>
-              <p className="truncate text-xs text-ink/54">{rule.target}</p>
+              <p className="truncate text-xs text-muted">{rule.target}</p>
             </div>
           </article>
         ))}
         {rules.length === 0 ? (
-          <div className="px-4 py-6 text-center text-sm text-ink/54">No alert rules configured.</div>
+          <div className="px-4 py-6 text-center text-sm text-muted">No alert rules configured.</div>
         ) : null}
       </div>
     </section>
