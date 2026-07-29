@@ -145,3 +145,29 @@ Command 是单个 JSON object：
 - MQTT ingest ACL 测试：`backend/apps/mqtt-ingest/src/lib.rs`
 - Agent serializer/action 测试：`device-agent/device-agent/src/base/serializer/mod.rs`、`device-agent/device-agent/src/base/actions.rs`
 - Frontend topic helper 测试：`frontend/src/lib/protocol.test.ts`
+
+## ESP SDK
+
+本仓库提供两个 Excalibur 专用 ESP SDK，均只支持本页定义的原生协议：
+
+- Rust ESP-IDF：`sdk/excalibur-esp-rs-sdk`
+- C ESP-IDF component：`sdk/excalibur-esp-idf-sdk`
+
+仓库内引用示例：
+
+```toml
+excalibur-esp-rs = { path = "sdk/excalibur-esp-rs-sdk" }
+```
+
+```cmake
+set(EXTRA_COMPONENT_DIRS "/path/to/excalibur/sdk/excalibur-esp-idf-sdk")
+```
+
+SDK 行为约定：
+
+- SDK 构造 `v1/p/{project_id}/d/{device_id}/...` topic，不发送 `/tenants/...`。
+- telemetry helper 会添加 `sequence` 和 `timestamp` 并发布 JSON array。
+- shadow helper 发布单个 JSON object。
+- command handler 接收 `action_id`、`name` 和 JSON value `payload`。
+- command status helper 发布 `action_id/state/progress/errors` array，并将内部下载态归一到协议状态。
+- OTA helper 监听 `ota.install`，使用 `signed_url` 下载，并在下载前校验 `sha256` 与 `size_bytes`。

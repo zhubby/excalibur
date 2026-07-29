@@ -1,0 +1,3 @@
+dependencies:
+  excalibur-esp-idf-sdk:
+    override_path: "../../../"

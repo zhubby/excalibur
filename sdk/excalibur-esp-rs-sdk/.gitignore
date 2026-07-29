@@ -1,0 +1,5 @@
+**/target
+/Cargo.lock
+**/.embuild
+cfg.toml
+tools/**/device_config.json

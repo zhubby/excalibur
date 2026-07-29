@@ -1,0 +1,9 @@
+version: "0.1.0"
+description: ESP-IDF component for Excalibur native device protocol
+maintainers:
+  - Excalibur contributors
+repository: https://github.com/excalibur/excalibur
+documentation: https://github.com/excalibur/excalibur/tree/main/sdk/excalibur-esp-idf-sdk
+dependencies:
+  idf:
+    version: ">=4.4"

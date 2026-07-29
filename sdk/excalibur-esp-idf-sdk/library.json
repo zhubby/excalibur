@@ -1,0 +1,20 @@
+{
+  "name": "excalibur-esp-idf-sdk",
+  "version": "0.1.0",
+  "description": "ESP-IDF component for Excalibur native device protocol",
+  "keywords": "mqtt, iot, espidf, esp32, excalibur, device-management, ota",
+  "authors": [
+    {
+      "name": "Excalibur contributors",
+      "maintainer": true
+    }
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/excalibur/excalibur"
+  },
+  "frameworks": "espidf",
+  "platforms": [
+    "espressif32"
+  ]
+}

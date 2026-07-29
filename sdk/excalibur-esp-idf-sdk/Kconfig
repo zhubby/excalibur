@@ -1,0 +1,96 @@
+menu "Excalibur"
+    menu "Device Shadow"
+        config EXCALIBUR_SHADOW_STATUS
+            string "Status"
+            default "Device is Online"
+
+        config EXCALIBUR_SHADOW_SOFTWARE_TYPE
+            string "Software Type"
+            default "excalibur-esp-app"
+
+        config EXCALIBUR_SHADOW_SOFTWARE_VERSION
+            string "Software Version"
+            default "v0.1.0"
+
+        config EXCALIBUR_SHADOW_HARDWARE_TYPE
+            string "Hardware Type"
+            default "ESP32"
+
+        config EXCALIBUR_SHADOW_HARDWARE_VERSION
+            string "Hardware Version"
+            default "rev1"
+
+        config EXCALIBUR_SHADOW_CUSTOM_JSON_STR_LEN
+            int "Custom shadow JSON length"
+            default 512
+
+        config EXCALIBUR_SHADOW_PUSH_INTERVAL
+            int "Shadow push interval in seconds"
+            default 40
+    endmenu
+
+    menu "Device Provisioning"
+        choice EXCALIBUR_PROVISIONING_FILESYSTEM
+            prompt "Provisioning file system"
+            default EXCALIBUR_PROVISIONING_FILESYSTEM_IS_SPIFFS
+
+            config EXCALIBUR_PROVISIONING_FILESYSTEM_IS_SPIFFS
+                bool "SPIFFS"
+
+            config EXCALIBUR_PROVISIONING_FILESYSTEM_IS_FATFS
+                bool "FATFS"
+
+            config EXCALIBUR_PROVISIONING_FILESYSTEM_IS_LITTLEFS
+                bool "LITTLEFS"
+        endchoice
+
+        config EXCALIBUR_PROVISIONING_FILENAME
+            string "Provisioning file name"
+            default "device_config.json"
+    endmenu
+
+    menu "Excalibur Logging"
+        config EXCALIBUR_CLOUD_LOGGING_IS_ENABLED
+            bool "Enable cloud logging"
+
+        config EXCALIBUR_CLOUD_LOGGING_STREAM
+            string "Cloud logging telemetry stream"
+            depends on EXCALIBUR_CLOUD_LOGGING_IS_ENABLED
+            default "logs"
+
+        choice EXCALIBUR_LOGGING_LEVEL_CHOICE
+            prompt "Logging level"
+            default EXCALIBUR_LOGGING_LEVEL_IS_INFO
+
+            config EXCALIBUR_LOGGING_LEVEL_IS_NONE
+                bool "No Output"
+            config EXCALIBUR_LOGGING_LEVEL_IS_ERROR
+                bool "Error"
+            config EXCALIBUR_LOGGING_LEVEL_IS_WARN
+                bool "Warning"
+            config EXCALIBUR_LOGGING_LEVEL_IS_INFO
+                bool "Info"
+            config EXCALIBUR_LOGGING_LEVEL_IS_DEBUG
+                bool "Debug"
+            config EXCALIBUR_LOGGING_LEVEL_IS_VERBOSE
+                bool "Verbose"
+        endchoice
+
+        config EXCALIBUR_LOGGING_LEVEL
+            int
+            default 0 if EXCALIBUR_LOGGING_LEVEL_IS_NONE
+            default 1 if EXCALIBUR_LOGGING_LEVEL_IS_ERROR
+            default 2 if EXCALIBUR_LOGGING_LEVEL_IS_WARN
+            default 3 if EXCALIBUR_LOGGING_LEVEL_IS_INFO
+            default 4 if EXCALIBUR_LOGGING_LEVEL_IS_DEBUG
+            default 5 if EXCALIBUR_LOGGING_LEVEL_IS_VERBOSE
+    endmenu
+
+    config EXCALIBUR_NUM_MESSAGES_IN_MQTT_BATCH
+        int "MQTT batch element count"
+        default 125
+
+    config EXCALIBUR_MQTT_BATCH_ELEMENT_SIZE
+        int "MQTT batch element size in bytes"
+        default 250
+endmenu

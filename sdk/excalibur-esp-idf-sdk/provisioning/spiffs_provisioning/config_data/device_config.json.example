@@ -1,0 +1,13 @@
+{
+  "project_id": "018f4c5c-9b4d-7cc2-a62a-44590f671001",
+  "broker": "mqtt.local.excalibur.dev",
+  "port": 8883,
+  "device_id": "018f4c5c-9b4d-7cc2-a62a-44590f671101",
+  "authentication": {
+    "ca_certificate": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----",
+    "device_certificate": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----",
+    "device_private_key": "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"
+  },
+  "provisioning_mode": "Csr",
+  "production": true
+}
