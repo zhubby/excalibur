@@ -1,0 +1,3 @@
+use_small_heuristics = "Max"
+merge_derives = false
+# indent_style = "Visual"

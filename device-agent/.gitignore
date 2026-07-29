@@ -1,0 +1,18 @@
+target
+**/*.rs.bk
+.idea
+.vim
+
+
+#Added by cargo
+#
+#already existing elements are commented out
+
+#/target
+#**/*.rs.bk
+certs/
+config/
+
+devices/
+uplink/src/bin/*
+.persistence

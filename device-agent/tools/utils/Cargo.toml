@@ -1,0 +1,33 @@
+[package]
+name = "utils"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "test"
+path = "src/test.rs"
+
+[[bin]]
+name = "push_data"
+path = "src/push_data.rs"
+
+[[bin]]
+name = "push_to_uplink"
+path = "src/push_to_uplink.rs"
+
+[[bin]]
+name = "wait_and_send"
+path = "src/wait_and_send.rs"
+
+[dependencies]
+flume = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
+structopt = "0.3.26"
+device-agent = { path = "../../device-agent" }
+rand = "0.8.5"
+chrono = "0.4.38"

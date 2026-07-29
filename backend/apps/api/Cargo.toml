@@ -1,0 +1,29 @@
+[package]
+name = "excalibur-api"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+argon2.workspace = true
+axum.workspace = true
+chrono.workspace = true
+excalibur-device-protocol = { path = "../../crates/device-protocol" }
+excalibur-domain = { path = "../../crates/domain" }
+excalibur-storage = { path = "../../crates/storage" }
+futures-util.workspace = true
+password-hash.workspace = true
+rand_core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+utoipa.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tower.workspace = true

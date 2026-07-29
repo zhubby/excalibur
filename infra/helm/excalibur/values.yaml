@@ -1,0 +1,57 @@
+image:
+  repository: excalibur
+  tag: latest
+  pullPolicy: IfNotPresent
+
+api:
+  replicas: 1
+  port: 8080
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+mqttIngest:
+  replicas: 2
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+worker:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+frontend:
+  replicas: 2
+  port: 3000
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+migrations:
+  enabled: true
+  image: postgres:16-alpine
+  backoffLimit: 3
+
+env:
+  STORAGE_BACKEND: memory
+  DATABASE_URL: postgres://excalibur:excalibur@timescaledb:5432/excalibur
+  NATS_URL: nats://nats:4222
+  S3_ENDPOINT: http://minio:9000

@@ -1,0 +1,16 @@
+[book]
+authors = ["Excalibur contributors"]
+description = "Excalibur Bytebeam-like IoT SaaS platform documentation"
+language = "zh-CN"
+multilingual = false
+src = "src"
+title = "Excalibur IoT SaaS 文档"
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[output.html]
+git-repository-url = "https://github.com/excalibur/excalibur"
+edit-url-template = "https://github.com/excalibur/excalibur/edit/main/docs/{path}"
+site-url = "/"

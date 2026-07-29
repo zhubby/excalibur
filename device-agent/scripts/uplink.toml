@@ -1,0 +1,13 @@
+
+action_redirections={"ota.install"="install_firmware"}
+[tcpapps.1]
+port=5050
+
+[downloader]
+path="/tmp/device_agent/download"
+actions=[{name="ota.install", timeout=310}, {name="send_file"}]
+
+[ota_installer]
+path="/tmp/device_agent/installer"
+actions=[{name="install_firmware", timeout=310}]
+device_agent_port=5050

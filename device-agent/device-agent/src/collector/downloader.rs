@@ -1,0 +1,667 @@
+use bytes::BytesMut;
+use flume::{Receiver, Sender};
+use futures_util::StreamExt;
+use human_bytes::human_bytes;
+use log::{debug, error, info, trace, warn};
+use reqwest::{Certificate, Client, ClientBuilder, Error as ReqwestError, Identity};
+use rsa::sha2::{Digest, Sha256};
+use serde::{Deserialize, Serialize};
+use tokio::select;
+use tokio::time::{Instant, sleep};
+
+use crate::base::actions::Cancellation;
+use crate::device_agent_config::{Authentication, Config, DownloaderConfig};
+use crate::{Action, ActionResponse, base::bridge::BridgeTx};
+use anyhow::Context;
+use std::fs::{File, metadata, read, remove_dir_all, remove_file, write};
+use std::io;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+#[cfg(unix)]
+use std::{
+    fs::{Permissions, create_dir, set_permissions},
+    path::Path,
+};
+use std::{io::Write, path::PathBuf};
+
+#[derive(thiserror::Error, Debug)]
+pub enum Error {
+    #[error("Cannot download file: invalid credentials")]
+    InvalidCredentials,
+    #[error("Serde error: {0}")]
+    Serde(#[from] serde_json::Error),
+    #[error("Error from reqwest: {0}")]
+    Reqwest(#[from] ReqwestError),
+    #[error("File io Error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("Empty file name")]
+    EmptyFileName,
+    #[error("Missing file path")]
+    FilePathMissing,
+    #[error("Download failed, content length zero")]
+    EmptyFile,
+    #[error("Downloaded file has unexpected checksum")]
+    BadChecksum,
+    #[error("Disk space is insufficient: {0}")]
+    InsufficientDisk(String),
+    #[error("Save file is corrupted")]
+    BadSave,
+    #[error("Save file doesn't exist")]
+    NoSave,
+    #[error("Download has been cancelled by '{0}'")]
+    Cancelled(String),
+}
+
+enum DownloadResult {
+    Ok,
+    Err(String),
+    Suspended,
+}
+
+/// This struct contains the necessary components to download and store file as notified by a download file
+/// [`Action`], while also sending periodic [`ActionResponse`]s to update progress and finally forwarding
+/// the download [`Action`], updated with information regarding where the file is stored in the file-system
+/// to the connected bridge application.
+pub struct FileDownloader {
+    config: DownloaderConfig,
+    actions_rx: Receiver<Action>,
+    bridge_tx: BridgeTx,
+    client: Client,
+    shutdown_rx: Receiver<DownloaderShutdown>,
+    disabled: Arc<Mutex<bool>>,
+}
+
+impl FileDownloader {
+    /// Creates a handler for download actions within device_agent and uses HTTP to download files.
+    pub fn new(
+        config: Arc<Config>,
+        authentication: &Option<Authentication>,
+        actions_rx: Receiver<Action>,
+        bridge_tx: BridgeTx,
+        shutdown_rx: Receiver<DownloaderShutdown>,
+        disabled: Arc<Mutex<bool>>,
+    ) -> Result<Self, Error> {
+        // Authenticate with TLS certs from config
+        let client_builder = ClientBuilder::new();
+        let client = match authentication {
+            Some(certs) => {
+                let ca = Certificate::from_pem(certs.ca_certificate.as_bytes())?;
+                let device_private_key = certs
+                    .device_private_key
+                    .clone()
+                    .or_else(|| {
+                        certs.device_private_key_path.as_ref().and_then(|path| {
+                            match std::fs::read_to_string(path) {
+                                Ok(key) => Some(key),
+                                Err(error) => {
+                                    error!(
+                                        "failed to read device private key from {}: {error}",
+                                        path.display()
+                                    );
+                                    None
+                                }
+                            }
+                        })
+                    })
+                    .unwrap_or_default();
+                let mut buf = BytesMut::from(device_private_key.as_bytes());
+                buf.extend_from_slice(certs.device_certificate.as_bytes());
+                // buf contains the private key and certificate of device
+                let device = Identity::from_pem(&buf)?;
+                client_builder.add_root_certificate(ca).identity(device)
+            }
+            None => client_builder,
+        }
+        .build()?;
+
+        Ok(Self::with_client(config, client, actions_rx, bridge_tx, shutdown_rx, disabled))
+    }
+
+    pub fn with_client(
+        config: Arc<Config>,
+        client: Client,
+        actions_rx: Receiver<Action>,
+        bridge_tx: BridgeTx,
+        shutdown_rx: Receiver<DownloaderShutdown>,
+        disabled: Arc<Mutex<bool>>,
+    ) -> Self {
+        Self {
+            config: config.downloader.clone(),
+            actions_rx,
+            client,
+            bridge_tx,
+            shutdown_rx,
+            disabled,
+        }
+    }
+
+    /// Spawn a thread to handle downloading files as notified by download actions and for forwarding the updated actions
+    /// back to bridge for further processing, e.g. OTA update installation.
+    #[tokio::main(flavor = "current_thread")]
+    pub async fn start(mut self) {
+        self.reload().await;
+
+        info!("Downloader thread is ready to receive download actions");
+        while let Ok(action) = self.actions_rx.recv_async().await {
+            let action_id = action.action_id.clone();
+            let mut state = match DownloadState::new(action, &self.config) {
+                Ok(s) => s,
+                Err(e) => {
+                    self.bridge_tx
+                        .send_action_response(ActionResponse::failure(&action_id, e.to_string()))
+                        .await;
+                    continue;
+                }
+            };
+
+            // Update action status for process initiated
+            let status =
+                ActionResponse::progress(&state.current.action.action_id, "Downloading", 0);
+            self.bridge_tx.send_action_response(status).await;
+
+            match self.download(&mut state).await {
+                DownloadResult::Ok => {
+                    // Forward updated action as part of response
+                    let DownloadState { current: CurrentDownload { action, .. }, .. } = state;
+                    let mut status =
+                        ActionResponse::new(&action.action_id, "Downloaded", 100, vec![]);
+                    status.done_response = Some(action);
+                    self.bridge_tx.send_action_response(status).await;
+                }
+                DownloadResult::Err(e) => {
+                    self.bridge_tx
+                        .send_action_response(ActionResponse::failure(
+                            &state.current.action.action_id,
+                            e,
+                        ))
+                        .await;
+                }
+                DownloadResult::Suspended => break,
+            }
+        }
+
+        error!("Downloader thread stopped");
+    }
+
+    // Loads a download left uncompleted during the previous run of device_agent and continues it
+    async fn reload(&mut self) {
+        let mut state = match DownloadState::load(&self.config) {
+            Ok(s) => s,
+            Err(Error::NoSave) => return,
+            Err(e) => {
+                warn!("Couldn't reload current_download: {e:?}");
+                return;
+            }
+        };
+
+        match self.download(&mut state).await {
+            DownloadResult::Ok => {
+                // Forward updated action as part of response
+                let DownloadState { current: CurrentDownload { action, .. }, .. } = state;
+                let mut status = ActionResponse::new(&action.action_id, "Downloaded", 100, vec![]);
+                status.done_response = Some(action);
+                self.bridge_tx.send_action_response(status).await;
+            }
+            DownloadResult::Err(e) => {
+                self.bridge_tx
+                    .send_action_response(ActionResponse::failure(
+                        &state.current.action.action_id,
+                        e,
+                    ))
+                    .await;
+            }
+            DownloadResult::Suspended => {}
+        }
+    }
+
+    // Accepts `DownloadState`, sets a timeout for the action
+    async fn download(&mut self, state: &mut DownloadState) -> DownloadResult {
+        if state.already_downloaded {
+            return DownloadResult::Ok;
+        }
+
+        let shutdown_rx = self.shutdown_rx.clone();
+        loop {
+            select! {
+                o = self.continuous_retry(state) => {
+                    if let Err(e) = o {
+                        return DownloadResult::Err(e.to_string());
+                    } else {
+                        break;
+                    }
+                },
+                Ok(action) = self.actions_rx.recv_async() => {
+                    if &action.action_id == &state.current.action.action_id {
+                        // This handles the edge case when the device is able to receive actions
+                        // from the broker but for something goes wrong when pushing action statuses back to the backend
+                        // In this case the backend will try sending the same action again
+                        //
+                        // TODO: Right now we use the action status pushed by device as confirmation that it
+                        // has received the action. It is not very reliable because as of now the action status pipeline can drop messages.
+                        // Would it be better if the backend used MQTT Ack of the action message instead?
+                        log::error!("Backend tried sending the same action again!");
+                    } else if action.name != "cancel_action" {
+                        self.bridge_tx.send_action_response(ActionResponse::failure(action.action_id.as_str(), "Downloader is already occupied")).await;
+                    } else {
+                        match action.payload_as::<Cancellation>()
+                            .context("Invalid cancel action payload")
+                            .and_then(|cancellation| {
+                                if cancellation.action_id == state.current.action.action_id {
+                                    Ok(())
+                                } else {
+                                    Err(anyhow::Error::msg(format!("Cancel action target ({}) doesn't match active download action id ({})", cancellation.action_id, &state.current.action.action_id)))
+                                }
+                            })
+                            .and_then(|_| {
+                                state.clean()
+                                    .context("Couldn't couldn't perform cleanup")
+                            }) {
+                            Ok(_) => {
+                                self.bridge_tx.send_action_response(ActionResponse::success(action.action_id.as_str())).await;
+                                return DownloadResult::Err("action has been cancelled!".to_string());
+                            },
+                            Err(e) => {
+                                self.bridge_tx.send_action_response(ActionResponse::failure(action.action_id.as_str(), format!("Could not stop download: {e:?}"))).await;
+                            },
+                        }
+                    }
+                },
+
+                Ok(_) = shutdown_rx.recv_async(), if !shutdown_rx.is_disconnected() => {
+                    if let Err(e) = state.save(&self.config) {
+                        error!("Error saving current_download: {e:?}");
+                    }
+
+                    return DownloadResult::Suspended;
+                },
+            }
+        }
+
+        self.bridge_tx
+            .send_action_response(ActionResponse::progress(
+                &state.current.action.action_id,
+                "VerifyingChecksum",
+                99,
+            ))
+            .await;
+        if state.current.meta.checksum.is_some() {
+            if let Err(e) = state.current.meta.verify_checksum() {
+                return DownloadResult::Err(e.to_string());
+            }
+        }
+        // Update Action payload with `download_path`, i.e. downloaded file's location in fs
+        state.current.action.payload = match serde_json::to_value(&state.current.meta) {
+            Ok(p) => p,
+            Err(e) => {
+                return DownloadResult::Err(e.to_string());
+            }
+        };
+
+        DownloadResult::Ok
+    }
+
+    // A download must be retried with Range header when HTTP/reqwest errors are faced
+    async fn continuous_retry(&self, state: &mut DownloadState) -> Result<(), Error> {
+        'outer: loop {
+            let mut req = self.client.get(&state.current.meta.url);
+            if let Some(range) = state.retry_range() {
+                warn!("Retrying download; Continuing to download file from: {range}");
+                req = req.header("Range", range);
+            }
+            let mut stream = match req
+                .send()
+                .await
+                .context("network issue")
+                .and_then(|s| s.error_for_status().context("request failed"))
+            {
+                Ok(s) => s.bytes_stream(),
+                Err(e) => {
+                    if format!("{e:?}").contains("BadSignature") {
+                        return Err(Error::InvalidCredentials);
+                    }
+                    error!("Download failed: {e:?}");
+                    // Retry after wait
+                    sleep(Duration::from_secs(1)).await;
+                    continue 'outer;
+                }
+            };
+
+            // Download and store to disk by streaming as chunks
+            loop {
+                // Checks if downloader is disabled by user or not
+                if *self.disabled.lock().unwrap() {
+                    // async to ensure download can be cancelled during sleep
+                    sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+                let Some(item) = stream.next().await else { break };
+                let chunk = match item {
+                    Ok(c) => c,
+                    // Retry non-status errors
+                    Err(e) if !e.is_status() => {
+                        let status = ActionResponse::progress(
+                            &state.current.action.action_id,
+                            "Download Failed",
+                            0,
+                        )
+                        .add_error(e.to_string());
+                        self.bridge_tx.send_action_response(status).await;
+                        error!("Download failed: {e:?}");
+                        // Retry after wait
+                        sleep(Duration::from_secs(1)).await;
+                        continue 'outer;
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+                if let Some(percentage) = state.write_bytes(&chunk)? {
+                    let status = ActionResponse::progress(
+                        &state.current.action.action_id,
+                        "Downloading",
+                        percentage,
+                    );
+                    self.bridge_tx.send_action_response(status).await;
+                }
+            }
+
+            info!("Firmware downloaded successfully");
+            break;
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+/// Custom create_dir_all which sets permissions on each created directory, only works on unix
+fn create_dirs_with_perms(path: &Path, perms: Permissions) -> std::io::Result<()> {
+    let mut current_path = PathBuf::new();
+
+    for component in path.components() {
+        current_path.push(component);
+
+        if !current_path.exists() {
+            create_dir(&current_path)?;
+            set_permissions(&current_path, perms.clone())?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Creates file to download into
+fn create_file(file_path: &Path) -> Result<File, Error> {
+    // NOTE: if file_path is occupied by a directory due to previous working of device_agent, remove it
+    if let Ok(f) = metadata(&file_path) {
+        if f.is_dir() {
+            remove_dir_all(&file_path)?;
+        }
+    }
+    let file = File::create(&file_path)?;
+    #[cfg(unix)]
+    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o666))?;
+
+    Ok(file)
+}
+
+fn check_disk_size(config: &DownloaderConfig, download: &DownloadFile) -> Result<(), Error> {
+    let disk_free_space = fs2::free_space(&config.path)? as usize;
+
+    let req_size = human_bytes(download.content_length as f64);
+    let free_size = human_bytes(disk_free_space as f64);
+    debug!("Download requires {req_size}; Disk free space is {free_size}");
+
+    if download.content_length > disk_free_space {
+        return Err(Error::InsufficientDisk(free_size));
+    }
+
+    Ok(())
+}
+
+/// Expected JSON format of data contained in the [`payload`] of a download file [`Action`]
+///
+/// [`payload`]: Action#structfield.payload
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct DownloadFile {
+    #[serde(alias = "signed_url")]
+    pub url: String,
+    #[serde(alias = "content-length", alias = "size_bytes")]
+    pub content_length: usize,
+    #[serde(default)]
+    #[serde(alias = "version")]
+    pub file_name: String,
+    /// Path to location in fs where file will be stored
+    pub download_path: Option<PathBuf>,
+    /// Checksum that can be used to verify download was successful
+    pub checksum: Option<String>,
+}
+
+impl DownloadFile {
+    fn from_action_payload(payload: serde_json::Value) -> Result<Self, serde_json::Error> {
+        #[derive(Deserialize)]
+        struct OtaHints {
+            component: Option<String>,
+            version: Option<String>,
+            sha256: Option<String>,
+        }
+
+        let hints = serde_json::from_value::<OtaHints>(payload.clone()).ok();
+        let mut download = serde_json::from_value::<DownloadFile>(payload)?;
+        if let Some(hints) = hints {
+            if let (Some(component), Some(version)) = (hints.component, hints.version) {
+                if download.file_name.is_empty() || download.file_name == version {
+                    download.file_name = format!("{component}-{version}.bin");
+                }
+            }
+            if download.checksum.is_none() {
+                download.checksum = hints.sha256;
+            }
+        }
+        Ok(download)
+    }
+
+    fn verify_checksum(&self) -> Result<(), Error> {
+        let path = self.download_path.as_ref().expect("Downloader didn't set \"download_path\"");
+        let mut file = File::open(path)?;
+        let mut hasher = Sha256::new();
+        io::copy(&mut file, &mut hasher)?;
+        let hash = hasher.finalize();
+
+        if self.checksum.as_ref().unwrap() != &hex::encode(hash) {
+            return Err(Error::BadChecksum);
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CurrentDownload {
+    action: Action,
+    meta: DownloadFile,
+}
+
+// A temporary structure to help us retry downloads
+// that failed after partial completion.
+#[derive(Debug)]
+struct DownloadState {
+    current: CurrentDownload,
+    file: File,
+    bytes_written: usize,
+    percentage_downloaded: u8,
+    already_downloaded: bool,
+    start: Instant,
+}
+
+impl DownloadState {
+    fn new(action: Action, config: &DownloaderConfig) -> Result<Self, Error> {
+        // Ensure that directory for downloading file into, exists
+        let mut path = config.path.clone();
+        path.push(&action.name);
+
+        #[cfg(unix)]
+        create_dirs_with_perms(
+            path.as_path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o777),
+        )?;
+
+        #[cfg(not(unix))]
+        std::fs::create_dir_all(&path)?;
+
+        // Extract url information from action payload
+        let mut meta = match DownloadFile::from_action_payload(action.payload.clone())? {
+            DownloadFile { file_name, .. } if file_name.is_empty() => {
+                return Err(Error::EmptyFileName);
+            }
+            DownloadFile { content_length: 0, .. } => return Err(Error::EmptyFile),
+            u => u,
+        };
+
+        let file_path = path.join(&meta.file_name);
+        meta.download_path = Some(file_path.clone());
+        if meta.checksum.is_some() && meta.verify_checksum().is_ok() {
+            info!(
+                "file has already been downloaded and its checksum matches, skipping download..."
+            );
+            return Ok(Self {
+                bytes_written: meta.content_length,
+                current: CurrentDownload { action, meta },
+                file: File::open("/dev/null")?,
+                percentage_downloaded: 100,
+                already_downloaded: true,
+                start: Instant::now(),
+            });
+        }
+
+        let _ = remove_file(&file_path);
+        let _ = remove_dir_all(&file_path);
+
+        check_disk_size(config, &meta)?;
+
+        let url = meta.url.clone();
+
+        // Create file to actually download into
+        let file = create_file(&file_path)?;
+        // Retry downloading upto 3 times in case of connectivity issues
+        // TODO: Error out for 1XX/3XX responses
+        info!(
+            "Downloading from {url} into {}; size = {}",
+            file_path.display(),
+            human_bytes(meta.content_length as f64)
+        );
+        let current = CurrentDownload { action, meta };
+
+        Ok(Self {
+            current,
+            file,
+            bytes_written: 0,
+            percentage_downloaded: 0,
+            already_downloaded: false,
+            start: Instant::now(),
+        })
+    }
+
+    fn load(config: &DownloaderConfig) -> Result<Self, Error> {
+        let mut path = config.path.clone();
+        path.push("current_download");
+
+        if !path.exists() {
+            return Err(Error::NoSave);
+        }
+
+        let read = read(&path)?;
+        let current: CurrentDownload = serde_json::from_slice(&read)?;
+
+        // Unwrap is ok here as it is expected to be set for actions once received
+        let file =
+            File::options().append(true).open(current.meta.download_path.as_ref().unwrap())?;
+        let bytes_written = file.metadata()?.len() as usize;
+
+        remove_file(path)?;
+
+        Ok(DownloadState {
+            current,
+            file,
+            bytes_written,
+            percentage_downloaded: 0,
+            already_downloaded: false,
+            start: Instant::now(),
+        })
+    }
+
+    fn save(&self, config: &DownloaderConfig) -> Result<(), Error> {
+        if self.bytes_written == self.current.meta.content_length {
+            return Ok(());
+        }
+
+        let current = self.current.clone();
+        let json = serde_json::to_vec(&current)?;
+
+        let mut path = config.path.clone();
+        path.push("current_download");
+        write(path, json)?;
+
+        Ok(())
+    }
+
+    /// Deletes contents of file
+    fn clean(&self) -> Result<(), Error> {
+        // Unwrap is ok here as it is expected to be set for actions once received
+        remove_file(self.current.meta.download_path.as_ref().unwrap())?;
+
+        Ok(())
+    }
+
+    fn retry_range(&self) -> Option<String> {
+        if self.bytes_written == 0 {
+            return None;
+        }
+
+        Some(format!("bytes={}-{}", self.bytes_written, self.current.meta.content_length))
+    }
+
+    fn write_bytes(&mut self, buf: &[u8]) -> Result<Option<u8>, Error> {
+        let bytes_downloaded = buf.len();
+        self.file.write_all(buf)?;
+        self.bytes_written += bytes_downloaded;
+        let size = human_bytes(self.current.meta.content_length as f64);
+
+        // Calculate percentage on the basis of content_length
+        let factor = self.bytes_written as f32 / self.current.meta.content_length as f32;
+        let percentage = (99.99 * factor) as u8;
+
+        // NOTE: ensure lesser frequency of action responses, once every percentage points
+        if percentage > self.percentage_downloaded {
+            self.percentage_downloaded = percentage;
+            debug!(
+                "Downloading: size = {size}, percentage = {percentage}, elapsed = {}s",
+                self.start.elapsed().as_secs()
+            );
+
+            Ok(Some(percentage))
+        } else {
+            trace!(
+                "Downloading: size = {size}, percentage = {}, elapsed = {}s",
+                self.percentage_downloaded,
+                self.start.elapsed().as_secs()
+            );
+
+            Ok(None)
+        }
+    }
+}
+
+/// Command to remotely trigger `Downloader` shutdown
+pub struct DownloaderShutdown;
+
+/// Handle to send control messages to `Downloader`
+#[derive(Debug, Clone)]
+pub struct CtrlTx {
+    pub(crate) inner: Sender<DownloaderShutdown>,
+}
+
+impl CtrlTx {
+    /// Triggers shutdown of `Downloader`
+    pub async fn trigger_shutdown(&self) {
+        _ = self.inner.send_async(DownloaderShutdown).await;
+    }
+}

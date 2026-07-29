@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-mqtt-ingest
+spec:
+  replicas: {{ .Values.mqttIngest.replicas }}
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}-mqtt-ingest
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}-mqtt-ingest
+    spec:
+      containers:
+        - name: mqtt-ingest
+          image: "{{ .Values.image.repository }}/mqtt-ingest:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: DATABASE_URL
+              value: {{ .Values.env.DATABASE_URL | quote }}
+            - name: NATS_URL
+              value: {{ .Values.env.NATS_URL | quote }}
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "test -x /usr/local/bin/excalibur && kill -0 1"]
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+{{ toYaml .Values.mqttIngest.resources | nindent 12 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-worker
+spec:
+  replicas: {{ .Values.worker.replicas }}
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}-worker
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}-worker
+    spec:
+      containers:
+        - name: worker
+          image: "{{ .Values.image.repository }}/worker:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: DATABASE_URL
+              value: {{ .Values.env.DATABASE_URL | quote }}
+            - name: NATS_URL
+              value: {{ .Values.env.NATS_URL | quote }}
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "test -x /usr/local/bin/excalibur && kill -0 1"]
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+{{ toYaml .Values.worker.resources | nindent 12 }}

@@ -1,0 +1,23 @@
+[package]
+name = "excalibur-mqtt-ingest"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+rumqttd-runtime = ["dep:rumqttd"]
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+excalibur-device-protocol = { path = "../../crates/device-protocol" }
+excalibur-domain = { path = "../../crates/domain" }
+excalibur-storage = { path = "../../crates/storage" }
+rumqttd = { workspace = true, optional = true }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true

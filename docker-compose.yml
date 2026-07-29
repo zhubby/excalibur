@@ -1,0 +1,107 @@
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      POSTGRES_DB: excalibur
+      POSTGRES_USER: excalibur
+      POSTGRES_PASSWORD: excalibur
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescaledb-data:/var/lib/postgresql/data
+      - ./backend/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U excalibur -d excalibur"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js", "-m", "8222", "--store_dir", "/data"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    volumes:
+      - nats-data:/data
+
+  minio:
+    image: minio/minio:latest
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: excalibur
+      MINIO_ROOT_PASSWORD: excalibur-secret
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+
+  api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      args:
+        BIN: excalibur-api
+    environment:
+      API_ADDR: 0.0.0.0:8080
+      STORAGE_BACKEND: memory
+      DATABASE_URL: postgres://excalibur:excalibur@timescaledb:5432/excalibur
+      NATS_URL: nats://nats:4222
+      S3_ENDPOINT: http://minio:9000
+    ports:
+      - "8080:8080"
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      nats:
+        condition: service_started
+      minio:
+        condition: service_started
+
+  mqtt-ingest:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      args:
+        BIN: excalibur-mqtt-ingest
+    environment:
+      DATABASE_URL: postgres://excalibur:excalibur@timescaledb:5432/excalibur
+      NATS_URL: nats://nats:4222
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      nats:
+        condition: service_started
+
+  worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      args:
+        BIN: excalibur-worker
+    environment:
+      DATABASE_URL: postgres://excalibur:excalibur@timescaledb:5432/excalibur
+      NATS_URL: nats://nats:4222
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      nats:
+        condition: service_started
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: http://localhost:8080
+    ports:
+      - "3000:3000"
+    depends_on:
+      api:
+        condition: service_started
+
+volumes:
+  timescaledb-data:
+  nats-data:
+  minio-data:
