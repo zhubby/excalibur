@@ -7,11 +7,11 @@
 | 路径 | 职责 |
 | --- | --- |
 | `backend/apps/api` | Axum API，负责 auth、RBAC、tenant scope、OpenAPI、SSE 和控制面 handler。 |
-| `backend/apps/mqtt-ingest` | Broker-agnostic MQTT ACL 和 ingest 逻辑，生产 runtime 通过 `rumqttd` hook 调用。 |
+| `backend/apps/mqtt-ingest` | 本地 `rumqttd` MQTT broker runtime，复用 broker-agnostic ACL 和 ingest 逻辑写入 Store。 |
 | `backend/apps/worker` | 后台 worker scaffold，后续负责 alert scan、action timeout、dispatcher、retention/export 等任务。 |
 | `backend/crates/domain` | 领域模型，包含 `User`、`Org`、`Project`、`Device`、`DeviceCertificate`、`StreamDefinition`、`Action`、`FirmwareArtifact`、`AlertRule`、`Dashboard`、`AuditLog`。 |
 | `backend/crates/device-protocol` | 设备 wire contract，包含 MQTT topic helper、parser、payload decoder、device auth JSON 和 action payload 类型。 |
-| `backend/crates/storage` | 当前提供 `MemoryStore`，并保留 Toasty integration boundary。 |
+| `backend/crates/storage` | 提供 `MemoryStore`、`PgStore` 和统一 `Store` 包装层，并保留 Toasty integration boundary。 |
 
 ## 请求处理原则
 
@@ -35,6 +35,11 @@ GET /api/v1/openapi.json
 
 后续前端应基于该 OpenAPI 生成 TS client，避免手写 REST 类型漂移。
 
+## Health 与 Readiness
+
+- `/health` 是轻量 liveness endpoint，只表示 API 进程可响应。
+- `/ready` 会调用当前 `Store` 的 readiness check；`timescale` 模式会执行数据库 `SELECT 1`。Helm readiness probe 指向 `/ready`。
+
 ## 当前运行模式
 
 API main 会读取 `STORAGE_BACKEND`：
@@ -42,15 +47,14 @@ API main 会读取 `STORAGE_BACKEND`：
 | 值 | 行为 |
 | --- | --- |
 | `memory` | 正常启动，使用内存开发 store。 |
-| `postgres` | fail fast，提示 SQL repositories 尚未实现。 |
-| `timescale` | fail fast，提示 SQL repositories 尚未实现。 |
+| `timescale` | 使用 SQL repository，要求 `DATABASE_URL` 指向已初始化的 TimescaleDB schema；启动时执行 schema validation。 |
 | 其他 | fail fast。 |
 
-生产化前不应把 `memory` 模式暴露为真实 SaaS 环境。
+生产化前不应把 `memory` 模式暴露为真实 SaaS 环境。SQL repository 已覆盖控制面和 telemetry 表，但 session 仍在 API 进程内，生产需要迁移到持久 session/refresh-token 存储。
 
 ## 关键工程约束
 
 - 遥测和 Timescale 特性不通过 Toasty 抽象。
 - 控制面 repositories 可以在 `storage` 边界内替换为 Toasty/SQL 实现。
-- MQTT ingest 必须保持 project/device 作用域校验，不能只依赖 topic 字符串。
+- MQTT ingest 必须保持 project/device 作用域校验；本地 runtime 可按 topic 查 device，生产 runtime 必须额外绑定连接证书身份。
 - Worker 必须以幂等方式处理 action dispatcher、timeout、alert notification 和 export。

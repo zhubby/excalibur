@@ -1,26 +1,77 @@
-import { AlertTriangle, CheckCircle2, Clock3, PlayCircle } from "lucide-react";
-import { actionQueue, alertRules } from "@/lib/data";
+import { AlertTriangle, CheckCircle2, Clock3, PackageCheck, PlayCircle, Wrench } from "lucide-react";
+import type { ActionSummary, AlertSummary } from "@/lib/data";
 import { clampProgress } from "@/lib/protocol";
 
 const actionIcon = {
+  queued: Clock3,
   running: PlayCircle,
   completed: CheckCircle2,
+  failed: AlertTriangle,
+  cancelled: AlertTriangle,
+  "timed out": AlertTriangle,
   "waiting approval": Clock3,
 } as const;
 
-export function ActionQueuePanel() {
+type ActionQueuePanelProps = {
+  actions: ActionSummary[];
+  busy?: boolean;
+  canRunDeviceAction: boolean;
+  onCreateDiagnostics: () => void;
+  onCreateOta: () => void;
+  onCompleteLatest: () => void;
+};
+
+export function ActionQueuePanel({
+  actions,
+  busy = false,
+  canRunDeviceAction,
+  onCreateDiagnostics,
+  onCreateOta,
+  onCompleteLatest,
+}: ActionQueuePanelProps) {
   return (
     <section className="panel-in rounded-md border border-line bg-panel">
-      <div className="border-b border-line px-4 py-3">
-        <h2 className="text-base font-semibold text-ink">Actions</h2>
-        <p className="text-sm text-ink/54">OTA, diagnostics, and command progress.</p>
+      <div className="flex items-start justify-between gap-3 border-b border-line px-4 py-3">
+        <div>
+          <h2 className="text-base font-semibold text-ink">Actions</h2>
+          <p className="text-sm text-ink/54">OTA, diagnostics, and command progress.</p>
+        </div>
+        <div className="flex gap-1">
+          <button
+            className="grid h-8 w-8 place-items-center rounded-md border border-line bg-white text-ink/70 transition hover:border-ink/20 hover:text-ink disabled:cursor-not-allowed disabled:text-ink/24"
+            type="button"
+            aria-label="Create diagnostics action"
+            disabled={busy || !canRunDeviceAction}
+            onClick={onCreateDiagnostics}
+          >
+            <Wrench className="h-3.5 w-3.5" aria-hidden="true" />
+          </button>
+          <button
+            className="grid h-8 w-8 place-items-center rounded-md border border-line bg-white text-ink/70 transition hover:border-ink/20 hover:text-ink disabled:cursor-not-allowed disabled:text-ink/24"
+            type="button"
+            aria-label="Create OTA action"
+            disabled={busy || !canRunDeviceAction}
+            onClick={onCreateOta}
+          >
+            <PackageCheck className="h-3.5 w-3.5" aria-hidden="true" />
+          </button>
+          <button
+            className="grid h-8 w-8 place-items-center rounded-md border border-line bg-white text-ink/70 transition hover:border-ink/20 hover:text-ink disabled:cursor-not-allowed disabled:text-ink/24"
+            type="button"
+            aria-label="Complete latest action"
+            disabled={busy || actions.length === 0}
+            onClick={onCompleteLatest}
+          >
+            <CheckCircle2 className="h-3.5 w-3.5" aria-hidden="true" />
+          </button>
+        </div>
       </div>
       <div className="space-y-3 p-4">
-        {actionQueue.map((action) => {
+        {actions.map((action) => {
           const Icon = actionIcon[action.state as keyof typeof actionIcon] ?? PlayCircle;
           const progress = clampProgress(action.progress);
           return (
-            <article key={`${action.name}-${action.target}`} className="rounded-md border border-line bg-white p-3">
+            <article key={action.id} className="rounded-md border border-line bg-white p-3">
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
                   <p className="truncate text-sm font-semibold text-ink">{action.name}</p>
@@ -38,21 +89,45 @@ export function ActionQueuePanel() {
             </article>
           );
         })}
+        {actions.length === 0 ? (
+          <div className="rounded-md border border-line bg-white px-3 py-6 text-center text-sm text-ink/54">
+            No actions queued.
+          </div>
+        ) : null}
       </div>
     </section>
   );
 }
 
-export function AlertPanel() {
+export function AlertPanel({
+  rules,
+  busy = false,
+  onCreateDefault,
+}: {
+  rules: AlertSummary[];
+  busy?: boolean;
+  onCreateDefault: () => void;
+}) {
   return (
     <section className="panel-in rounded-md border border-line bg-panel">
-      <div className="border-b border-line px-4 py-3">
-        <h2 className="text-base font-semibold text-ink">Alerts</h2>
-        <p className="text-sm text-ink/54">Offline, threshold, and aggregate rules.</p>
+      <div className="flex items-start justify-between gap-3 border-b border-line px-4 py-3">
+        <div>
+          <h2 className="text-base font-semibold text-ink">Alerts</h2>
+          <p className="text-sm text-ink/54">Offline, threshold, and aggregate rules.</p>
+        </div>
+        <button
+          className="grid h-8 w-8 place-items-center rounded-md border border-line bg-white text-ink/70 transition hover:border-ink/20 hover:text-ink disabled:cursor-not-allowed disabled:text-ink/24"
+          type="button"
+          aria-label="Create default alert"
+          disabled={busy}
+          onClick={onCreateDefault}
+        >
+          <AlertTriangle className="h-3.5 w-3.5" aria-hidden="true" />
+        </button>
       </div>
       <div className="divide-y divide-line">
-        {alertRules.map((rule) => (
-          <article key={rule.name} className="flex items-start gap-3 px-4 py-3">
+        {rules.map((rule) => (
+          <article key={rule.id} className="flex items-start gap-3 px-4 py-3">
             <span className={`mt-0.5 grid h-8 w-8 place-items-center rounded-md ${rule.state === "firing" ? "bg-danger/10 text-danger" : "bg-teal/10 text-teal"}`}>
               <AlertTriangle className="h-4 w-4" aria-hidden="true" />
             </span>
@@ -65,8 +140,10 @@ export function AlertPanel() {
             </div>
           </article>
         ))}
+        {rules.length === 0 ? (
+          <div className="px-4 py-6 text-center text-sm text-ink/54">No alert rules configured.</div>
+        ) : null}
       </div>
     </section>
   );
 }
-

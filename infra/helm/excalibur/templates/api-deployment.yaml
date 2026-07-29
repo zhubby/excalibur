@@ -29,9 +29,13 @@ spec:
               value: {{ .Values.env.NATS_URL | quote }}
             - name: S3_ENDPOINT
               value: {{ .Values.env.S3_ENDPOINT | quote }}
+            - name: DEVICE_MQTT_BROKER
+              value: {{ .Values.env.DEVICE_MQTT_BROKER | quote }}
+            - name: DEVICE_MQTT_PORT
+              value: {{ .Values.env.DEVICE_MQTT_PORT | quote }}
           readinessProbe:
             httpGet:
-              path: /health
+              path: /ready
               port: {{ .Values.api.port }}
           livenessProbe:
             httpGet:

@@ -18,7 +18,7 @@
 | TimescaleDB | PostgreSQL 扩展，提供 hypertable、compression、retention 等时序能力。 |
 | Hypertable | TimescaleDB 的时序分区表。 |
 | NATS JetStream | 推荐的 ingest/worker 缓冲和事件流。 |
-| S3-compatible storage | MinIO、AWS S3 等对象存储，用于 firmware、diagnostics、export。 |
+| S3-compatible storage | RustFS、AWS S3 等对象存储，用于 firmware、diagnostics、export。 |
 | RBAC | Role-based access control，基于角色的访问控制。 |
 | Audit log | 安全敏感操作的追加日志。 |
 | Remote shell | 高风险 beta 能力，通过短时授权打开设备 shell tunnel。 |

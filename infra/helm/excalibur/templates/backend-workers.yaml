@@ -16,7 +16,14 @@ spec:
         - name: mqtt-ingest
           image: "{{ .Values.image.repository }}/mqtt-ingest:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: mqtt
+              containerPort: {{ .Values.mqttIngest.port }}
           env:
+            - name: MQTT_LISTEN
+              value: "0.0.0.0:{{ .Values.mqttIngest.port }}"
+            - name: STORAGE_BACKEND
+              value: {{ .Values.env.STORAGE_BACKEND | quote }}
             - name: DATABASE_URL
               value: {{ .Values.env.DATABASE_URL | quote }}
             - name: NATS_URL
@@ -28,6 +35,18 @@ spec:
             periodSeconds: 30
           resources:
 {{ toYaml .Values.mqttIngest.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-mqtt
+spec:
+  selector:
+    app: {{ .Release.Name }}-mqtt-ingest
+  ports:
+    - name: mqtt
+      port: {{ .Values.mqttIngest.port }}
+      targetPort: mqtt
 ---
 apiVersion: apps/v1
 kind: Deployment

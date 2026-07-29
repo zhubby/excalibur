@@ -20,7 +20,31 @@ spec:
           image: {{ .Values.migrations.image | quote }}
           command: ["/bin/sh", "-ec"]
           args:
-            - psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f /migrations/001_initial.sql
+            - |
+              psql "$DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
+              CREATE TABLE IF NOT EXISTS schema_migrations (
+                version TEXT PRIMARY KEY,
+                applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+              );
+              INSERT INTO schema_migrations (version)
+              SELECT '001_initial.sql'
+              WHERE to_regclass('public.users') IS NOT NULL
+                AND NOT EXISTS (
+                  SELECT 1 FROM schema_migrations WHERE version = '001_initial.sql'
+                );
+              SQL
+
+              for migration in /migrations/*.sql; do
+                version="$(basename "$migration")"
+                if [ "$(psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -Atc "SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = '$version')")" = "t" ]; then
+                  echo "Skipping already applied migration $version"
+                  continue
+                fi
+
+                echo "Applying migration $version"
+                psql "$DATABASE_URL" -v ON_ERROR_STOP=1 --single-transaction -f "$migration"
+                psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "INSERT INTO schema_migrations (version) VALUES ('$version')"
+              done
           env:
             - name: DATABASE_URL
               value: {{ .Values.env.DATABASE_URL | quote }}

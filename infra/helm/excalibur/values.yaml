@@ -16,6 +16,7 @@ api:
 
 mqttIngest:
   replicas: 2
+  port: 1883
   resources:
     requests:
       cpu: 100m
@@ -51,7 +52,9 @@ migrations:
   backoffLimit: 3
 
 env:
-  STORAGE_BACKEND: memory
+  STORAGE_BACKEND: timescale
   DATABASE_URL: postgres://excalibur:excalibur@timescaledb:5432/excalibur
   NATS_URL: nats://nats:4222
-  S3_ENDPOINT: http://minio:9000
+  S3_ENDPOINT: http://rustfs:9000
+  DEVICE_MQTT_BROKER: mqtt.local.excalibur.dev
+  DEVICE_MQTT_PORT: "1883"

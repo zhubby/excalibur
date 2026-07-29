@@ -9,7 +9,7 @@ backend/
   crates/
     device-protocol/     MQTT topic、device auth JSON、command payload 类型。
     domain/              用户、组织、项目、设备、证书、stream、action 等领域模型。
-    storage/             Store trait 边界和 in-memory development store。
+    storage/             MemoryStore、SQLx PgStore 和统一 Store 包装层。
   migrations/            TimescaleDB schema。
 
 device-agent/
@@ -21,7 +21,7 @@ device-agent/
 frontend/
   src/app/               Next.js App Router 页面和全局样式。
   src/components/        Console UI 组件。
-  src/lib/               静态 demo 数据和协议 helper。
+  src/lib/               API client、协议 helper 和共享 UI 类型。
 
 infra/
   helm/excalibur/        Kubernetes Helm chart。
@@ -33,7 +33,7 @@ docs/
   book.toml              mdBook 配置。
   src/                   本文档源文件。
 
-docker-compose.yml       本地 TimescaleDB、NATS、MinIO、应用服务拓扑。
+docker-compose.yml       本地 TimescaleDB、NATS、RustFS、应用服务拓扑。
 README.md                项目入口说明。
 ```
 

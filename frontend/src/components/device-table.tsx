@@ -6,7 +6,8 @@ import {
   getCoreRowModel,
   useReactTable,
 } from "@tanstack/react-table";
-import { Circle, MoreHorizontal, Terminal } from "lucide-react";
+import { Circle, Download, MoreHorizontal, RadioTower, Terminal } from "lucide-react";
+import { useMemo } from "react";
 import type { DeviceRow, DeviceStatus } from "@/lib/data";
 
 const statusClass: Record<DeviceStatus, string> = {
@@ -16,71 +17,121 @@ const statusClass: Record<DeviceStatus, string> = {
   provisioned: "bg-amber/10 text-amber",
 };
 
-const columns: ColumnDef<DeviceRow>[] = [
-  {
-    accessorKey: "name",
-    header: "Device",
-    cell: ({ row }) => (
-      <div className="min-w-0">
-        <p className="truncate font-medium text-ink">{row.original.name}</p>
-        <p className="truncate text-xs text-ink/48">{row.original.id}</p>
-      </div>
-    ),
-  },
-  {
-    accessorKey: "status",
-    header: "Status",
-    cell: ({ row }) => (
-      <span
-        className={`inline-flex items-center gap-1.5 rounded-sm px-2 py-1 text-xs font-medium ${statusClass[row.original.status]}`}
-      >
-        <Circle className="h-2.5 w-2.5 fill-current" aria-hidden="true" />
-        {row.original.status}
-      </span>
-    ),
-  },
-  {
-    accessorKey: "stream",
-    header: "Stream",
-  },
-  {
-    accessorKey: "firmware",
-    header: "Firmware",
-  },
-  {
-    accessorKey: "lastSeen",
-    header: "Last seen",
-  },
-  {
-    accessorKey: "rssi",
-    header: "RSSI",
-    cell: ({ row }) => <span>{row.original.rssi === 0 ? "-" : `${row.original.rssi} dBm`}</span>,
-  },
-  {
-    id: "actions",
-    header: "",
-    cell: () => (
-      <div className="flex justify-end gap-1">
-        <button
-          className="grid h-8 w-8 place-items-center rounded-md text-ink/60 transition hover:bg-ink/5 hover:text-ink"
-          type="button"
-          aria-label="Open shell"
-        >
-          <Terminal className="h-4 w-4" aria-hidden="true" />
-        </button>
-        <button
-          className="grid h-8 w-8 place-items-center rounded-md text-ink/60 transition hover:bg-ink/5 hover:text-ink"
-          type="button"
-          aria-label="More device actions"
-        >
-          <MoreHorizontal className="h-4 w-4" aria-hidden="true" />
-        </button>
-      </div>
-    ),
-  },
-];
+type DeviceTableProps = {
+  data: DeviceRow[];
+  selectedDeviceId?: string;
+  busy?: boolean;
+  onCreateDevice: () => void;
+  onSelectDevice: (deviceId: string) => void;
+  onDownloadDevAuth: (deviceId: string) => void;
+  onIngestSample: (deviceId: string) => void;
+};
 
-export function DeviceTable({ data }: { data: DeviceRow[] }) {
+export function DeviceTable({
+  data,
+  selectedDeviceId,
+  busy = false,
+  onCreateDevice,
+  onSelectDevice,
+  onDownloadDevAuth,
+  onIngestSample,
+}: DeviceTableProps) {
+  const columns = useMemo<ColumnDef<DeviceRow>[]>(
+    () => [
+      {
+        accessorKey: "name",
+        header: "Device",
+        cell: ({ row }) => (
+          <div className="min-w-0">
+            <p className="truncate font-medium text-ink">{row.original.name}</p>
+            <p className="truncate text-xs text-ink/48">{row.original.id}</p>
+          </div>
+        ),
+      },
+      {
+        accessorKey: "status",
+        header: "Status",
+        cell: ({ row }) => (
+          <span
+            className={`inline-flex items-center gap-1.5 rounded-sm px-2 py-1 text-xs font-medium ${statusClass[row.original.status]}`}
+          >
+            <Circle className="h-2.5 w-2.5 fill-current" aria-hidden="true" />
+            {row.original.status}
+          </span>
+        ),
+      },
+      {
+        accessorKey: "stream",
+        header: "Stream",
+        cell: ({ row }) => <span className="truncate">{row.original.stream}</span>,
+      },
+      {
+        accessorKey: "firmware",
+        header: "Firmware",
+      },
+      {
+        accessorKey: "lastSeen",
+        header: "Last seen",
+      },
+      {
+        accessorKey: "rssi",
+        header: "RSSI",
+        cell: ({ row }) => <span>{row.original.rssi === null ? "-" : `${row.original.rssi} dBm`}</span>,
+      },
+      {
+        id: "actions",
+        header: "",
+        cell: ({ row }) => (
+          <div className="flex justify-end gap-1">
+            <button
+              className="grid h-8 w-8 place-items-center rounded-md text-ink/60 transition hover:bg-ink/5 hover:text-ink disabled:cursor-not-allowed disabled:text-ink/24"
+              type="button"
+              aria-label={`Download dev auth for ${row.original.name}`}
+              disabled={busy}
+              onClick={(event) => {
+                event.stopPropagation();
+                onDownloadDevAuth(row.original.id);
+              }}
+            >
+              <Download className="h-4 w-4" aria-hidden="true" />
+            </button>
+            <button
+              className="grid h-8 w-8 place-items-center rounded-md text-ink/60 transition hover:bg-ink/5 hover:text-ink disabled:cursor-not-allowed disabled:text-ink/24"
+              type="button"
+              aria-label={`Ingest sample telemetry for ${row.original.name}`}
+              disabled={busy}
+              onClick={(event) => {
+                event.stopPropagation();
+                onIngestSample(row.original.id);
+              }}
+            >
+              <RadioTower className="h-4 w-4" aria-hidden="true" />
+            </button>
+            <button
+              className="grid h-8 w-8 place-items-center rounded-md bg-paper text-ink/32"
+              type="button"
+              aria-label="Remote shell disabled"
+              disabled
+            >
+              <Terminal className="h-4 w-4" aria-hidden="true" />
+            </button>
+            <button
+              className="grid h-8 w-8 place-items-center rounded-md text-ink/60 transition hover:bg-ink/5 hover:text-ink"
+              type="button"
+              aria-label={`Select ${row.original.name}`}
+              onClick={(event) => {
+                event.stopPropagation();
+                onSelectDevice(row.original.id);
+              }}
+            >
+              <MoreHorizontal className="h-4 w-4" aria-hidden="true" />
+            </button>
+          </div>
+        ),
+      },
+    ],
+    [busy, onDownloadDevAuth, onIngestSample, onSelectDevice],
+  );
   const table = useReactTable({
     data,
     columns,
@@ -94,7 +145,12 @@ export function DeviceTable({ data }: { data: DeviceRow[] }) {
           <h2 className="text-base font-semibold text-ink">Devices</h2>
           <p className="text-sm text-ink/54">Provisioning, shadow state, firmware, and diagnostics.</p>
         </div>
-        <button className="inline-flex h-9 items-center justify-center rounded-md bg-teal px-3 text-sm font-medium text-white transition hover:bg-teal/90" type="button">
+        <button
+          className="inline-flex h-9 items-center justify-center rounded-md bg-teal px-3 text-sm font-medium text-white transition hover:bg-teal/90 disabled:cursor-not-allowed disabled:bg-ink/20"
+          type="button"
+          disabled={busy}
+          onClick={onCreateDevice}
+        >
           Provision device
         </button>
       </div>
@@ -113,7 +169,13 @@ export function DeviceTable({ data }: { data: DeviceRow[] }) {
           </thead>
           <tbody className="divide-y divide-line">
             {table.getRowModel().rows.map((row) => (
-              <tr key={row.id} className="transition hover:bg-paper/60">
+              <tr
+                key={row.id}
+                className={`cursor-pointer transition hover:bg-paper/60 ${
+                  selectedDeviceId === row.original.id ? "bg-teal/5" : ""
+                }`}
+                onClick={() => onSelectDevice(row.original.id)}
+              >
                 {row.getVisibleCells().map((cell) => (
                   <td key={cell.id} className="px-4 py-3 text-ink/72">
                     {flexRender(cell.column.columnDef.cell, cell.getContext())}
@@ -121,6 +183,13 @@ export function DeviceTable({ data }: { data: DeviceRow[] }) {
                 ))}
               </tr>
             ))}
+            {table.getRowModel().rows.length === 0 ? (
+              <tr>
+                <td className="px-4 py-8 text-center text-sm text-ink/54" colSpan={columns.length}>
+                  No devices in this project yet.
+                </td>
+              </tr>
+            ) : null}
           </tbody>
         </table>
       </div>

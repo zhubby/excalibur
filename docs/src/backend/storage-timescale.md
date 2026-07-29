@@ -7,7 +7,9 @@ Excalibur 使用一个 TimescaleDB 集群承载控制面 PostgreSQL 表和遥测
 当前 schema 位于：
 
 - `backend/migrations/001_initial.sql`
+- `backend/migrations/002_sql_repository_upgrade.sql`
 - `infra/helm/excalibur/migrations/001_initial.sql`
+- `infra/helm/excalibur/migrations/002_sql_repository_upgrade.sql`
 
 它包含：
 
@@ -16,6 +18,7 @@ Excalibur 使用一个 TimescaleDB 集群承载控制面 PostgreSQL 表和遥测
 - enum 类型：`member_role`、`device_status`、`certificate_status`、`action_state`、`alert_kind`。
 - 控制面表：`users`、`orgs`、`memberships`、`projects`、`devices`、`device_certificates`、`stream_definitions`、`actions`、`action_targets`、`firmware_artifacts`、`dashboards`、`alert_rules`、`audit_logs`。
 - 遥测表：`telemetry_points` hypertable。
+- 遥测去重表：`telemetry_sequence_dedup`，按 `(project_id, device_id, stream, sequence)` 保证重放幂等。
 
 ## 控制面表
 
@@ -39,11 +42,14 @@ orgs
 
 关键约束：
 
+- `users` 保留 `UNIQUE (email)`，并额外用 `users_email_lower_unique_idx` 强制大小写不敏感的邮箱唯一性。
 - `projects` 使用 `UNIQUE (org_id, slug)`。
+- `projects` 额外使用 `UNIQUE (org_id, id)`，为 audit log 的 org/project 复合外键提供租户约束。
 - `devices` 使用 `UNIQUE (project_id, id)`，为复合外键提供租户约束。
 - `device_certificates` 通过 `(project_id, device_id)` 引用 devices，避免跨项目证书绑定。
 - `actions` 使用 `UNIQUE (project_id, id)`，`action_targets` 通过 `(project_id, action_id)` 和 `(project_id, device_id)` 绑定作用域。
-- `audit_logs_scope_idx` 支持 org/project 范围查询。
+- `audit_logs` 通过 `(org_id, project_id)` 引用 projects，避免 audit entry 绑定到错误 org。
+- `audit_logs_scope_idx` 和 `audit_logs_org_created_idx` 支持 project-scoped 和 org-scoped 最新日志查询。
 
 ## Telemetry hypertable
 
@@ -59,20 +65,34 @@ orgs
 | `payload` | JSONB | stream payload fields。 |
 | `ingested_at` | TIMESTAMPTZ | 平台接收时间。 |
 
-Primary key：
+Hypertable primary key：
 
 ```sql
 PRIMARY KEY (project_id, device_id, stream, sequence, ts)
 ```
 
+TimescaleDB 要求 hypertable 的唯一约束包含时间维度，因此逻辑去重不直接依赖该 primary key。写入路径会先插入 `telemetry_sequence_dedup`：
+
+```sql
+PRIMARY KEY (project_id, device_id, stream, sequence)
+```
+
+只有新 sequence key 才会进入 `telemetry_points`；同一个设备、stream、sequence 即使带不同 timestamp 重放，也会被忽略。
+
 Indexes：
 
 ```sql
-CREATE INDEX telemetry_points_project_stream_ts_idx
-  ON telemetry_points (project_id, stream, ts DESC);
+CREATE INDEX telemetry_points_project_ts_idx
+  ON telemetry_points (project_id, ts DESC, sequence DESC);
 
-CREATE INDEX telemetry_points_device_ts_idx
-  ON telemetry_points (device_id, ts DESC);
+CREATE INDEX telemetry_points_project_stream_ts_idx
+  ON telemetry_points (project_id, stream, ts DESC, sequence DESC);
+
+CREATE INDEX telemetry_points_project_device_ts_idx
+  ON telemetry_points (project_id, device_id, ts DESC, sequence DESC);
+
+CREATE INDEX telemetry_points_project_device_stream_ts_idx
+  ON telemetry_points (project_id, device_id, stream, ts DESC, sequence DESC);
 ```
 
 Timescale policies：
@@ -96,11 +116,48 @@ Toasty 只适合控制面强模型。遥测路径必须绕开 ORM，原因是：
 - Timescale hypertable、compression、retention、continuous aggregate 需要 raw SQL 或 migration 管理。
 - Dashboard 查询常用窗口聚合和 downsampling，不适合被通用 ORM 隐藏。
 
-推荐实现方式：
+当前实现方式：
 
-- 控制面 repositories 可在 `backend/crates/storage` 中引入 Toasty 或 SQLx。
-- Telemetry ingest 使用 SQLx raw query、COPY、prepared batch insert 或专用 writer。
+- 控制面 repositories 已在 `backend/crates/storage` 中通过 SQLx raw queries 实现。
+- Telemetry ingest 使用 SQLx chunked bulk insert，并通过 `telemetry_sequence_dedup` 做 sequence 幂等；后续更高吞吐路径可替换为 COPY 或专用 writer。
 - Timescale policies、continuous aggregates 和 retention 通过 migration 管理。
+
+## SQL repository 实现
+
+`backend/crates/storage` 提供两个后端：
+
+- `MemoryStore`：开发和单元测试使用。
+- `PgStore`：SQL repository，连接 PostgreSQL/TimescaleDB。
+
+API 通过统一 `Store` enum 调用 repository 方法，`STORAGE_BACKEND=timescale` 会创建 `PgStore` 并校验 TimescaleDB schema。SQL repository 覆盖：
+
+- users、orgs、memberships、projects。
+- devices、device_certificates、shadow/online heartbeat。
+- stream definitions。
+- telemetry_points 写入和查询。
+- actions 与 action_targets；父 action 状态和进度从所有 target 聚合，避免单个设备完成时把批量 action 误标为完成。
+- firmware_artifacts。
+- dashboards。
+- alert_rules。
+- audit_logs。
+
+SQL-backed 启动：
+
+```bash
+DATABASE_URL=postgres://excalibur:excalibur@localhost:5432/excalibur \
+  STORAGE_BACKEND=timescale \
+  cargo run -p excalibur-api
+```
+
+本地 SQL contract test：
+
+```bash
+EXCALIBUR_SQL_TEST_DATABASE_URL=postgres://excalibur:excalibur@localhost:5432/excalibur \
+  RUSTUP_TOOLCHAIN=stable \
+  cargo test -p excalibur-storage pg_store_contract_runs_when_database_url_is_set -- --nocapture
+```
+
+未设置 `EXCALIBUR_SQL_TEST_DATABASE_URL` 时，本地测试会跳过 live SQL contract。设置该变量后，storage contract 会覆盖 SQL schema validation、tenant scope、telemetry sequence 去重和多 target action 聚合；mqtt-ingest 也有同变量门控的 SQL-backed ingest contract。CI workflow 会启动 TimescaleDB 并设置该变量，因此 SQL contract 在 CI 中强制执行。
 
 ## 生产 repository 要求
 
@@ -109,8 +166,8 @@ SQL repository 必须满足：
 - 每个 project-scoped 查询都显式带 `project_id`。
 - 写入前检查外键和 project scope。
 - 对创建 action 和 action_targets 使用事务。
-- 对 certificate revoke 使用事务并保持幂等。
-- 对 telemetry ingest 支持批量写入和重复 sequence 冲突策略。
+- 对 telemetry ingest 使用事务，并通过 `telemetry_sequence_dedup` 对重复 `(project_id, device_id, stream, sequence)` 执行 `ON CONFLICT DO NOTHING`。
+- 启动 schema validation 必须验证 `telemetry_points` 是 Timescale hypertable，并且 compression/retention policy 已存在。
 - 对 audit log 使用 append-only 语义。
 - 对 API key、refresh token、device certificate fingerprint 只保存 hash 或 fingerprint，不保存敏感明文。
 

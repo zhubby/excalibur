@@ -7,7 +7,7 @@ Excalibur 采用清晰的控制面、数据面和设备端分层。控制面处�
 ```mermaid
 flowchart LR
   Console["Next.js Console"] --> API["Axum API"]
-  API --> Store["Storage Trait / Memory Store"]
+  API --> Store["Store / SQLx Repositories"]
   Store --> Timescale["TimescaleDB"]
   API --> ObjectStore["S3-compatible Storage"]
   API --> NATS["NATS JetStream"]
@@ -30,7 +30,7 @@ flowchart LR
 1. 用户通过 Console 调用 `/api/v1/auth/register` 或 `/api/v1/auth/login` 获取 session token。
 2. Console 调用 org/project/device/stream/action/firmware/dashboard/alert/audit API。
 3. API 通过 RBAC 检查访问权限，所有项目级资源都带 `project_id`。
-4. 当前实现写入 `MemoryStore`；生产实现会把 store trait 替换为 SQL repositories。
+4. 开发模式写入 `MemoryStore`；`timescale` 模式写入 `PgStore` SQL repositories。
 5. API 暴露 `/api/v1/openapi.json`，后续前端 TS client 应由 OpenAPI 生成。
 
 ## 设备数据路径
@@ -38,11 +38,11 @@ flowchart LR
 1. 设备通过 CSR 或 dev auth JSON 获得 broker、project_id、device_id、CA、device cert 和私钥路径。
 2. `device-agent` 使用 mTLS 连接 MQTT broker。
 3. 设备向 `v1/p/{project_id}/d/{device_id}/telemetry/{stream}` 发布 JSON array。
-4. MQTT runtime hook 调用 `mqtt-ingest` ACL，确认 topic project/device 与证书身份一致。
+4. MQTT runtime 调用 `mqtt-ingest` ingest path；本地 runtime 会按 topic 查 device，生产 hook 还必须确认 topic project/device 与证书身份一致。
 5. ingest 解码 payload，触发 heartbeat，批量写入 TimescaleDB hypertable，必要时写入 NATS JetStream。
 6. Dashboard query 从 TimescaleDB 查询 raw rows、continuous aggregate 或 cache。
 
-当前仓库已实现第 3 到第 5 步中的 topic parser、payload decoder、ACL 和内存 store 写入；真实 broker hook、NATS buffer 和 SQL 写入仍待生产化。
+当前仓库已实现第 3 到第 5 步中的本地 rumqttd listener、topic parser、payload decoder、ACL、内存 store 写入和 SQL repository 写入；生产 mTLS broker hook、NATS buffer 和高吞吐 COPY writer 仍待生产化。
 
 ## 命令路径
 
@@ -59,13 +59,13 @@ flowchart LR
 
 | 数据 | 生产存储 | 当前实现 |
 | --- | --- | --- |
-| 用户、组织、项目、设备、证书 | PostgreSQL tables via TimescaleDB | `MemoryStore` |
-| Stream definition | PostgreSQL tables | `MemoryStore` |
-| Telemetry points | TimescaleDB hypertable | `MemoryStore` vector + migration |
-| Device latest shadow | `devices.latest_shadow` 或 materialized table | `MemoryStore` device field |
-| Actions and action targets | PostgreSQL tables | action aggregate in `MemoryStore` |
-| Firmware metadata | PostgreSQL tables + S3 object | metadata in `MemoryStore` |
-| Audit logs | PostgreSQL table | `MemoryStore` vector |
+| 用户、组织、项目、设备、证书 | PostgreSQL tables via TimescaleDB | `MemoryStore` 和 `PgStore` |
+| Stream definition | PostgreSQL tables | `MemoryStore` 和 `PgStore` |
+| Telemetry points | TimescaleDB hypertable | `MemoryStore` vector 和 `PgStore` raw SQL |
+| Device latest shadow | `devices.latest_shadow` 或 materialized table | `MemoryStore` device field 和 `PgStore` `devices.latest_shadow` |
+| Actions and action targets | PostgreSQL tables | `MemoryStore` aggregate action 和 `PgStore` action/action_targets tables |
+| Firmware metadata | PostgreSQL tables + S3/RustFS object | metadata in `MemoryStore` 和 `PgStore` |
+| Audit logs | PostgreSQL table | `MemoryStore` vector 和 `PgStore` append-only insert |
 | Diagnostics files | S3-compatible storage | planned |
 
 ## 关键边界

@@ -4,17 +4,18 @@
 
 ## Milestone 1: 持久控制面
 
-目标：
+状态：SQL repository 已实现，Helm chart 已有轻量 versioned migration runner；session 持久化和生产级 migration 运维流程仍待完成。
 
-- 实现 SQL repositories。
-- API 从 `MemoryStore` 切换到 TimescaleDB/PostgreSQL。
+剩余目标：
+
 - 保持所有 tenant scope 测试。
-- 引入 migration runner。
+- 硬化 migration runner 的回滚、锁、审计和失败恢复流程。
+- 将 session、refresh token、API key 存储迁移到 SQL。
 
 验收：
 
 - `STORAGE_BACKEND=timescale` 可启动。
-- backend tests 同时覆盖 memory 和 SQL。
+- backend tests 覆盖 memory；CI 设置 `EXCALIBUR_SQL_TEST_DATABASE_URL` 后强制覆盖 SQL contract。
 - org/project/device/action/audit 数据重启后保留。
 
 ## Milestone 2: 真实 PKI 与 MQTT runtime
@@ -99,7 +100,7 @@
 验收：
 
 - 前端 E2E 覆盖关键工作流。
-- 无静态 demo 数据依赖。
+- MVP 首页已改为 API-backed 数据；生产化仍需拆分真实二级页面。
 - 错误态、加载态、空态完整。
 
 ## Milestone 7: Remote Shell Beta

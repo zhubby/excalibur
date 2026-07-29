@@ -12,7 +12,7 @@
 | Frontend | Next.js build 和 HTTP readiness。 |
 | TimescaleDB | `pg_isready`、连接池、chunk/retention/compression 状态。 |
 | NATS | JetStream health、consumer lag、ack pending。 |
-| MinIO/S3 | bucket availability、signed URL success、object age。 |
+| RustFS/S3 | bucket availability、signed URL success、object age。 |
 
 ## 日志
 

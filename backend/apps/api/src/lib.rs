@@ -23,7 +23,7 @@ use excalibur_domain::{
     DeviceCertificate, FirmwareArtifact, Id, Org, Project, Role, StreamDefinition, StreamField,
     StreamFieldType, TelemetryPoint, User,
 };
-use excalibur_storage::{MemoryStore, StoreError, map_terminal_action_state};
+use excalibur_storage::{Store, StoreError, map_terminal_action_state};
 use futures_util::stream;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -34,14 +34,23 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct AppState {
-    pub store: MemoryStore,
+    pub store: Store,
     sessions: Arc<RwLock<HashMap<String, Id>>>,
 }
 
 impl Default for AppState {
     fn default() -> Self {
         Self {
-            store: MemoryStore::new(),
+            store: Store::memory(),
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+}
+
+impl AppState {
+    pub fn new(store: Store) -> Self {
+        Self {
+            store,
             sessions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -54,6 +63,7 @@ pub fn app() -> Router {
 pub fn app_with_state(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/ready", get(readiness))
         .route("/api/v1/openapi.json", get(openapi))
         .route("/api/v1/events", get(events))
         .route("/api/v1/auth/register", post(register))
@@ -103,6 +113,7 @@ pub fn app_with_state(state: AppState) -> Router {
 #[openapi(
     paths(
         health,
+        readiness,
         register,
         login,
         create_org,
@@ -190,6 +201,10 @@ impl From<StoreError> for ApiError {
                 ApiError::Conflict(format!("{resource} already exists"))
             }
             StoreError::TenantScope => ApiError::Unauthorized("tenant scope violation".to_owned()),
+            StoreError::Database(detail) => {
+                tracing::error!(%detail, "storage operation failed");
+                ApiError::Internal("storage operation failed".to_owned())
+            }
         }
     }
 }
@@ -208,6 +223,15 @@ async fn health() -> Json<HealthResponse> {
         status: "ok",
         service: "excalibur-api",
     })
+}
+
+#[utoipa::path(get, path = "/ready", responses((status = 200, body = HealthResponse)))]
+async fn readiness(State(state): State<AppState>) -> Result<Json<HealthResponse>, ApiError> {
+    state.store.health_check().await?;
+    Ok(Json(HealthResponse {
+        status: "ready",
+        service: "excalibur-api",
+    }))
 }
 
 async fn openapi() -> Json<utoipa::openapi::OpenApi> {
@@ -238,7 +262,7 @@ async fn require_org_role(
     let role = state
         .store
         .user_role(org_id, actor_id)
-        .await
+        .await?
         .ok_or_else(|| ApiError::Unauthorized("org access denied".to_owned()))?;
     if role.permits(minimum) {
         Ok(role)
@@ -268,6 +292,14 @@ async fn require_project_access(
     project_id: Id,
 ) -> Result<Project, ApiError> {
     require_project_role(state, actor_id, project_id, Role::Viewer).await
+}
+
+async fn record_audit(state: &AppState, audit: AuditLog) {
+    let action = audit.action.clone();
+    let resource = audit.resource.clone();
+    if let Err(error) = state.store.append_audit(audit).await {
+        tracing::warn!(?error, %action, %resource, "audit log append failed");
+    }
 }
 
 async fn events(
@@ -379,24 +411,25 @@ async fn create_org(
         .store
         .create_org(Org::new(request.name, request.slug), actor_id)
         .await?;
-    state
-        .store
-        .append_audit(AuditLog::new(
+    record_audit(
+        &state,
+        AuditLog::new(
             org.id,
             None,
             Some(actor_id),
             "org.create",
             format!("org:{}", org.id),
             json!({ "name": org.name }),
-        ))
-        .await;
+        ),
+    )
+    .await;
     Ok(Json(org))
 }
 
 #[utoipa::path(get, path = "/api/v1/orgs", responses((status = 200)))]
 async fn list_orgs(headers: HeaderMap, State(state): State<AppState>) -> ApiResult<Vec<Org>> {
     let actor_id = require_actor(&headers, &state).await?;
-    Ok(Json(state.store.list_orgs_for_user(actor_id).await))
+    Ok(Json(state.store.list_orgs_for_user(actor_id).await?))
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -427,17 +460,18 @@ async fn create_project(
         .store
         .create_project(Project::new(request.org_id, request.name, request.slug))
         .await?;
-    state
-        .store
-        .append_audit(AuditLog::new(
+    record_audit(
+        &state,
+        AuditLog::new(
             project.org_id,
             Some(project.id),
             Some(actor_id),
             "project.create",
             format!("project:{}", project.id),
             json!({ "name": project.name }),
-        ))
-        .await;
+        ),
+    )
+    .await;
     Ok(Json(project))
 }
 
@@ -452,7 +486,7 @@ async fn list_projects(
         .org_id
         .ok_or_else(|| ApiError::BadRequest("org_id is required".to_owned()))?;
     require_org_access(&state, actor_id, org_id).await?;
-    Ok(Json(state.store.list_projects(org_id).await))
+    Ok(Json(state.store.list_projects(org_id).await?))
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -480,17 +514,18 @@ async fn create_device(
             request.metadata,
         ))
         .await?;
-    state
-        .store
-        .append_audit(AuditLog::new(
+    record_audit(
+        &state,
+        AuditLog::new(
             project.org_id,
             Some(project.id),
             Some(actor_id),
             "device.create",
             format!("device:{}", device.id),
             json!({ "name": device.name }),
-        ))
-        .await;
+        ),
+    )
+    .await;
     Ok(Json(device))
 }
 
@@ -505,7 +540,7 @@ async fn list_devices(
         .project_id
         .ok_or_else(|| ApiError::BadRequest("project_id is required".to_owned()))?;
     require_project_access(&state, actor_id, project_id).await?;
-    Ok(Json(state.store.list_devices(project_id).await))
+    Ok(Json(state.store.list_devices(project_id).await?))
 }
 
 #[utoipa::path(post, path = "/api/v1/devices/{device_id}/provision", params(("device_id" = String, Path)), responses((status = 200)))]
@@ -519,7 +554,7 @@ async fn provision_device(
     let project_id = query
         .project_id
         .ok_or_else(|| ApiError::BadRequest("project_id is required".to_owned()))?;
-    require_project_role(&state, actor_id, project_id, Role::Operator).await?;
+    let project = require_project_role(&state, actor_id, project_id, Role::Operator).await?;
     let _device = state.store.get_device(project_id, device_id).await?;
     let config = issue_device_auth_config(
         &state,
@@ -530,6 +565,18 @@ async fn provision_device(
         None,
     )
     .await?;
+    record_audit(
+        &state,
+        AuditLog::new(
+            project.org_id,
+            Some(project.id),
+            Some(actor_id),
+            "device.dev_auth_download",
+            format!("device:{device_id}"),
+            json!({ "production": false, "legacy_endpoint": true }),
+        ),
+    )
+    .await;
     Ok(Json(config))
 }
 
@@ -571,17 +618,18 @@ async fn provision_device_csr(
     )
     .await?;
     let project = state.store.get_project(request.project_id).await?;
-    state
-        .store
-        .append_audit(AuditLog::new(
+    record_audit(
+        &state,
+        AuditLog::new(
             project.org_id,
             Some(project.id),
             Some(actor_id),
             "device.csr_sign",
             format!("device:{device_id}"),
             json!({ "production": true }),
-        ))
-        .await;
+        ),
+    )
+    .await;
     Ok(Json(config))
 }
 
@@ -604,17 +652,18 @@ async fn provision_device_dev_auth(
     )
     .await?;
     let project = state.store.get_project(request.project_id).await?;
-    state
-        .store
-        .append_audit(AuditLog::new(
+    record_audit(
+        &state,
+        AuditLog::new(
             project.org_id,
             Some(project.id),
             Some(actor_id),
             "device.dev_auth_download",
             format!("device:{device_id}"),
             json!({ "production": false }),
-        ))
-        .await;
+        ),
+    )
+    .await;
     Ok(Json(config))
 }
 
@@ -634,17 +683,18 @@ async fn revoke_device_certificate(
         .store
         .revoke_device_certificate(project_id, device_id, certificate_id)
         .await?;
-    state
-        .store
-        .append_audit(AuditLog::new(
+    record_audit(
+        &state,
+        AuditLog::new(
             project.org_id,
             Some(project.id),
             Some(actor_id),
             "device.certificate_revoke",
             format!("certificate:{certificate_id}"),
             json!({ "device_id": device_id }),
-        ))
-        .await;
+        ),
+    )
+    .await;
     Ok(Json(certificate))
 }
 
@@ -668,8 +718,8 @@ async fn issue_device_auth_config(
         ))
         .await?;
     Ok(DeviceConfig {
-        broker: "mqtt.local.excalibur.dev".to_owned(),
-        port: 8883,
+        broker: device_mqtt_broker(),
+        port: device_mqtt_port(),
         project_id,
         device_id,
         authentication: DeviceAgentAuthentication {
@@ -681,6 +731,17 @@ async fn issue_device_auth_config(
         production: matches!(provisioning_mode, ProvisioningMode::Csr),
         provisioning_mode,
     })
+}
+
+fn device_mqtt_broker() -> String {
+    std::env::var("DEVICE_MQTT_BROKER").unwrap_or_else(|_| "localhost".to_owned())
+}
+
+fn device_mqtt_port() -> u16 {
+    std::env::var("DEVICE_MQTT_PORT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1883)
 }
 
 fn fake_fingerprint() -> String {
@@ -746,7 +807,8 @@ async fn create_stream(
     Json(request): Json<CreateStreamRequest>,
 ) -> ApiResult<StreamDefinition> {
     let actor_id = require_actor(&headers, &state).await?;
-    require_project_role(&state, actor_id, request.project_id, Role::Operator).await?;
+    let project =
+        require_project_role(&state, actor_id, request.project_id, Role::Operator).await?;
     let fields = request
         .fields
         .into_iter()
@@ -756,16 +818,27 @@ async fn create_stream(
             required: field.required,
         })
         .collect();
-    Ok(Json(
-        state
-            .store
-            .create_stream(StreamDefinition::new(
-                request.project_id,
-                request.name,
-                fields,
-            ))
-            .await?,
-    ))
+    let stream = state
+        .store
+        .create_stream(StreamDefinition::new(
+            request.project_id,
+            request.name,
+            fields,
+        ))
+        .await?;
+    record_audit(
+        &state,
+        AuditLog::new(
+            project.org_id,
+            Some(project.id),
+            Some(actor_id),
+            "stream.create",
+            format!("stream:{}", stream.id),
+            json!({ "name": stream.name }),
+        ),
+    )
+    .await;
+    Ok(Json(stream))
 }
 
 #[utoipa::path(get, path = "/api/v1/streams", params(ProjectQuery), responses((status = 200)))]
@@ -779,7 +852,7 @@ async fn list_streams(
         .project_id
         .ok_or_else(|| ApiError::BadRequest("project_id is required".to_owned()))?;
     require_project_access(&state, actor_id, project_id).await?;
-    Ok(Json(state.store.list_streams(project_id).await))
+    Ok(Json(state.store.list_streams(project_id).await?))
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -892,7 +965,7 @@ async fn query_telemetry(
                 query.stream.as_deref(),
                 query.limit.unwrap_or(100).min(1000),
             )
-            .await,
+            .await?,
     ))
 }
 
@@ -913,7 +986,8 @@ async fn create_action(
     Json(request): Json<CreateActionRequest>,
 ) -> ApiResult<Action> {
     let actor_id = require_actor(&headers, &state).await?;
-    require_project_role(&state, actor_id, request.project_id, Role::Operator).await?;
+    let project =
+        require_project_role(&state, actor_id, request.project_id, Role::Operator).await?;
     if request.device_ids.is_empty() {
         return Err(ApiError::BadRequest(
             "device_ids must not be empty".to_owned(),
@@ -926,18 +1000,29 @@ async fn create_action(
             .await?;
     }
     validate_device_action(&request.name, &request.payload)?;
-    Ok(Json(
-        state
-            .store
-            .create_action(Action::new(
-                request.project_id,
-                request.device_ids,
-                request.name,
-                request.payload,
-                Some(actor_id),
-            ))
-            .await?,
-    ))
+    let action = state
+        .store
+        .create_action(Action::new(
+            request.project_id,
+            request.device_ids,
+            request.name,
+            request.payload,
+            Some(actor_id),
+        ))
+        .await?;
+    record_audit(
+        &state,
+        AuditLog::new(
+            project.org_id,
+            Some(project.id),
+            Some(actor_id),
+            "action.create",
+            format!("action:{}", action.id),
+            json!({ "name": action.name, "target_count": action.device_ids.len() }),
+        ),
+    )
+    .await;
+    Ok(Json(action))
 }
 
 fn validate_device_action(name: &str, payload: &Value) -> Result<(), ApiError> {
@@ -978,7 +1063,7 @@ async fn list_actions(
         .project_id
         .ok_or_else(|| ApiError::BadRequest("project_id is required".to_owned()))?;
     require_project_access(&state, actor_id, project_id).await?;
-    Ok(Json(state.store.list_actions(project_id).await))
+    Ok(Json(state.store.list_actions(project_id).await?))
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1025,21 +1110,36 @@ async fn update_action_status(
     Json(request): Json<ActionStatusRequest>,
 ) -> ApiResult<Action> {
     let actor_id = require_actor(&headers, &state).await?;
-    require_project_role(&state, actor_id, request.project_id, Role::Operator).await?;
-    Ok(Json(
-        state
-            .store
-            .update_action_status(ActionStatusUpdate {
-                project_id: request.project_id,
-                action_id,
-                device_id: request.device_id,
-                state: request.state.into(),
-                progress: request.progress.min(100),
-                errors: request.errors,
-                ts: Utc::now(),
-            })
-            .await?,
-    ))
+    let project =
+        require_project_role(&state, actor_id, request.project_id, Role::Operator).await?;
+    let action_state = ActionState::from(request.state);
+    let progress = request.progress.min(100);
+    let device_id = request.device_id;
+    let action = state
+        .store
+        .update_action_status(ActionStatusUpdate {
+            project_id: request.project_id,
+            action_id,
+            device_id,
+            state: action_state.clone(),
+            progress,
+            errors: request.errors,
+            ts: Utc::now(),
+        })
+        .await?;
+    record_audit(
+        &state,
+        AuditLog::new(
+            project.org_id,
+            Some(project.id),
+            Some(actor_id),
+            "action.status_update",
+            format!("action:{action_id}"),
+            json!({ "device_id": device_id, "state": format!("{action_state:?}"), "progress": progress }),
+        ),
+    )
+    .await;
+    Ok(Json(action))
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1060,20 +1160,32 @@ async fn create_firmware(
     Json(request): Json<CreateFirmwareRequest>,
 ) -> ApiResult<FirmwareArtifact> {
     let actor_id = require_actor(&headers, &state).await?;
-    require_project_role(&state, actor_id, request.project_id, Role::Operator).await?;
-    Ok(Json(
-        state
-            .store
-            .create_firmware(FirmwareArtifact::new(
-                request.project_id,
-                request.component,
-                request.version,
-                request.object_key,
-                request.sha256,
-                request.size_bytes,
-            ))
-            .await?,
-    ))
+    let project =
+        require_project_role(&state, actor_id, request.project_id, Role::Operator).await?;
+    let artifact = state
+        .store
+        .create_firmware(FirmwareArtifact::new(
+            request.project_id,
+            request.component,
+            request.version,
+            request.object_key,
+            request.sha256,
+            request.size_bytes,
+        ))
+        .await?;
+    record_audit(
+        &state,
+        AuditLog::new(
+            project.org_id,
+            Some(project.id),
+            Some(actor_id),
+            "firmware.create",
+            format!("firmware:{}", artifact.id),
+            json!({ "component": artifact.component, "version": artifact.version }),
+        ),
+    )
+    .await;
+    Ok(Json(artifact))
 }
 
 #[utoipa::path(get, path = "/api/v1/firmware", params(ProjectQuery), responses((status = 200)))]
@@ -1087,7 +1199,7 @@ async fn list_firmware(
         .project_id
         .ok_or_else(|| ApiError::BadRequest("project_id is required".to_owned()))?;
     require_project_access(&state, actor_id, project_id).await?;
-    Ok(Json(state.store.list_firmware(project_id).await))
+    Ok(Json(state.store.list_firmware(project_id).await?))
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1105,18 +1217,30 @@ async fn create_dashboard(
     Json(request): Json<CreateDashboardRequest>,
 ) -> ApiResult<Dashboard> {
     let actor_id = require_actor(&headers, &state).await?;
-    require_project_role(&state, actor_id, request.project_id, Role::Operator).await?;
-    Ok(Json(
-        state
-            .store
-            .create_dashboard(Dashboard {
-                id: Uuid::now_v7(),
-                project_id: request.project_id,
-                name: request.name,
-                layout: request.layout,
-            })
-            .await?,
-    ))
+    let project =
+        require_project_role(&state, actor_id, request.project_id, Role::Operator).await?;
+    let dashboard = state
+        .store
+        .create_dashboard(Dashboard {
+            id: Uuid::now_v7(),
+            project_id: request.project_id,
+            name: request.name,
+            layout: request.layout,
+        })
+        .await?;
+    record_audit(
+        &state,
+        AuditLog::new(
+            project.org_id,
+            Some(project.id),
+            Some(actor_id),
+            "dashboard.create",
+            format!("dashboard:{}", dashboard.id),
+            json!({ "name": dashboard.name }),
+        ),
+    )
+    .await;
+    Ok(Json(dashboard))
 }
 
 #[utoipa::path(get, path = "/api/v1/dashboards", params(ProjectQuery), responses((status = 200)))]
@@ -1130,7 +1254,7 @@ async fn list_dashboards(
         .project_id
         .ok_or_else(|| ApiError::BadRequest("project_id is required".to_owned()))?;
     require_project_access(&state, actor_id, project_id).await?;
-    Ok(Json(state.store.list_dashboards(project_id).await))
+    Ok(Json(state.store.list_dashboards(project_id).await?))
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1166,20 +1290,32 @@ async fn create_alert(
     Json(request): Json<CreateAlertRequest>,
 ) -> ApiResult<AlertRule> {
     let actor_id = require_actor(&headers, &state).await?;
-    require_project_role(&state, actor_id, request.project_id, Role::Operator).await?;
-    Ok(Json(
-        state
-            .store
-            .create_alert(AlertRule {
-                id: Uuid::now_v7(),
-                project_id: request.project_id,
-                name: request.name,
-                kind: request.kind.into(),
-                expression: request.expression,
-                enabled: true,
-            })
-            .await?,
-    ))
+    let project =
+        require_project_role(&state, actor_id, request.project_id, Role::Operator).await?;
+    let alert = state
+        .store
+        .create_alert(AlertRule {
+            id: Uuid::now_v7(),
+            project_id: request.project_id,
+            name: request.name,
+            kind: request.kind.into(),
+            expression: request.expression,
+            enabled: true,
+        })
+        .await?;
+    record_audit(
+        &state,
+        AuditLog::new(
+            project.org_id,
+            Some(project.id),
+            Some(actor_id),
+            "alert.create",
+            format!("alert:{}", alert.id),
+            json!({ "name": alert.name }),
+        ),
+    )
+    .await;
+    Ok(Json(alert))
 }
 
 #[utoipa::path(get, path = "/api/v1/alerts", params(ProjectQuery), responses((status = 200)))]
@@ -1193,7 +1329,7 @@ async fn list_alerts(
         .project_id
         .ok_or_else(|| ApiError::BadRequest("project_id is required".to_owned()))?;
     require_project_access(&state, actor_id, project_id).await?;
-    Ok(Json(state.store.list_alerts(project_id).await))
+    Ok(Json(state.store.list_alerts(project_id).await?))
 }
 
 #[utoipa::path(get, path = "/api/v1/audit", params(ProjectQuery), responses((status = 200)))]
@@ -1207,7 +1343,9 @@ async fn list_audit(
         .org_id
         .ok_or_else(|| ApiError::BadRequest("org_id is required".to_owned()))?;
     require_org_access(&state, actor_id, org_id).await?;
-    Ok(Json(state.store.list_audit(org_id, query.project_id).await))
+    Ok(Json(
+        state.store.list_audit(org_id, query.project_id).await?,
+    ))
 }
 
 #[cfg(test)]
@@ -1225,6 +1363,21 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn readiness_endpoint_checks_store() {
+        let response = app()
+            .oneshot(
+                Request::builder()
+                    .uri("/ready")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1294,6 +1447,53 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn record_audit_is_best_effort() {
+        let state = AppState::default();
+        let user = state
+            .store
+            .create_user(User::new("audit-best-effort@example.com", "Audit", "hash"))
+            .await
+            .unwrap();
+        let org = state
+            .store
+            .create_org(Org::new("Audit Best Effort", "audit-best-effort"), user.id)
+            .await
+            .unwrap();
+        let other_org = state
+            .store
+            .create_org(Org::new("Audit Other", "audit-other"), user.id)
+            .await
+            .unwrap();
+        let other_project = state
+            .store
+            .create_project(Project::new(other_org.id, "Other", "other"))
+            .await
+            .unwrap();
+
+        record_audit(
+            &state,
+            AuditLog::new(
+                org.id,
+                Some(other_project.id),
+                Some(user.id),
+                "audit.invalid",
+                format!("project:{}", other_project.id),
+                json!({}),
+            ),
+        )
+        .await;
+
+        assert!(
+            state
+                .store
+                .list_audit(org.id, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1500,7 +1700,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -1560,6 +1760,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(certificates.len(), 1);
+
+        let legacy_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/v1/devices/{}/provision?project_id={}",
+                        device.id, project.id
+                    ))
+                    .header("authorization", "Bearer owner-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(legacy_response.status(), StatusCode::OK);
+
+        let audit = state
+            .store
+            .list_audit(org.id, Some(project.id))
+            .await
+            .unwrap();
+        assert!(
+            audit
+                .iter()
+                .filter(|entry| entry.action == "device.dev_auth_download")
+                .count()
+                >= 2
+        );
     }
 
     #[tokio::test]
@@ -1709,6 +1938,200 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_resource_writes_append_audit_entries() {
+        let state = AppState::default();
+        let user = state
+            .store
+            .create_user(User::new("owner@example.com", "Owner", "hash"))
+            .await
+            .unwrap();
+        let org = state
+            .store
+            .create_org(Org::new("Acme", "acme"), user.id)
+            .await
+            .unwrap();
+        let project = state
+            .store
+            .create_project(Project::new(org.id, "Factory", "factory"))
+            .await
+            .unwrap();
+        let device = state
+            .store
+            .create_device(Device::new(project.id, "press-1", json!({})))
+            .await
+            .unwrap();
+        state
+            .sessions
+            .write()
+            .await
+            .insert("owner-token".to_owned(), user.id);
+
+        let stream_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/streams")
+                    .header("authorization", "Bearer owner-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "project_id": project.id,
+                            "name": "device_agent_system_stats",
+                            "fields": [
+                                {
+                                    "name": "cpu_percent",
+                                    "field_type": "Float",
+                                    "required": true
+                                }
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stream_response.status(), StatusCode::OK);
+
+        let action_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/actions")
+                    .header("authorization", "Bearer owner-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "project_id": project.id,
+                            "device_ids": [device.id],
+                            "name": "diagnostics.collect",
+                            "payload": {
+                                "session_id": Uuid::now_v7(),
+                                "paths": ["/var/log/excalibur"],
+                                "include_logs": true,
+                                "include_system_stats": true
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(action_response.status(), StatusCode::OK);
+        let body = to_bytes(action_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let action: Action = serde_json::from_slice(&body).unwrap();
+
+        let action_status_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/actions/{}/status", action.id))
+                    .header("authorization", "Bearer owner-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "project_id": project.id,
+                            "device_id": device.id,
+                            "state": "Completed",
+                            "progress": 100,
+                            "errors": []
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(action_status_response.status(), StatusCode::OK);
+
+        let firmware_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/firmware")
+                    .header("authorization", "Bearer owner-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "project_id": project.id,
+                            "component": "main",
+                            "version": "1.0.0",
+                            "object_key": "firmware/main/1.0.0.bin",
+                            "sha256": "a".repeat(64),
+                            "size_bytes": 1024
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(firmware_response.status(), StatusCode::OK);
+
+        let dashboard_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/dashboards")
+                    .header("authorization", "Bearer owner-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "project_id": project.id,
+                            "name": "Fleet overview",
+                            "layout": { "panels": [] }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(dashboard_response.status(), StatusCode::OK);
+
+        let alert_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/alerts")
+                    .header("authorization", "Bearer owner-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "project_id": project.id,
+                            "name": "offline > 10m",
+                            "kind": "Offline",
+                            "expression": { "window": "10m" }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(alert_response.status(), StatusCode::OK);
+
+        let audit = state
+            .store
+            .list_audit(org.id, Some(project.id))
+            .await
+            .unwrap();
+        assert!(audit.iter().any(|entry| entry.action == "stream.create"));
+        assert!(audit.iter().any(|entry| entry.action == "action.create"));
+        assert!(
+            audit
+                .iter()
+                .any(|entry| entry.action == "action.status_update")
+        );
+        assert!(audit.iter().any(|entry| entry.action == "firmware.create"));
+        assert!(audit.iter().any(|entry| entry.action == "dashboard.create"));
+        assert!(audit.iter().any(|entry| entry.action == "alert.create"));
+    }
+
+    #[tokio::test]
     async fn action_status_rejects_cross_project_update() {
         let state = AppState::default();
         let user = state
@@ -1775,7 +2198,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

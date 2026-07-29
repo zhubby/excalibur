@@ -11,7 +11,10 @@ cd backend
 RUSTUP_TOOLCHAIN=stable cargo fmt --all
 RUSTUP_TOOLCHAIN=stable cargo test --workspace
 RUSTUP_TOOLCHAIN=stable cargo test --workspace --all-features
+RUSTUP_TOOLCHAIN=stable cargo clippy --workspace --all-features -- -D warnings
 ```
+
+`.github/workflows/backend.yml` 会启动 TimescaleDB service、应用 `backend/migrations/*.sql`，并设置 `EXCALIBUR_SQL_TEST_DATABASE_URL`，因此 CI 会执行 SQL-backed storage 和 mqtt-ingest contract。未设置该变量的本地运行会跳过 live SQL contract，只执行内存和协议测试。
 
 Device agent：
 
@@ -132,7 +135,7 @@ mdbook build docs
 - RBAC 禁用按钮和拒绝路由。
 - remote shell beta off 时入口 disabled。
 
-当前前端主要是静态 scaffold 和 protocol helper tests。
+当前前端已有 protocol helper tests 和手写 API client contract tests。浏览器 E2E 仍待补齐，尤其是注册、workspace bootstrap、Run loop、dev-auth 下载、telemetry ingest、action status 和 audit 展示链路。
 
 ## 性能测试
 

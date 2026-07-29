@@ -1,4 +1,5 @@
-import { streamHealth, telemetrySeries } from "@/lib/data";
+import { RadioTower } from "lucide-react";
+import type { StreamSummary } from "@/lib/data";
 
 function Sparkline({ values }: { values: number[] }) {
   const width = 560;
@@ -28,22 +29,51 @@ function Sparkline({ values }: { values: number[] }) {
   );
 }
 
-export function TelemetryPanel() {
+type TelemetryPanelProps = {
+  values: number[];
+  streams: StreamSummary[];
+  rowRateLabel: string;
+  selectedDeviceName?: string;
+  busy?: boolean;
+  onIngestSample: () => void;
+};
+
+export function TelemetryPanel({
+  values,
+  streams,
+  rowRateLabel,
+  selectedDeviceName,
+  busy = false,
+  onIngestSample,
+}: TelemetryPanelProps) {
   return (
     <section className="panel-in rounded-md border border-line bg-panel">
       <div className="flex flex-col gap-1 border-b border-line px-4 py-3 sm:flex-row sm:items-end sm:justify-between">
         <div>
           <h2 className="text-base font-semibold text-ink">Telemetry</h2>
-          <p className="text-sm text-ink/54">Timescale ingest and stream query health.</p>
+          <p className="text-sm text-ink/54">
+            {selectedDeviceName ? `${selectedDeviceName} stream query health.` : "Timescale ingest and stream query health."}
+          </p>
         </div>
-        <span className="text-sm font-medium text-teal">1.8M rows/min</span>
+        <div className="flex items-center gap-2">
+          <span className="text-sm font-medium text-teal">{rowRateLabel}</span>
+          <button
+            className="inline-flex h-8 items-center justify-center gap-2 rounded-md border border-line bg-white px-2 text-xs font-medium text-ink transition hover:border-ink/20 disabled:cursor-not-allowed disabled:text-ink/28"
+            type="button"
+            disabled={busy || !selectedDeviceName}
+            onClick={onIngestSample}
+          >
+            <RadioTower className="h-3.5 w-3.5" aria-hidden="true" />
+            Ingest sample
+          </button>
+        </div>
       </div>
       <div className="grid gap-4 p-4 xl:grid-cols-[1.5fr_1fr]">
         <div className="h-56 rounded-md border border-line bg-white p-3">
-          <Sparkline values={telemetrySeries} />
+          <Sparkline values={values} />
         </div>
         <div className="space-y-2">
-          {streamHealth.map((stream) => (
+          {streams.map((stream) => (
             <div key={stream.name} className="grid grid-cols-[1fr_auto] gap-3 rounded-md border border-line bg-white px-3 py-2">
               <div className="min-w-0">
                 <p className="truncate text-sm font-medium text-ink">{stream.name}</p>
@@ -55,6 +85,11 @@ export function TelemetryPanel() {
               </div>
             </div>
           ))}
+          {streams.length === 0 ? (
+            <div className="rounded-md border border-line bg-white px-3 py-6 text-center text-sm text-ink/54">
+              No stream definitions yet.
+            </div>
+          ) : null}
         </div>
       </div>
     </section>

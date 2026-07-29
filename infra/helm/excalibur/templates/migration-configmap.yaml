@@ -8,6 +8,8 @@ metadata:
     "helm.sh/hook-weight": "-1"
     "helm.sh/hook-delete-policy": before-hook-creation
 data:
-  001_initial.sql: |
-{{ .Files.Get "migrations/001_initial.sql" | indent 4 }}
+{{- range $path, $_ := .Files.Glob "migrations/*.sql" }}
+  {{ base $path }}: |
+{{ $.Files.Get $path | indent 4 }}
+{{- end }}
 {{- end }}

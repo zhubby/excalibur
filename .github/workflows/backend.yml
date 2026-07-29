@@ -1,0 +1,62 @@
+name: Backend
+
+on:
+  push:
+    paths:
+      - ".github/workflows/backend.yml"
+      - "backend/**"
+      - "infra/helm/excalibur/**"
+  pull_request:
+    paths:
+      - ".github/workflows/backend.yml"
+      - "backend/**"
+      - "infra/helm/excalibur/**"
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    services:
+      timescaledb:
+        image: timescale/timescaledb:latest-pg16
+        env:
+          POSTGRES_DB: excalibur
+          POSTGRES_PASSWORD: excalibur
+          POSTGRES_USER: excalibur
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U excalibur -d excalibur"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgres://excalibur:excalibur@localhost:5432/excalibur
+      EXCALIBUR_SQL_TEST_DATABASE_URL: postgres://excalibur:excalibur@localhost:5432/excalibur
+      RUSTUP_TOOLCHAIN: stable
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install PostgreSQL client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: Apply migrations
+        run: |
+          for migration in backend/migrations/*.sql; do
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 --single-transaction -f "$migration"
+          done
+
+      - name: Format
+        working-directory: backend
+        run: cargo fmt --all -- --check
+
+      - name: Test
+        working-directory: backend
+        run: cargo test --workspace --all-features
+
+      - name: Clippy
+        working-directory: backend
+        run: cargo clippy --workspace --all-features -- -D warnings

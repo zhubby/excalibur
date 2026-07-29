@@ -10,6 +10,5 @@ ARG BIN=excalibur-api
 RUN useradd -m -u 10001 appuser
 COPY --from=builder /app/backend/target/release/${BIN} /usr/local/bin/excalibur
 USER appuser
-EXPOSE 8080
+EXPOSE 8080 1883
 CMD ["/usr/local/bin/excalibur"]
-

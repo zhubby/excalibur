@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = []
+default = ["rumqttd-runtime"]
 rumqttd-runtime = ["dep:rumqttd"]
 
 [dependencies]

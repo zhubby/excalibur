@@ -15,6 +15,7 @@ CREATE TABLE users (
   email_verified BOOLEAN NOT NULL DEFAULT FALSE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE UNIQUE INDEX users_email_lower_unique_idx ON users (lower(email));
 
 CREATE TABLE orgs (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -38,7 +39,8 @@ CREATE TABLE projects (
   name TEXT NOT NULL,
   slug TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE (org_id, slug)
+  UNIQUE (org_id, slug),
+  UNIQUE (org_id, id)
 );
 
 CREATE TABLE devices (
@@ -53,6 +55,7 @@ CREATE TABLE devices (
   UNIQUE (project_id, id)
 );
 CREATE INDEX devices_project_status_idx ON devices (project_id, status);
+CREATE INDEX devices_project_created_idx ON devices (project_id, created_at DESC, id);
 CREATE INDEX devices_metadata_gin_idx ON devices USING gin (metadata);
 
 CREATE TABLE device_certificates (
@@ -89,8 +92,23 @@ CREATE TABLE telemetry_points (
   PRIMARY KEY (project_id, device_id, stream, sequence, ts)
 );
 SELECT create_hypertable('telemetry_points', 'ts', if_not_exists => TRUE);
-CREATE INDEX telemetry_points_project_stream_ts_idx ON telemetry_points (project_id, stream, ts DESC);
-CREATE INDEX telemetry_points_device_ts_idx ON telemetry_points (device_id, ts DESC);
+CREATE INDEX telemetry_points_project_ts_idx ON telemetry_points (project_id, ts DESC, sequence DESC);
+CREATE INDEX telemetry_points_project_stream_ts_idx ON telemetry_points (project_id, stream, ts DESC, sequence DESC);
+CREATE INDEX telemetry_points_project_device_ts_idx ON telemetry_points (project_id, device_id, ts DESC, sequence DESC);
+CREATE INDEX telemetry_points_project_device_stream_ts_idx ON telemetry_points (project_id, device_id, stream, ts DESC, sequence DESC);
+
+CREATE TABLE telemetry_sequence_dedup (
+  project_id UUID NOT NULL,
+  device_id UUID NOT NULL,
+  stream TEXT NOT NULL,
+  sequence BIGINT NOT NULL,
+  first_ts TIMESTAMPTZ NOT NULL,
+  first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (project_id, device_id, stream, sequence),
+  FOREIGN KEY (project_id, device_id) REFERENCES devices(project_id, id) ON DELETE CASCADE
+);
+CREATE INDEX telemetry_sequence_dedup_seen_idx ON telemetry_sequence_dedup (first_seen_at);
+
 ALTER TABLE telemetry_points SET (
   timescaledb.compress,
   timescaledb.compress_segmentby = 'project_id,device_id,stream',
@@ -113,6 +131,7 @@ CREATE TABLE actions (
   UNIQUE (project_id, id)
 );
 CREATE INDEX actions_project_state_idx ON actions (project_id, state, created_at DESC);
+CREATE INDEX actions_project_created_idx ON actions (project_id, created_at DESC, id);
 
 CREATE TABLE action_targets (
   action_id UUID NOT NULL,
@@ -164,11 +183,13 @@ CREATE INDEX alert_rules_project_enabled_idx ON alert_rules (project_id, enabled
 CREATE TABLE audit_logs (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   org_id UUID NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
-  project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+  project_id UUID,
   actor_id UUID REFERENCES users(id) ON DELETE SET NULL,
   action TEXT NOT NULL,
   resource TEXT NOT NULL,
   metadata JSONB NOT NULL DEFAULT '{}',
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  FOREIGN KEY (org_id, project_id) REFERENCES projects(org_id, id) ON DELETE CASCADE
 );
-CREATE INDEX audit_logs_scope_idx ON audit_logs (org_id, project_id, created_at DESC);
+CREATE INDEX audit_logs_scope_idx ON audit_logs (org_id, project_id, created_at DESC, id);
+CREATE INDEX audit_logs_org_created_idx ON audit_logs (org_id, created_at DESC, id);

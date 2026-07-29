@@ -4,7 +4,7 @@ use excalibur_device_protocol::{
     decode_telemetry_payload, parse_publish_topic, parse_subscribe_topic, validate_device_scope,
 };
 use excalibur_domain::{ActionStatusUpdate, DeviceStatus, Id, TelemetryPoint};
-use excalibur_storage::{MemoryStore, StoreError, map_terminal_action_state};
+use excalibur_storage::{Store, StoreError, map_terminal_action_state};
 use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,7 +72,7 @@ pub fn authorize_subscribe(
 }
 
 pub async fn ingest_publish(
-    store: &MemoryStore,
+    store: &Store,
     topic: &str,
     payload: Value,
     device: AuthenticatedDevice,
@@ -146,8 +146,11 @@ pub mod rumqttd_adapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use excalibur_device_protocol::{command_status_topic, commands_topic, telemetry_topic};
+    use excalibur_device_protocol::{
+        command_status_topic, commands_topic, shadow_topic, telemetry_topic,
+    };
     use excalibur_domain::{Action, ActionState, Device, Org, Project, User};
+    use excalibur_storage::PgStore;
     use serde_json::json;
     use uuid::Uuid;
 
@@ -192,7 +195,7 @@ mod tests {
 
     #[tokio::test]
     async fn command_status_publish_updates_target_action() {
-        let store = MemoryStore::new();
+        let store = Store::memory();
         let user = store
             .create_user(User::new("owner@example.com", "Owner", "hash"))
             .await
@@ -241,8 +244,154 @@ mod tests {
         .unwrap();
 
         assert_eq!(count, 1);
-        let actions = store.list_actions(project.id).await;
+        let actions = store.list_actions(project.id).await.unwrap();
         assert_eq!(actions[0].state, ActionState::Completed);
         assert_eq!(actions[0].progress, 100);
+    }
+
+    #[tokio::test]
+    async fn sql_store_ingest_publish_contract_runs_when_database_url_is_set() {
+        let Ok(database_url) = std::env::var("EXCALIBUR_SQL_TEST_DATABASE_URL") else {
+            eprintln!("skipping mqtt PgStore contract; EXCALIBUR_SQL_TEST_DATABASE_URL is not set");
+            return;
+        };
+
+        let pg_store = PgStore::connect(&database_url).await.unwrap();
+        pg_store.validate_schema().await.unwrap();
+        let store = Store::postgres(pg_store);
+        let suffix = Uuid::now_v7().simple().to_string();
+        let user = store
+            .create_user(User::new(
+                format!("mqtt-sql-{suffix}@example.com"),
+                "MQTT SQL",
+                "hash",
+            ))
+            .await
+            .unwrap();
+        let org = store
+            .create_org(
+                Org::new("MQTT SQL Org", format!("mqtt-sql-org-{suffix}")),
+                user.id,
+            )
+            .await
+            .unwrap();
+        let project = store
+            .create_project(Project::new(
+                org.id,
+                "MQTT SQL Project",
+                format!("mqtt-sql-project-{suffix}"),
+            ))
+            .await
+            .unwrap();
+        let device = store
+            .create_device(Device::new(project.id, "mqtt-sql-device", json!({})))
+            .await
+            .unwrap();
+        let authenticated = AuthenticatedDevice {
+            project_id: project.id,
+            device_id: device.id,
+            status: DeviceStatus::Online,
+        };
+
+        assert_eq!(
+            ingest_publish(
+                &store,
+                &telemetry_topic(project.id, device.id, "temperature"),
+                json!([
+                    {
+                        "sequence": 1,
+                        "timestamp": 1710760059006i64,
+                        "value": 21.5
+                    }
+                ]),
+                authenticated.clone(),
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            ingest_publish(
+                &store,
+                &telemetry_topic(project.id, device.id, "temperature"),
+                json!([
+                    {
+                        "sequence": 1,
+                        "timestamp": 1710760060006i64,
+                        "value": 22.0
+                    }
+                ]),
+                authenticated.clone(),
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .query_telemetry(project.id, Some(device.id), Some("temperature"), 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        assert_eq!(
+            ingest_publish(
+                &store,
+                &shadow_topic(project.id, device.id),
+                json!({"desired": {"mode": "eco"}}),
+                authenticated.clone(),
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .get_device(project.id, device.id)
+                .await
+                .unwrap()
+                .latest_shadow["desired"]["mode"],
+            "eco"
+        );
+
+        let action = store
+            .create_action(Action::new(
+                project.id,
+                vec![device.id],
+                "ota",
+                json!({ "version": "1.0.0" }),
+                Some(user.id),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            ingest_publish(
+                &store,
+                &command_status_topic(project.id, device.id),
+                json!([
+                    {
+                        "action_id": action.id,
+                        "state": "completed",
+                        "progress": 100,
+                        "errors": []
+                    }
+                ]),
+                authenticated,
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        let action = store
+            .list_actions(project.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|stored| stored.id == action.id)
+            .unwrap();
+        assert_eq!(action.state, ActionState::Completed);
+        assert_eq!(action.progress, 100);
     }
 }

@@ -16,19 +16,15 @@
 
 ## 当前页面
 
-首页位于 `frontend/src/app/page.tsx`，当前是 Console scaffold，包含：
+首页位于 `frontend/src/app/page.tsx`，当前加载 `ConsoleApp` client component，并调用 Axum REST API。Console 支持：
 
-- Sidebar navigation。
-- Project header。
-- Metric strip。
-- Telemetry panel。
-- Device table。
-- Device-agent provisioning/status panel。
-- Action queue panel。
-- Alert panel。
-- Protocol topic 展示。
+- 注册/登录并保存本地 Bearer session。
+- 空库启动时自动创建默认 org/project/stream/alert/dashboard。
+- 设备创建、dev auth JSON 下载、shadow/telemetry HTTP ingest。
+- diagnostics/OTA action 创建和 action status 回写。
+- fleet metrics、telemetry trend、device table、agent panel、actions、alerts、protocol topic 和 audit log 展示。
 
-Demo 数据来自 `frontend/src/lib/data.ts`。
+API base URL 默认来自 `NEXT_PUBLIC_API_BASE_URL`，未设置时使用 `http://localhost:8080`。当前 session 仍是开发态 localStorage Bearer token；生产前端应切到 HttpOnly cookie session。
 
 ## 组件边界
 
@@ -42,6 +38,9 @@ Demo 数据来自 `frontend/src/lib/data.ts`。
 | `DeviceAgentPanel` | CSR/dev auth 下载入口、agent status、OTA/diagnostics/shell controls。 |
 | `ActionQueuePanel` | action 进度摘要。 |
 | `AlertPanel` | alert rule 状态摘要。 |
+| `ConsoleApp` | 认证、workspace bootstrap、API 调用、数据刷新和本地闭环动作编排。 |
+
+`frontend/src/lib/api.ts` 是手写的第一版 TS client，覆盖当前 Axum API。后续仍应从 `/api/v1/openapi.json` 生成 client，避免 DTO 漂移。
 
 ## Protocol helper
 
@@ -56,7 +55,7 @@ Demo 数据来自 `frontend/src/lib/data.ts`。
 
 这些 helper 当前有 Vitest 覆盖。后续应从后端 device protocol 或 OpenAPI 生成共享 contract，避免 Rust/TS 漂移。
 
-## API client 目标
+## API client 后续目标
 
 生产前端应：
 
