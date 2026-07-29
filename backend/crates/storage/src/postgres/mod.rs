@@ -1,0 +1,1068 @@
+mod helpers;
+mod mappers;
+
+use std::collections::{HashMap, HashSet};
+
+use excalibur_domain::{
+    Action, ActionStatusUpdate, AlertRule, AuditLog, Dashboard, Device, DeviceCertificate,
+    FirmwareArtifact, Id, Membership, Org, Project, Role, StreamDefinition, TelemetryPoint, User,
+};
+use serde_json::Value;
+use sqlx::{PgPool, Postgres, QueryBuilder, Row, postgres::PgPoolOptions};
+
+use crate::{
+    StoreError, StoreResult,
+    postgres::{
+        helpers::{
+            SQL_INSERT_CHUNK_SIZE, action_device_ids_in_tx, aggregate_action_in_tx,
+            device_project_ids_in_tx, ensure_device_project_scope, ensure_exists,
+            ensure_exists_in_tx, map_decode_error, map_json_error, map_sqlx_error,
+        },
+        mappers::{
+            action_state_to_db, alert_kind_to_db, certificate_status_to_db, device_status_to_db,
+            map_action_row, map_alert, map_audit, map_certificate, map_dashboard, map_device,
+            map_firmware, map_membership, map_org, map_project, map_stream, map_telemetry,
+            map_user, role_from_db, role_to_db,
+        },
+    },
+    telemetry::{TelemetryDedupeKey, telemetry_dedupe_key},
+};
+
+#[derive(Debug, Clone)]
+pub struct PgStore {
+    pool: PgPool,
+}
+
+impl PgStore {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    pub async fn connect(database_url: &str) -> Result<Self, sqlx::Error> {
+        let pool = PgPoolOptions::new()
+            .max_connections(20)
+            .connect(database_url)
+            .await?;
+        Ok(Self::new(pool))
+    }
+
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    pub async fn health_check(&self) -> StoreResult<()> {
+        sqlx::query("SELECT 1")
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(|error| map_sqlx_error(error, "database"))
+    }
+
+    pub async fn validate_schema(&self) -> StoreResult<()> {
+        sqlx::query(
+            "SELECT
+                to_regclass('public.users') IS NOT NULL AS users,
+                to_regclass('public.projects') IS NOT NULL AS projects,
+                to_regclass('public.devices') IS NOT NULL AS devices,
+                to_regclass('public.telemetry_points') IS NOT NULL AS telemetry_points,
+                to_regclass('public.telemetry_sequence_dedup') IS NOT NULL AS telemetry_sequence_dedup,
+                to_regclass('public.action_targets') IS NOT NULL AS action_targets,
+                to_regclass('public.audit_logs') IS NOT NULL AS audit_logs,
+                to_regclass('public.users_email_lower_unique_idx') IS NOT NULL AS users_email_lower_unique_idx,
+                to_regclass('public.telemetry_points_project_device_stream_ts_idx') IS NOT NULL AS telemetry_index,
+                EXISTS (
+                    SELECT 1
+                    FROM pg_extension
+                    WHERE extname = 'timescaledb'
+                ) AS has_timescaledb,
+                EXISTS (
+                    SELECT 1
+                    FROM timescaledb_information.hypertables
+                    WHERE hypertable_schema = 'public'
+                      AND hypertable_name = 'telemetry_points'
+                ) AS telemetry_hypertable,
+                COALESCE((
+                    SELECT compression_enabled
+                    FROM timescaledb_information.hypertables
+                    WHERE hypertable_schema = 'public'
+                      AND hypertable_name = 'telemetry_points'
+                ), FALSE) AS telemetry_compression,
+                EXISTS (
+                    SELECT 1
+                    FROM timescaledb_information.jobs
+                    WHERE hypertable_schema = 'public'
+                      AND hypertable_name = 'telemetry_points'
+                      AND proc_name = 'policy_compression'
+                ) AS telemetry_compression_policy,
+                EXISTS (
+                    SELECT 1
+                    FROM timescaledb_information.jobs
+                    WHERE hypertable_schema = 'public'
+                      AND hypertable_name = 'telemetry_points'
+                      AND proc_name = 'policy_retention'
+                ) AS telemetry_retention_policy",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "schema"))
+        .and_then(|row| {
+            let required_objects = [
+                "users",
+                "projects",
+                "devices",
+                "telemetry_points",
+                "telemetry_sequence_dedup",
+                "action_targets",
+                "audit_logs",
+                "users_email_lower_unique_idx",
+                "telemetry_index",
+                "telemetry_hypertable",
+                "telemetry_compression",
+                "telemetry_compression_policy",
+                "telemetry_retention_policy",
+            ];
+            for object in required_objects {
+                let exists = row.try_get::<bool, _>(object).map_err(map_decode_error)?;
+                if !exists {
+                    return Err(StoreError::Database(format!(
+                        "required schema object is missing: {object}"
+                    )));
+                }
+            }
+            let has_timescaledb = row
+                .try_get::<bool, _>("has_timescaledb")
+                .map_err(map_decode_error)?;
+            if !has_timescaledb {
+                return Err(StoreError::Database(
+                    "required extension is missing: timescaledb".to_owned(),
+                ));
+            }
+            Ok(())
+        })
+    }
+
+    pub async fn create_user(&self, user: User) -> StoreResult<User> {
+        if self.find_user_id_by_email(&user.email).await?.is_some() {
+            return Err(StoreError::Conflict("user"));
+        }
+        let row = sqlx::query(
+            "INSERT INTO users (id, email, display_name, password_hash, email_verified, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             RETURNING id, email, display_name, password_hash, email_verified, created_at",
+        )
+        .bind(user.id)
+        .bind(&user.email)
+        .bind(&user.display_name)
+        .bind(&user.password_hash)
+        .bind(user.email_verified)
+        .bind(user.created_at)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "user"))?;
+        map_user(&row)
+    }
+
+    pub async fn get_user_by_email(&self, email: &str) -> StoreResult<User> {
+        let row = sqlx::query(
+            "SELECT id, email, display_name, password_hash, email_verified, created_at
+             FROM users
+             WHERE lower(email) = lower($1)",
+        )
+        .bind(email)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "user"))?
+        .ok_or(StoreError::NotFound("user"))?;
+        map_user(&row)
+    }
+
+    async fn find_user_id_by_email(&self, email: &str) -> StoreResult<Option<Id>> {
+        let row = sqlx::query("SELECT id FROM users WHERE lower(email) = lower($1)")
+            .bind(email)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| map_sqlx_error(error, "user"))?;
+        row.map(|row| row.try_get("id").map_err(map_decode_error))
+            .transpose()
+    }
+
+    async fn ensure_user_exists(&self, user_id: Id) -> StoreResult<()> {
+        ensure_exists(
+            &self.pool,
+            "SELECT 1 FROM users WHERE id = $1",
+            user_id,
+            "user",
+        )
+        .await
+    }
+
+    async fn ensure_org_exists(&self, org_id: Id) -> StoreResult<()> {
+        ensure_exists(
+            &self.pool,
+            "SELECT 1 FROM orgs WHERE id = $1",
+            org_id,
+            "org",
+        )
+        .await
+    }
+
+    async fn ensure_project_exists(&self, project_id: Id) -> StoreResult<()> {
+        ensure_exists(
+            &self.pool,
+            "SELECT 1 FROM projects WHERE id = $1",
+            project_id,
+            "project",
+        )
+        .await
+    }
+
+    pub async fn create_org(&self, org: Org, owner_id: Id) -> StoreResult<Org> {
+        self.ensure_user_exists(owner_id).await?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| map_sqlx_error(error, "org"))?;
+        let row = sqlx::query(
+            "INSERT INTO orgs (id, name, slug, created_at)
+             VALUES ($1, $2, $3, $4)
+             RETURNING id, name, slug, created_at",
+        )
+        .bind(org.id)
+        .bind(&org.name)
+        .bind(&org.slug)
+        .bind(org.created_at)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|error| map_sqlx_error(error, "org"))?;
+        let org = map_org(&row)?;
+        let membership = Membership::new(org.id, owner_id, Role::Owner);
+        sqlx::query(
+            "INSERT INTO memberships (id, org_id, user_id, role, created_at)
+             VALUES ($1, $2, $3, $4::member_role, $5)",
+        )
+        .bind(membership.id)
+        .bind(membership.org_id)
+        .bind(membership.user_id)
+        .bind(role_to_db(membership.role))
+        .bind(membership.created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| map_sqlx_error(error, "membership"))?;
+        tx.commit()
+            .await
+            .map_err(|error| map_sqlx_error(error, "org"))?;
+        Ok(org)
+    }
+
+    pub async fn add_membership(&self, membership: Membership) -> StoreResult<Membership> {
+        self.ensure_org_exists(membership.org_id).await?;
+        self.ensure_user_exists(membership.user_id).await?;
+        let row = sqlx::query(
+            "INSERT INTO memberships (id, org_id, user_id, role, created_at)
+             VALUES ($1, $2, $3, $4::member_role, $5)
+             RETURNING id, org_id, user_id, role::text AS role, created_at",
+        )
+        .bind(membership.id)
+        .bind(membership.org_id)
+        .bind(membership.user_id)
+        .bind(role_to_db(membership.role))
+        .bind(membership.created_at)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "membership"))?;
+        map_membership(&row)
+    }
+
+    pub async fn list_orgs_for_user(&self, user_id: Id) -> StoreResult<Vec<Org>> {
+        let rows = sqlx::query(
+            "SELECT o.id, o.name, o.slug, o.created_at
+             FROM orgs o
+             JOIN memberships m ON m.org_id = o.id
+             WHERE m.user_id = $1
+             ORDER BY o.created_at DESC, o.id",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "org"))?;
+        rows.iter().map(map_org).collect()
+    }
+
+    pub async fn user_role(&self, org_id: Id, user_id: Id) -> StoreResult<Option<Role>> {
+        let row = sqlx::query(
+            "SELECT role::text AS role
+             FROM memberships
+             WHERE org_id = $1 AND user_id = $2",
+        )
+        .bind(org_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "membership"))?;
+        row.map(|row| {
+            let role: String = row.try_get("role").map_err(map_decode_error)?;
+            role_from_db(&role)
+        })
+        .transpose()
+    }
+
+    pub async fn create_project(&self, project: Project) -> StoreResult<Project> {
+        self.ensure_org_exists(project.org_id).await?;
+        let row = sqlx::query(
+            "INSERT INTO projects (id, org_id, name, slug, created_at)
+             VALUES ($1, $2, $3, $4, $5)
+             RETURNING id, org_id, name, slug, created_at",
+        )
+        .bind(project.id)
+        .bind(project.org_id)
+        .bind(&project.name)
+        .bind(&project.slug)
+        .bind(project.created_at)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "project"))?;
+        map_project(&row)
+    }
+
+    pub async fn list_projects(&self, org_id: Id) -> StoreResult<Vec<Project>> {
+        let rows = sqlx::query(
+            "SELECT id, org_id, name, slug, created_at
+             FROM projects
+             WHERE org_id = $1
+             ORDER BY created_at DESC, id",
+        )
+        .bind(org_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "project"))?;
+        rows.iter().map(map_project).collect()
+    }
+
+    pub async fn get_project(&self, project_id: Id) -> StoreResult<Project> {
+        let row =
+            sqlx::query("SELECT id, org_id, name, slug, created_at FROM projects WHERE id = $1")
+                .bind(project_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|error| map_sqlx_error(error, "project"))?
+                .ok_or(StoreError::NotFound("project"))?;
+        map_project(&row)
+    }
+
+    pub async fn get_project_for_user(&self, project_id: Id, user_id: Id) -> StoreResult<Project> {
+        let project = self.get_project(project_id).await?;
+        let has_membership =
+            sqlx::query("SELECT 1 FROM memberships WHERE org_id = $1 AND user_id = $2 LIMIT 1")
+                .bind(project.org_id)
+                .bind(user_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|error| map_sqlx_error(error, "membership"))?
+                .is_some();
+        if has_membership {
+            Ok(project)
+        } else {
+            Err(StoreError::TenantScope)
+        }
+    }
+
+    pub async fn create_device(&self, device: Device) -> StoreResult<Device> {
+        self.ensure_project_exists(device.project_id).await?;
+        let row = sqlx::query(
+            "INSERT INTO devices
+                (id, project_id, name, status, metadata, latest_shadow, last_seen_at, created_at)
+             VALUES ($1, $2, $3, $4::device_status, $5, $6, $7, $8)
+             RETURNING id, project_id, name, status::text AS status, metadata, latest_shadow, last_seen_at, created_at",
+        )
+        .bind(device.id)
+        .bind(device.project_id)
+        .bind(&device.name)
+        .bind(device_status_to_db(&device.status))
+        .bind(device.metadata)
+        .bind(device.latest_shadow)
+        .bind(device.last_seen_at)
+        .bind(device.created_at)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "device"))?;
+        map_device(&row)
+    }
+
+    pub async fn list_devices(&self, project_id: Id) -> StoreResult<Vec<Device>> {
+        let rows = sqlx::query(
+            "SELECT id, project_id, name, status::text AS status, metadata, latest_shadow, last_seen_at, created_at
+             FROM devices
+             WHERE project_id = $1
+             ORDER BY created_at DESC, id",
+        )
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "device"))?;
+        rows.iter().map(map_device).collect()
+    }
+
+    pub async fn get_device(&self, project_id: Id, device_id: Id) -> StoreResult<Device> {
+        let row = sqlx::query(
+            "SELECT id, project_id, name, status::text AS status, metadata, latest_shadow, last_seen_at, created_at
+             FROM devices
+             WHERE project_id = $1 AND id = $2",
+        )
+        .bind(project_id)
+        .bind(device_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "device"))?
+        .ok_or(StoreError::NotFound("device"))?;
+        map_device(&row)
+    }
+
+    pub async fn create_device_certificate(
+        &self,
+        certificate: DeviceCertificate,
+    ) -> StoreResult<DeviceCertificate> {
+        self.get_device(certificate.project_id, certificate.device_id)
+            .await?;
+        let row = sqlx::query(
+            "INSERT INTO device_certificates
+                (id, project_id, device_id, fingerprint_sha256, status, not_before, not_after, created_at)
+             VALUES ($1, $2, $3, $4, $5::certificate_status, $6, $7, $8)
+             RETURNING id, project_id, device_id, fingerprint_sha256, status::text AS status, not_before, not_after, created_at",
+        )
+        .bind(certificate.id)
+        .bind(certificate.project_id)
+        .bind(certificate.device_id)
+        .bind(&certificate.fingerprint_sha256)
+        .bind(certificate_status_to_db(&certificate.status))
+        .bind(certificate.not_before)
+        .bind(certificate.not_after)
+        .bind(certificate.created_at)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "certificate"))?;
+        map_certificate(&row)
+    }
+
+    pub async fn list_device_certificates(
+        &self,
+        project_id: Id,
+        device_id: Id,
+    ) -> StoreResult<Vec<DeviceCertificate>> {
+        self.get_device(project_id, device_id).await?;
+        let rows = sqlx::query(
+            "SELECT id, project_id, device_id, fingerprint_sha256, status::text AS status, not_before, not_after, created_at
+             FROM device_certificates
+             WHERE project_id = $1 AND device_id = $2
+             ORDER BY created_at DESC, id",
+        )
+        .bind(project_id)
+        .bind(device_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "certificate"))?;
+        rows.iter().map(map_certificate).collect()
+    }
+
+    pub async fn revoke_device_certificate(
+        &self,
+        project_id: Id,
+        device_id: Id,
+        certificate_id: Id,
+    ) -> StoreResult<DeviceCertificate> {
+        self.get_device(project_id, device_id).await?;
+        let row = sqlx::query(
+            "SELECT id, project_id, device_id, fingerprint_sha256, status::text AS status, not_before, not_after, created_at
+             FROM device_certificates
+             WHERE id = $1",
+        )
+        .bind(certificate_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "certificate"))?
+        .ok_or(StoreError::NotFound("certificate"))?;
+        let certificate = map_certificate(&row)?;
+        if certificate.project_id != project_id || certificate.device_id != device_id {
+            return Err(StoreError::TenantScope);
+        }
+        let row = sqlx::query(
+            "UPDATE device_certificates
+             SET status = 'revoked'::certificate_status
+             WHERE id = $1
+             RETURNING id, project_id, device_id, fingerprint_sha256, status::text AS status, not_before, not_after, created_at",
+        )
+        .bind(certificate_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "certificate"))?;
+        map_certificate(&row)
+    }
+
+    pub async fn touch_device_online(&self, project_id: Id, device_id: Id) -> StoreResult<Device> {
+        self.get_device(project_id, device_id).await?;
+        let row = sqlx::query(
+            "UPDATE devices
+             SET status = 'online'::device_status, last_seen_at = now()
+             WHERE project_id = $1 AND id = $2
+             RETURNING id, project_id, name, status::text AS status, metadata, latest_shadow, last_seen_at, created_at",
+        )
+        .bind(project_id)
+        .bind(device_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "device"))?;
+        map_device(&row)
+    }
+
+    pub async fn update_shadow(
+        &self,
+        project_id: Id,
+        device_id: Id,
+        shadow: Value,
+    ) -> StoreResult<Device> {
+        self.get_device(project_id, device_id).await?;
+        let row = sqlx::query(
+            "UPDATE devices
+             SET latest_shadow = $3, last_seen_at = now()
+             WHERE project_id = $1 AND id = $2
+             RETURNING id, project_id, name, status::text AS status, metadata, latest_shadow, last_seen_at, created_at",
+        )
+        .bind(project_id)
+        .bind(device_id)
+        .bind(shadow)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "device"))?;
+        map_device(&row)
+    }
+
+    pub async fn create_stream(&self, stream: StreamDefinition) -> StoreResult<StreamDefinition> {
+        self.ensure_project_exists(stream.project_id).await?;
+        let fields = serde_json::to_value(&stream.fields).map_err(map_json_error)?;
+        let row = sqlx::query(
+            "INSERT INTO stream_definitions (id, project_id, name, fields, created_at)
+             VALUES ($1, $2, $3, $4, $5)
+             RETURNING id, project_id, name, fields, created_at",
+        )
+        .bind(stream.id)
+        .bind(stream.project_id)
+        .bind(&stream.name)
+        .bind(fields)
+        .bind(stream.created_at)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "stream"))?;
+        map_stream(&row)
+    }
+
+    pub async fn list_streams(&self, project_id: Id) -> StoreResult<Vec<StreamDefinition>> {
+        let rows = sqlx::query(
+            "SELECT id, project_id, name, fields, created_at
+             FROM stream_definitions
+             WHERE project_id = $1
+             ORDER BY created_at DESC, id",
+        )
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "stream"))?;
+        rows.iter().map(map_stream).collect()
+    }
+
+    pub async fn write_telemetry(&self, points: Vec<TelemetryPoint>) -> StoreResult<usize> {
+        if points.is_empty() {
+            return Ok(0);
+        }
+
+        let device_ids = points
+            .iter()
+            .map(|point| point.device_id)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| map_sqlx_error(error, "telemetry"))?;
+        let device_projects = device_project_ids_in_tx(&mut tx, &device_ids).await?;
+        for point in &points {
+            ensure_device_project_scope(&device_projects, point.device_id, point.project_id)?;
+        }
+
+        let mut written = 0usize;
+        for chunk in points.chunks(SQL_INSERT_CHUNK_SIZE) {
+            let mut seen_in_chunk = HashSet::new();
+            let dedupe_candidates = chunk
+                .iter()
+                .filter(|point| seen_in_chunk.insert(telemetry_dedupe_key(point)))
+                .collect::<Vec<_>>();
+            if dedupe_candidates.is_empty() {
+                continue;
+            }
+
+            let mut dedupe_builder = QueryBuilder::<Postgres>::new(
+                "INSERT INTO telemetry_sequence_dedup
+                    (project_id, device_id, stream, sequence, first_ts, first_seen_at) ",
+            );
+            dedupe_builder.push_values(dedupe_candidates.iter().copied(), |mut row, point| {
+                row.push_bind(point.project_id)
+                    .push_bind(point.device_id)
+                    .push_bind(&point.stream)
+                    .push_bind(point.sequence)
+                    .push_bind(point.ts)
+                    .push_bind(point.ingested_at);
+            });
+            dedupe_builder.push(
+                " ON CONFLICT (project_id, device_id, stream, sequence) DO NOTHING
+                  RETURNING project_id, device_id, stream, sequence",
+            );
+            let inserted_dedupe_rows = dedupe_builder
+                .build()
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|error| map_sqlx_error(error, "telemetry sequence"))?;
+            let inserted_dedupe_keys = inserted_dedupe_rows
+                .iter()
+                .map(|row| {
+                    Ok((
+                        row.try_get("project_id").map_err(map_decode_error)?,
+                        row.try_get("device_id").map_err(map_decode_error)?,
+                        row.try_get("stream").map_err(map_decode_error)?,
+                        row.try_get("sequence").map_err(map_decode_error)?,
+                    ))
+                })
+                .collect::<StoreResult<HashSet<TelemetryDedupeKey>>>()?;
+            let points_to_insert = dedupe_candidates
+                .into_iter()
+                .filter(|point| inserted_dedupe_keys.contains(&telemetry_dedupe_key(point)))
+                .collect::<Vec<_>>();
+            if points_to_insert.is_empty() {
+                continue;
+            }
+
+            let mut builder = QueryBuilder::<Postgres>::new(
+                "INSERT INTO telemetry_points
+                    (project_id, device_id, stream, sequence, ts, payload, ingested_at) ",
+            );
+            builder.push_values(points_to_insert, |mut row, point| {
+                row.push_bind(point.project_id)
+                    .push_bind(point.device_id)
+                    .push_bind(&point.stream)
+                    .push_bind(point.sequence)
+                    .push_bind(point.ts)
+                    .push_bind(&point.payload)
+                    .push_bind(point.ingested_at);
+            });
+            builder.push(" ON CONFLICT (project_id, device_id, stream, sequence, ts) DO NOTHING");
+            let result = builder
+                .build()
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| map_sqlx_error(error, "telemetry"))?;
+            written += result.rows_affected() as usize;
+        }
+        tx.commit()
+            .await
+            .map_err(|error| map_sqlx_error(error, "telemetry"))?;
+        Ok(written)
+    }
+
+    pub async fn query_telemetry(
+        &self,
+        project_id: Id,
+        device_id: Option<Id>,
+        stream: Option<&str>,
+        limit: usize,
+    ) -> StoreResult<Vec<TelemetryPoint>> {
+        let limit = limit.min(1000) as i64;
+        let rows = match (device_id, stream) {
+            (Some(device_id), Some(stream)) => {
+                sqlx::query(
+                    "SELECT project_id, device_id, stream, sequence, ts, payload, ingested_at
+                     FROM telemetry_points
+                     WHERE project_id = $1 AND device_id = $2 AND stream = $3
+                     ORDER BY ts DESC, sequence DESC
+                     LIMIT $4",
+                )
+                .bind(project_id)
+                .bind(device_id)
+                .bind(stream)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+            }
+            (Some(device_id), None) => {
+                sqlx::query(
+                    "SELECT project_id, device_id, stream, sequence, ts, payload, ingested_at
+                     FROM telemetry_points
+                     WHERE project_id = $1 AND device_id = $2
+                     ORDER BY ts DESC, sequence DESC
+                     LIMIT $3",
+                )
+                .bind(project_id)
+                .bind(device_id)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+            }
+            (None, Some(stream)) => {
+                sqlx::query(
+                    "SELECT project_id, device_id, stream, sequence, ts, payload, ingested_at
+                     FROM telemetry_points
+                     WHERE project_id = $1 AND stream = $2
+                     ORDER BY ts DESC, sequence DESC
+                     LIMIT $3",
+                )
+                .bind(project_id)
+                .bind(stream)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+            }
+            (None, None) => {
+                sqlx::query(
+                    "SELECT project_id, device_id, stream, sequence, ts, payload, ingested_at
+                     FROM telemetry_points
+                     WHERE project_id = $1
+                     ORDER BY ts DESC, sequence DESC
+                     LIMIT $2",
+                )
+                .bind(project_id)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+            }
+        }
+        .map_err(|error| map_sqlx_error(error, "telemetry"))?;
+        rows.iter().map(map_telemetry).collect()
+    }
+
+    pub async fn create_action(&self, action: Action) -> StoreResult<Action> {
+        self.ensure_project_exists(action.project_id).await?;
+        let mut seen_targets = HashSet::new();
+        for device_id in &action.device_ids {
+            if !seen_targets.insert(*device_id) {
+                return Err(StoreError::Conflict("action target"));
+            }
+        }
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| map_sqlx_error(error, "action"))?;
+        let device_projects = device_project_ids_in_tx(&mut tx, &action.device_ids).await?;
+        for device_id in &action.device_ids {
+            ensure_device_project_scope(&device_projects, *device_id, action.project_id)?;
+        }
+        let row = sqlx::query(
+            "INSERT INTO actions
+                (id, project_id, name, payload, state, progress, errors, created_by, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5::action_state, $6, $7, $8, $9, $10)
+             RETURNING id, project_id, name, payload, state::text AS state, progress, errors, created_by, created_at, updated_at",
+        )
+        .bind(action.id)
+        .bind(action.project_id)
+        .bind(&action.name)
+        .bind(action.payload.clone())
+        .bind(action_state_to_db(&action.state))
+        .bind(action.progress as i16)
+        .bind(&action.errors)
+        .bind(action.created_by)
+        .bind(action.created_at)
+        .bind(action.updated_at)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|error| map_sqlx_error(error, "action"))?;
+        for chunk in action.device_ids.chunks(SQL_INSERT_CHUNK_SIZE) {
+            let mut builder = QueryBuilder::<Postgres>::new(
+                "INSERT INTO action_targets
+                    (action_id, project_id, device_id, state, progress, errors, updated_at) ",
+            );
+            builder.push_values(chunk, |mut row, device_id| {
+                row.push_bind(action.id)
+                    .push_bind(action.project_id)
+                    .push_bind(device_id)
+                    .push_bind(action_state_to_db(&action.state))
+                    .push_bind(action.progress as i16)
+                    .push_bind(&action.errors)
+                    .push_bind(action.updated_at);
+            });
+            builder
+                .build()
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| map_sqlx_error(error, "action target"))?;
+        }
+        let mut stored = map_action_row(&row, action.device_ids.clone())?;
+        tx.commit()
+            .await
+            .map_err(|error| map_sqlx_error(error, "action"))?;
+        stored.device_ids = action.device_ids;
+        Ok(stored)
+    }
+
+    pub async fn list_actions(&self, project_id: Id) -> StoreResult<Vec<Action>> {
+        let rows = sqlx::query(
+            "SELECT id, project_id, name, payload, state::text AS state, progress, errors, created_by, created_at, updated_at
+             FROM actions
+             WHERE project_id = $1
+             ORDER BY created_at DESC, id",
+        )
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "action"))?;
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let action_ids = rows
+            .iter()
+            .map(|row| row.try_get("id").map_err(map_decode_error))
+            .collect::<StoreResult<Vec<Id>>>()?;
+        let target_rows = sqlx::query(
+            "SELECT action_id, device_id
+             FROM action_targets
+             WHERE project_id = $1 AND action_id = ANY($2)
+             ORDER BY action_id, device_id",
+        )
+        .bind(project_id)
+        .bind(action_ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "action target"))?;
+        let mut targets_by_action: HashMap<Id, Vec<Id>> = HashMap::new();
+        for row in target_rows {
+            let action_id = row.try_get("action_id").map_err(map_decode_error)?;
+            let device_id = row.try_get("device_id").map_err(map_decode_error)?;
+            targets_by_action
+                .entry(action_id)
+                .or_default()
+                .push(device_id);
+        }
+
+        let mut actions = Vec::with_capacity(rows.len());
+        for row in rows {
+            let action_id = row.try_get("id").map_err(map_decode_error)?;
+            let device_ids = targets_by_action.remove(&action_id).unwrap_or_default();
+            actions.push(map_action_row(&row, device_ids)?);
+        }
+        Ok(actions)
+    }
+
+    pub async fn update_action_status(&self, update: ActionStatusUpdate) -> StoreResult<Action> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| map_sqlx_error(error, "action"))?;
+        ensure_exists_in_tx(
+            &mut tx,
+            "SELECT 1 FROM actions WHERE project_id = $1 AND id = $2",
+            update.project_id,
+            update.action_id,
+            "action",
+        )
+        .await?;
+        ensure_exists_in_tx(
+            &mut tx,
+            "SELECT 1 FROM devices WHERE project_id = $1 AND id = $2",
+            update.project_id,
+            update.device_id,
+            "device",
+        )
+        .await?;
+        let target = sqlx::query(
+            "UPDATE action_targets
+             SET state = $4::action_state, progress = $5, errors = $6, updated_at = $7
+             WHERE project_id = $1 AND action_id = $2 AND device_id = $3",
+        )
+        .bind(update.project_id)
+        .bind(update.action_id)
+        .bind(update.device_id)
+        .bind(action_state_to_db(&update.state))
+        .bind(update.progress.min(100) as i16)
+        .bind(&update.errors)
+        .bind(update.ts)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| map_sqlx_error(error, "action target"))?;
+        if target.rows_affected() == 0 {
+            return Err(StoreError::NotFound("action target"));
+        }
+        let row =
+            aggregate_action_in_tx(&mut tx, update.project_id, update.action_id, update.ts).await?;
+        let device_ids =
+            action_device_ids_in_tx(&mut tx, update.project_id, update.action_id).await?;
+        let action = map_action_row(&row, device_ids)?;
+        tx.commit()
+            .await
+            .map_err(|error| map_sqlx_error(error, "action"))?;
+        Ok(action)
+    }
+
+    pub async fn create_firmware(
+        &self,
+        artifact: FirmwareArtifact,
+    ) -> StoreResult<FirmwareArtifact> {
+        self.ensure_project_exists(artifact.project_id).await?;
+        let row = sqlx::query(
+            "INSERT INTO firmware_artifacts
+                (id, project_id, component, version, object_key, sha256, size_bytes, active, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             RETURNING id, project_id, component, version, object_key, sha256, size_bytes, active, created_at",
+        )
+        .bind(artifact.id)
+        .bind(artifact.project_id)
+        .bind(&artifact.component)
+        .bind(&artifact.version)
+        .bind(&artifact.object_key)
+        .bind(&artifact.sha256)
+        .bind(artifact.size_bytes)
+        .bind(artifact.active)
+        .bind(artifact.created_at)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "firmware"))?;
+        map_firmware(&row)
+    }
+
+    pub async fn list_firmware(&self, project_id: Id) -> StoreResult<Vec<FirmwareArtifact>> {
+        let rows = sqlx::query(
+            "SELECT id, project_id, component, version, object_key, sha256, size_bytes, active, created_at
+             FROM firmware_artifacts
+             WHERE project_id = $1
+             ORDER BY created_at DESC, id",
+        )
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "firmware"))?;
+        rows.iter().map(map_firmware).collect()
+    }
+
+    pub async fn create_alert(&self, alert: AlertRule) -> StoreResult<AlertRule> {
+        self.ensure_project_exists(alert.project_id).await?;
+        let row = sqlx::query(
+            "INSERT INTO alert_rules (id, project_id, name, kind, expression, enabled)
+             VALUES ($1, $2, $3, $4::alert_kind, $5, $6)
+             RETURNING id, project_id, name, kind::text AS kind, expression, enabled",
+        )
+        .bind(alert.id)
+        .bind(alert.project_id)
+        .bind(&alert.name)
+        .bind(alert_kind_to_db(&alert.kind))
+        .bind(alert.expression)
+        .bind(alert.enabled)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "alert"))?;
+        map_alert(&row)
+    }
+
+    pub async fn list_alerts(&self, project_id: Id) -> StoreResult<Vec<AlertRule>> {
+        let rows = sqlx::query(
+            "SELECT id, project_id, name, kind::text AS kind, expression, enabled
+             FROM alert_rules
+             WHERE project_id = $1
+             ORDER BY id",
+        )
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "alert"))?;
+        rows.iter().map(map_alert).collect()
+    }
+
+    pub async fn create_dashboard(&self, dashboard: Dashboard) -> StoreResult<Dashboard> {
+        self.ensure_project_exists(dashboard.project_id).await?;
+        let row = sqlx::query(
+            "INSERT INTO dashboards (id, project_id, name, layout)
+             VALUES ($1, $2, $3, $4)
+             RETURNING id, project_id, name, layout",
+        )
+        .bind(dashboard.id)
+        .bind(dashboard.project_id)
+        .bind(&dashboard.name)
+        .bind(dashboard.layout)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "dashboard"))?;
+        map_dashboard(&row)
+    }
+
+    pub async fn list_dashboards(&self, project_id: Id) -> StoreResult<Vec<Dashboard>> {
+        let rows = sqlx::query(
+            "SELECT id, project_id, name, layout
+             FROM dashboards
+             WHERE project_id = $1
+             ORDER BY id",
+        )
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "dashboard"))?;
+        rows.iter().map(map_dashboard).collect()
+    }
+
+    pub async fn append_audit(&self, audit: AuditLog) -> StoreResult<AuditLog> {
+        self.ensure_org_exists(audit.org_id).await?;
+        if let Some(project_id) = audit.project_id {
+            let project = self.get_project(project_id).await?;
+            if project.org_id != audit.org_id {
+                return Err(StoreError::TenantScope);
+            }
+        }
+        let row = sqlx::query(
+            "INSERT INTO audit_logs
+                (id, org_id, project_id, actor_id, action, resource, metadata, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             RETURNING id, org_id, project_id, actor_id, action, resource, metadata, created_at",
+        )
+        .bind(audit.id)
+        .bind(audit.org_id)
+        .bind(audit.project_id)
+        .bind(audit.actor_id)
+        .bind(&audit.action)
+        .bind(&audit.resource)
+        .bind(audit.metadata)
+        .bind(audit.created_at)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "audit"))?;
+        map_audit(&row)
+    }
+
+    pub async fn list_audit(
+        &self,
+        org_id: Id,
+        project_id: Option<Id>,
+    ) -> StoreResult<Vec<AuditLog>> {
+        let rows = if let Some(project_id) = project_id {
+            sqlx::query(
+                "SELECT id, org_id, project_id, actor_id, action, resource, metadata, created_at
+                 FROM audit_logs
+                 WHERE org_id = $1 AND project_id = $2
+                 ORDER BY created_at DESC, id",
+            )
+            .bind(org_id)
+            .bind(project_id)
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query(
+                "SELECT id, org_id, project_id, actor_id, action, resource, metadata, created_at
+                 FROM audit_logs
+                 WHERE org_id = $1
+                 ORDER BY created_at DESC, id",
+            )
+            .bind(org_id)
+            .fetch_all(&self.pool)
+            .await
+        }
+        .map_err(|error| map_sqlx_error(error, "audit"))?;
+        rows.iter().map(map_audit).collect()
+    }
+}

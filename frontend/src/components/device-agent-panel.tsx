@@ -7,13 +7,13 @@ const endpointRows = [
   {
     label: "CSR signing",
     path: "/api/v1/devices/{device_id}/provision/csr",
-    tone: "text-teal",
+    tone: "text-brand",
     icon: KeyRound,
   },
   {
     label: "Dev auth JSON",
     path: "/api/v1/devices/{device_id}/provision/dev-auth",
-    tone: "text-amber",
+    tone: "text-warning",
     icon: Download,
   },
 ];
@@ -47,15 +47,15 @@ export function DeviceAgentPanel({
   const authReady = devAuthConfig?.device_id === device?.id;
 
   return (
-    <section className="panel-in rounded-md border border-line bg-panel">
+    <section className="panel-in rounded-md border border-line bg-panel shadow-panel">
       <div className="flex flex-col gap-3 border-b border-line px-4 py-3 md:flex-row md:items-center md:justify-between">
         <div>
           <h2 className="text-base font-semibold text-ink">Device agent</h2>
-          <p className="text-sm text-ink/54">
+          <p className="text-sm text-muted">
             {device ? `${device.name} provisioning, OTA, diagnostics, and beta shell controls.` : "Select a device to manage its agent."}
           </p>
         </div>
-        <span className="inline-flex h-8 items-center gap-1.5 self-start rounded-sm bg-teal/10 px-2 text-xs font-medium text-teal md:self-auto">
+        <span className="inline-flex h-8 items-center gap-1.5 self-start rounded-sm bg-brand/15 px-2 text-xs font-medium text-brand md:self-auto">
           <PackageCheck className="h-3.5 w-3.5" aria-hidden="true" />
           native v1 protocol
         </span>
@@ -66,16 +66,16 @@ export function DeviceAgentPanel({
           {endpointRows.map((row) => {
             const Icon = row.icon;
             return (
-              <article key={row.label} className="rounded-md border border-line bg-white p-3">
+              <article key={row.label} className="rounded-md border border-line bg-elevated p-3">
                 <div className="flex items-start gap-3">
-                  <span className="grid h-8 w-8 shrink-0 place-items-center rounded-md bg-paper text-ink/70">
+                  <span className="grid h-8 w-8 shrink-0 place-items-center rounded-md bg-rail text-muted">
                     <Icon className={`h-4 w-4 ${row.tone}`} aria-hidden="true" />
                   </span>
                   <div className="min-w-0 flex-1">
                     <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
                       <p className="text-sm font-semibold text-ink">{row.label}</p>
                       <button
-                        className="inline-flex h-8 items-center justify-center gap-2 rounded-md border border-line bg-white px-2 text-xs font-medium text-ink transition hover:border-ink/20 disabled:cursor-not-allowed disabled:text-ink/28"
+                        className="inline-flex h-8 items-center justify-center gap-2 rounded-md border border-line bg-panel px-2 text-xs font-medium text-muted transition hover:bg-line hover:text-ink disabled:cursor-not-allowed disabled:text-faint"
                         type="button"
                         disabled={busy || !hasDevice || row.label === "CSR signing"}
                         onClick={onDownloadDevAuth}
@@ -84,7 +84,7 @@ export function DeviceAgentPanel({
                         Download
                       </button>
                     </div>
-                    <code className="mt-2 block break-all rounded-sm bg-paper px-2 py-1.5 text-xs text-ink/68">
+                    <code className="mt-2 block break-all rounded-sm bg-rail px-2 py-1.5 text-xs text-muted">
                       {device ? row.path.replace("{device_id}", device.id) : row.path}
                     </code>
                   </div>
@@ -92,38 +92,38 @@ export function DeviceAgentPanel({
               </article>
             );
           })}
-          <article className="rounded-md border border-line bg-white p-3">
-            <div className="grid gap-2 text-xs text-ink/58 sm:grid-cols-2">
-              <code className="break-all rounded-sm bg-paper px-2 py-1.5">{telemetry}</code>
-              <code className="break-all rounded-sm bg-paper px-2 py-1.5">{shadow}</code>
-              <code className="break-all rounded-sm bg-paper px-2 py-1.5">{commands}</code>
-              <code className="break-all rounded-sm bg-paper px-2 py-1.5">{commandStatus}</code>
+          <article className="rounded-md border border-line bg-elevated p-3">
+            <div className="grid gap-2 text-xs text-muted sm:grid-cols-2">
+              <code className="break-all rounded-sm bg-rail px-2 py-1.5">{telemetry}</code>
+              <code className="break-all rounded-sm bg-rail px-2 py-1.5">{shadow}</code>
+              <code className="break-all rounded-sm bg-rail px-2 py-1.5">{commands}</code>
+              <code className="break-all rounded-sm bg-rail px-2 py-1.5">{commandStatus}</code>
             </div>
           </article>
         </div>
 
-        <div className="rounded-md border border-line bg-white p-3">
+        <div className="rounded-md border border-line bg-elevated p-3">
           <h3 className="text-sm font-semibold text-ink">Agent status</h3>
           <dl className="mt-3 space-y-2 text-xs">
             <div className="flex items-center justify-between gap-3">
-              <dt className="text-ink/50">Version</dt>
+              <dt className="text-faint">Version</dt>
               <dd className="font-medium text-ink">{device?.firmware ?? "-"}</dd>
             </div>
             <div className="flex items-center justify-between gap-3">
-              <dt className="text-ink/50">Certificate</dt>
-              <dd className={`font-medium ${authReady ? "text-teal" : "text-amber"}`}>
+              <dt className="text-faint">Certificate</dt>
+              <dd className={`font-medium ${authReady ? "text-success" : "text-warning"}`}>
                 {authReady ? "dev auth ready" : "not issued"}
               </dd>
             </div>
             <div className="flex items-center justify-between gap-3">
-              <dt className="text-ink/50">Remote shell</dt>
-              <dd className="font-medium text-amber">beta off</dd>
+              <dt className="text-faint">Remote shell</dt>
+              <dd className="font-medium text-warning">beta off</dd>
             </div>
           </dl>
 
           <div className="mt-4 grid grid-cols-3 gap-2">
             <button
-              className="grid h-10 place-items-center rounded-md border border-line bg-white text-ink/70 transition hover:border-ink/20 hover:text-ink disabled:cursor-not-allowed disabled:text-ink/24"
+              className="grid h-10 place-items-center rounded-md border border-line bg-panel text-muted transition hover:bg-line hover:text-ink disabled:cursor-not-allowed disabled:text-faint"
               type="button"
               aria-label="Trigger OTA install"
               disabled={busy || !hasDevice}
@@ -132,7 +132,7 @@ export function DeviceAgentPanel({
               <PackageCheck className="h-4 w-4" aria-hidden="true" />
             </button>
             <button
-              className="grid h-10 place-items-center rounded-md border border-line bg-white text-ink/70 transition hover:border-ink/20 hover:text-ink disabled:cursor-not-allowed disabled:text-ink/24"
+              className="grid h-10 place-items-center rounded-md border border-line bg-panel text-muted transition hover:bg-line hover:text-ink disabled:cursor-not-allowed disabled:text-faint"
               type="button"
               aria-label="Collect diagnostics"
               disabled={busy || !hasDevice}
@@ -140,12 +140,12 @@ export function DeviceAgentPanel({
             >
               <Wrench className="h-4 w-4" aria-hidden="true" />
             </button>
-            <button className="grid h-10 place-items-center rounded-md border border-line bg-paper text-ink/32" type="button" aria-label="Remote shell disabled" disabled>
+            <button className="grid h-10 place-items-center rounded-md border border-line bg-rail text-faint" type="button" aria-label="Remote shell disabled" disabled>
               <Terminal className="h-4 w-4" aria-hidden="true" />
             </button>
           </div>
           <button
-            className="mt-2 inline-flex h-9 w-full items-center justify-center gap-2 rounded-md border border-line bg-white text-xs font-medium text-ink transition hover:border-ink/20 disabled:cursor-not-allowed disabled:text-ink/24"
+            className="mt-2 inline-flex h-9 w-full items-center justify-center gap-2 rounded-md border border-line bg-panel text-xs font-medium text-muted transition hover:bg-line hover:text-ink disabled:cursor-not-allowed disabled:text-faint"
             type="button"
             disabled={busy || !hasDevice}
             onClick={onIngestSample}
@@ -154,8 +154,8 @@ export function DeviceAgentPanel({
             Simulate heartbeat
           </button>
 
-          <div className="mt-3 flex items-center gap-2 rounded-sm bg-paper px-2 py-2 text-xs text-ink/58">
-            <FileText className="h-3.5 w-3.5 shrink-0 text-teal" aria-hidden="true" />
+          <div className="mt-3 flex items-center gap-2 rounded-sm bg-rail px-2 py-2 text-xs text-muted">
+            <FileText className="h-3.5 w-3.5 shrink-0 text-brand" aria-hidden="true" />
             Audit required for cert revoke, OTA, diagnostics, and shell sessions.
           </div>
         </div>

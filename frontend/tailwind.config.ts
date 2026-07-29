@@ -1,21 +1,30 @@
 import type { Config } from "tailwindcss";
 
+const color = (name: string) => `rgb(var(--color-${name}) / <alpha-value>)`;
+
 const config: Config = {
   content: ["./src/**/*.{ts,tsx}"],
   theme: {
     extend: {
       colors: {
-        ink: "#18211f",
-        paper: "#f4f1ea",
-        panel: "#fbfaf7",
-        line: "#ded8cc",
-        teal: "#16786f",
-        amber: "#b87911",
-        signal: "#2f5f9f",
-        danger: "#b13d32",
+        ink: color("ink"),
+        paper: color("paper"),
+        panel: color("panel"),
+        elevated: color("elevated"),
+        rail: color("rail"),
+        line: color("line"),
+        muted: color("muted"),
+        faint: color("faint"),
+        brand: color("brand"),
+        "brand-hover": color("brand-hover"),
+        success: color("success"),
+        warning: color("warning"),
+        danger: color("danger"),
+        signal: color("signal"),
       },
       boxShadow: {
-        rail: "inset -1px 0 0 rgba(24,33,31,0.1)",
+        rail: "var(--shadow-rail)",
+        panel: "var(--shadow-panel)",
       },
     },
   },
@@ -23,4 +32,3 @@ const config: Config = {
 };
 
 export default config;
-
