@@ -1,7 +1,7 @@
 use excalibur_domain::{
-    Action, ActionState, AlertRule, AuditLog, CertificateStatus, Dashboard, Device,
+    Action, ActionState, AlertRule, ApiKey, AuditLog, CertificateStatus, Dashboard, Device,
     DeviceCertificate, DeviceStatus, FirmwareArtifact, Id, Membership, Org, Project, Role,
-    StreamDefinition, TelemetryPoint, User,
+    StreamDefinition, TelemetryPoint, User, UserSession,
 };
 use serde_json::Value;
 use sqlx::{Row, postgres::PgRow};
@@ -123,6 +123,40 @@ pub(super) fn map_user(row: &PgRow) -> StoreResult<User> {
         display_name: row.try_get("display_name").map_err(map_decode_error)?,
         password_hash: row.try_get("password_hash").map_err(map_decode_error)?,
         email_verified: row.try_get("email_verified").map_err(map_decode_error)?,
+        created_at: row.try_get("created_at").map_err(map_decode_error)?,
+    })
+}
+
+pub(super) fn map_user_session(row: &PgRow) -> StoreResult<UserSession> {
+    Ok(UserSession {
+        id: row.try_get("id").map_err(map_decode_error)?,
+        user_id: row.try_get("user_id").map_err(map_decode_error)?,
+        token_hash: row.try_get("token_hash").map_err(map_decode_error)?,
+        refresh_token_hash: row
+            .try_get("refresh_token_hash")
+            .map_err(map_decode_error)?,
+        expires_at: row.try_get("expires_at").map_err(map_decode_error)?,
+        refresh_expires_at: row
+            .try_get("refresh_expires_at")
+            .map_err(map_decode_error)?,
+        revoked_at: row.try_get("revoked_at").map_err(map_decode_error)?,
+        last_used_at: row.try_get("last_used_at").map_err(map_decode_error)?,
+        created_at: row.try_get("created_at").map_err(map_decode_error)?,
+    })
+}
+
+pub(super) fn map_api_key(row: &PgRow) -> StoreResult<ApiKey> {
+    Ok(ApiKey {
+        id: row.try_get("id").map_err(map_decode_error)?,
+        org_id: row.try_get("org_id").map_err(map_decode_error)?,
+        project_id: row.try_get("project_id").map_err(map_decode_error)?,
+        name: row.try_get("name").map_err(map_decode_error)?,
+        key_hash: row.try_get("key_hash").map_err(map_decode_error)?,
+        scopes: row.try_get("scopes").map_err(map_decode_error)?,
+        expires_at: row.try_get("expires_at").map_err(map_decode_error)?,
+        revoked_at: row.try_get("revoked_at").map_err(map_decode_error)?,
+        last_used_at: row.try_get("last_used_at").map_err(map_decode_error)?,
+        created_by: row.try_get("created_by").map_err(map_decode_error)?,
         created_at: row.try_get("created_at").map_err(map_decode_error)?,
     })
 }

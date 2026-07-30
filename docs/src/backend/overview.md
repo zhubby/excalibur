@@ -23,7 +23,7 @@
 4. 调用 store 层，store 层再次检查 project ownership。
 5. 对安全敏感动作写 audit log。
 
-当前 API 的 session 保存在进程内 `HashMap`。这只适合开发验证；生产需要 HttpOnly cookie session、refresh token rotation、持久 session 表、设备 API key hash、邮箱验证和邀请流程。
+当前 API 使用 Bearer access token 解析 actor。`STORAGE_BACKEND=memory` 时 session 保存在进程内；`STORAGE_BACKEND=timescale` 时 session、refresh token rotation/reuse detection 和 API key hash 存储在 SQL 表中。生产仍需要 HttpOnly cookie、邮箱验证、邀请流程、登录限流和 MFA。
 
 ## OpenAPI
 
@@ -50,7 +50,7 @@ API main 会读取 `STORAGE_BACKEND`：
 | `timescale` | 使用 SQL repository，要求 `DATABASE_URL` 指向已初始化的 TimescaleDB schema；启动时执行 schema validation。 |
 | 其他 | fail fast。 |
 
-生产化前不应把 `memory` 模式暴露为真实 SaaS 环境。SQL repository 已覆盖控制面和 telemetry 表，但 session 仍在 API 进程内，生产需要迁移到持久 session/refresh-token 存储。
+生产化前不应把 `memory` 模式暴露为真实 SaaS 环境。SQL repository 已覆盖控制面、telemetry、session/refresh-token 和 API key 表；生产还需要 cookie session 集成、登录安全策略和 API key scope enforcement 接入自动化/ingest 入口。
 
 ## 关键工程约束
 

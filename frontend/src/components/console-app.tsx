@@ -15,6 +15,7 @@ import {
   type Action,
   type AlertRule,
   type AuditLog,
+  type AuthResponse,
   type Device,
   type DeviceConfig,
   type FirmwareArtifact,
@@ -36,6 +37,9 @@ import { commandStatusTopic, commandTopic, shadowTopic, telemetryTopic } from "@
 
 type Session = {
   token: string;
+  refreshToken: string;
+  expiresAt: string;
+  refreshExpiresAt: string;
   userId: string;
 };
 
@@ -64,6 +68,7 @@ const THEME_KEY = "excalibur.console.theme.v1";
 const DEFAULT_API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8080";
 const SYSTEM_STREAM = "device_agent_system_stats";
 const DEFAULT_SHA256 = "a".repeat(64);
+const SESSION_REFRESH_SKEW_MS = 60_000;
 
 const emptyProjectData: ProjectData = {
   devices: [],
@@ -87,6 +92,35 @@ function formatError(error: unknown) {
 
 function isThemeMode(value: string | null | undefined): value is ThemeMode {
   return value === "dark" || value === "light";
+}
+
+function isStoredSession(value: unknown): value is Session {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const session = value as Partial<Record<keyof Session, unknown>>;
+  return (
+    typeof session.token === "string" &&
+    typeof session.refreshToken === "string" &&
+    typeof session.expiresAt === "string" &&
+    typeof session.refreshExpiresAt === "string" &&
+    typeof session.userId === "string"
+  );
+}
+
+function sessionFromAuth(auth: AuthResponse): Session {
+  return {
+    token: auth.token,
+    refreshToken: auth.refresh_token,
+    expiresAt: auth.expires_at,
+    refreshExpiresAt: auth.refresh_expires_at,
+    userId: auth.user_id,
+  };
+}
+
+function expiresBefore(iso: string, cutoffMs: number) {
+  const expiresAt = Date.parse(iso);
+  return !Number.isFinite(expiresAt) || expiresAt <= cutoffMs;
 }
 
 function isRecord(value: JsonValue | undefined): value is Record<string, JsonValue> {
@@ -445,6 +479,39 @@ export function ConsoleApp() {
   const [notice, setNotice] = useState<string | null>(null);
   const initializedSessionKey = useRef<string | null>(null);
 
+  const clearSession = useCallback(() => {
+    window.localStorage.removeItem(SESSION_KEY);
+    setSession(null);
+  }, []);
+
+  const persistSession = useCallback((nextSession: Session) => {
+    window.localStorage.setItem(SESSION_KEY, JSON.stringify(nextSession));
+    setSession(nextSession);
+    return nextSession;
+  }, []);
+
+  const getApiForSession = useCallback(
+    async (activeSession: Session) => {
+      let usableSession = activeSession;
+      if (expiresBefore(activeSession.expiresAt, Date.now() + SESSION_REFRESH_SKEW_MS)) {
+        if (expiresBefore(activeSession.refreshExpiresAt, Date.now())) {
+          clearSession();
+          throw new Error("Session expired");
+        }
+        try {
+          const authApi = createExcaliburApi({ baseUrl: apiBaseUrl });
+          const auth = await authApi.refreshSession({ refresh_token: activeSession.refreshToken });
+          usableSession = persistSession(sessionFromAuth(auth));
+        } catch (refreshError) {
+          clearSession();
+          throw refreshError;
+        }
+      }
+      return createExcaliburApi({ baseUrl: apiBaseUrl, token: usableSession.token });
+    },
+    [apiBaseUrl, clearSession, persistSession],
+  );
+
   const loadProjectData = useCallback(async (api: Api, orgId: string, projectId: string) => {
     const [devices, streams, telemetry, actions, firmware, alerts, audit] = await Promise.all([
       api.listDevices(projectId),
@@ -468,7 +535,7 @@ export function ConsoleApp() {
       setError(null);
       setNotice("Loading workspace");
       try {
-        const api = createExcaliburApi({ baseUrl: apiBaseUrl, token: activeSession.token });
+        const api = await getApiForSession(activeSession);
         const org = await ensureOrg(api, activeSession.userId);
         const project = await ensureProject(api, org);
         await ensureDefaultControlPlane(api, project.id);
@@ -483,7 +550,7 @@ export function ConsoleApp() {
         setBusy(false);
       }
     },
-    [apiBaseUrl, loadProjectData],
+    [getApiForSession, loadProjectData],
   );
 
   useEffect(() => {
@@ -494,7 +561,12 @@ export function ConsoleApp() {
     }
     if (savedSession) {
       try {
-        setSession(JSON.parse(savedSession) as Session);
+        const parsedSession: unknown = JSON.parse(savedSession);
+        if (isStoredSession(parsedSession)) {
+          setSession(parsedSession);
+        } else {
+          window.localStorage.removeItem(SESSION_KEY);
+        }
       } catch {
         window.localStorage.removeItem(SESSION_KEY);
       }
@@ -539,7 +611,7 @@ export function ConsoleApp() {
       setBusy(true);
       setError(null);
       try {
-        const api = createExcaliburApi({ baseUrl: apiBaseUrl, token: session.token });
+        const api = await getApiForSession(session);
         await work(api, workspace);
         await loadProjectData(api, workspace.org.id, workspace.project.id);
         setNotice(success);
@@ -549,7 +621,7 @@ export function ConsoleApp() {
         setBusy(false);
       }
     },
-    [apiBaseUrl, loadProjectData, session, workspace],
+    [getApiForSession, loadProjectData, session, workspace],
   );
 
   const selectedDevice = useMemo(
@@ -648,10 +720,9 @@ export function ConsoleApp() {
               display_name: displayName.trim() || email,
             })
           : await api.login({ email, password });
-      const nextSession = { token: auth.token, userId: auth.user_id };
-      window.localStorage.setItem(SESSION_KEY, JSON.stringify(nextSession));
+      const nextSession = sessionFromAuth(auth);
       window.localStorage.setItem(API_BASE_KEY, apiBaseUrl);
-      setSession(nextSession);
+      persistSession(nextSession);
       setNotice("Signed in");
     } catch (authError) {
       setError(formatError(authError));
@@ -660,12 +731,25 @@ export function ConsoleApp() {
     }
   };
 
-  const handleLogout = () => {
-    window.localStorage.removeItem(SESSION_KEY);
-    setSession(null);
+  const handleLogout = useCallback(() => {
+    const activeSession = session;
+    setBusy(true);
     setNotice(null);
     setError(null);
-  };
+    void (async () => {
+      try {
+        if (activeSession) {
+          const api = await getApiForSession(activeSession);
+          await api.logout();
+        }
+      } catch (logoutError) {
+        setError(formatError(logoutError));
+      } finally {
+        clearSession();
+        setBusy(false);
+      }
+    })();
+  }, [clearSession, getApiForSession, session]);
 
   const handleRefresh = useCallback(() => {
     if (session && !workspace) {

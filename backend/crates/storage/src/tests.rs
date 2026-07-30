@@ -1,8 +1,9 @@
 use chrono::Utc;
 use excalibur_domain::{
-    Action, ActionState, ActionStatusUpdate, AlertKind, AlertRule, AuditLog, CertificateStatus,
-    Dashboard, Device, DeviceCertificate, FirmwareArtifact, Membership, Org, Project, Role,
-    StreamDefinition, StreamField, StreamFieldType, TelemetryPoint, User,
+    Action, ActionState, ActionStatusUpdate, AlertKind, AlertRule, ApiKey, AuditLog,
+    CertificateStatus, Dashboard, Device, DeviceCertificate, DeviceStatus, FirmwareArtifact,
+    Membership, Org, Project, Role, StreamDefinition, StreamField, StreamFieldType, TelemetryPoint,
+    User, UserSession,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -425,6 +426,337 @@ fn database_error_display_is_opaque() {
 }
 
 #[tokio::test]
+async fn sessions_rotate_refresh_tokens_and_detect_reuse() {
+    let store = MemoryStore::new();
+    let user = store
+        .create_user(User::new("sessions@example.com", "Sessions", "hash"))
+        .await
+        .unwrap();
+    let session = store
+        .create_session(UserSession::new(
+            user.id,
+            "access-1",
+            "refresh-1",
+            Utc::now() + chrono::Duration::hours(1),
+            Utc::now() + chrono::Duration::days(30),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .get_active_session_by_token_hash("access-1")
+            .await
+            .unwrap()
+            .user_id,
+        user.id
+    );
+
+    let rotated = store
+        .rotate_session_refresh_token(
+            "refresh-1",
+            "access-2".to_owned(),
+            "refresh-2".to_owned(),
+            Utc::now() + chrono::Duration::hours(1),
+            Utc::now() + chrono::Duration::days(30),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rotated.id, session.id);
+    assert_eq!(
+        store
+            .get_active_session_by_token_hash("access-1")
+            .await
+            .unwrap_err(),
+        StoreError::NotFound("session")
+    );
+    assert_eq!(
+        store
+            .rotate_session_refresh_token(
+                "refresh-1",
+                "access-3".to_owned(),
+                "refresh-3".to_owned(),
+                Utc::now() + chrono::Duration::hours(1),
+                Utc::now() + chrono::Duration::days(30),
+            )
+            .await
+            .unwrap_err(),
+        StoreError::Conflict("refresh token reuse")
+    );
+    assert_eq!(
+        store
+            .get_active_session_by_token_hash("access-2")
+            .await
+            .unwrap_err(),
+        StoreError::NotFound("session")
+    );
+}
+
+#[tokio::test]
+async fn sessions_reject_expired_and_revoked_refresh_tokens() {
+    let store = MemoryStore::new();
+    let user = store
+        .create_user(User::new(
+            "session-expiry@example.com",
+            "Session Expiry",
+            "hash",
+        ))
+        .await
+        .unwrap();
+    store
+        .create_session(UserSession::new(
+            user.id,
+            "expired-access",
+            "valid-refresh-for-expired-access",
+            Utc::now() - chrono::Duration::seconds(1),
+            Utc::now() + chrono::Duration::days(30),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_active_session_by_token_hash("expired-access")
+            .await
+            .unwrap_err(),
+        StoreError::NotFound("session")
+    );
+
+    store
+        .create_session(UserSession::new(
+            user.id,
+            "valid-access-for-expired-refresh",
+            "expired-refresh",
+            Utc::now() + chrono::Duration::hours(1),
+            Utc::now() - chrono::Duration::seconds(1),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .rotate_session_refresh_token(
+                "expired-refresh",
+                "unused-access".to_owned(),
+                "unused-refresh".to_owned(),
+                Utc::now() + chrono::Duration::hours(1),
+                Utc::now() + chrono::Duration::days(30),
+            )
+            .await
+            .unwrap_err(),
+        StoreError::NotFound("refresh token")
+    );
+
+    store
+        .create_session(UserSession::new(
+            user.id,
+            "revoked-access",
+            "revoked-refresh",
+            Utc::now() + chrono::Duration::hours(1),
+            Utc::now() + chrono::Duration::days(30),
+        ))
+        .await
+        .unwrap();
+    store
+        .revoke_session_by_token_hash("revoked-access")
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .rotate_session_refresh_token(
+                "revoked-refresh",
+                "unused-revoked-access".to_owned(),
+                "unused-revoked-refresh".to_owned(),
+                Utc::now() + chrono::Duration::hours(1),
+                Utc::now() + chrono::Duration::days(30),
+            )
+            .await
+            .unwrap_err(),
+        StoreError::NotFound("refresh token")
+    );
+}
+
+#[tokio::test]
+async fn api_keys_are_hashed_scoped_and_revocable() {
+    let store = MemoryStore::new();
+    let user = store
+        .create_user(User::new("api-keys@example.com", "API Keys", "hash"))
+        .await
+        .unwrap();
+    let org = store
+        .create_org(Org::new("API Key Org", "api-key-org"), user.id)
+        .await
+        .unwrap();
+    let project = store
+        .create_project(Project::new(org.id, "Factory", "factory"))
+        .await
+        .unwrap();
+    let api_key = store
+        .create_api_key(ApiKey::new(
+            org.id,
+            Some(project.id),
+            "ingest",
+            "hashed-secret",
+            vec!["ingest:write".to_owned()],
+            None,
+            Some(user.id),
+        ))
+        .await
+        .unwrap();
+
+    assert!(api_key.has_scope("ingest:write"));
+    assert_eq!(
+        store
+            .get_active_api_key_by_hash("hashed-secret")
+            .await
+            .unwrap()
+            .id,
+        api_key.id
+    );
+    assert_eq!(store.list_api_keys(org.id, Some(project.id)).await.len(), 1);
+    let other_org = store
+        .create_org(Org::new("Other API Key Org", "other-api-key-org"), user.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .revoke_api_key(other_org.id, api_key.id)
+            .await
+            .unwrap_err(),
+        StoreError::NotFound("api key")
+    );
+    store.revoke_api_key(org.id, api_key.id).await.unwrap();
+    assert_eq!(
+        store
+            .get_active_api_key_by_hash("hashed-secret")
+            .await
+            .unwrap_err(),
+        StoreError::NotFound("api key")
+    );
+    let expired = store
+        .create_api_key(ApiKey::new(
+            org.id,
+            Some(project.id),
+            "expired",
+            "expired-secret",
+            vec!["ingest:write".to_owned()],
+            Some(Utc::now() - chrono::Duration::seconds(1)),
+            Some(user.id),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(expired.key_hash, "expired-secret");
+    assert_eq!(
+        store
+            .get_active_api_key_by_hash("expired-secret")
+            .await
+            .unwrap_err(),
+        StoreError::NotFound("api key")
+    );
+}
+
+#[tokio::test]
+async fn active_certificate_fingerprint_resolves_device_identity() {
+    let store = MemoryStore::new();
+    let user = store
+        .create_user(User::new("certs@example.com", "Certs", "hash"))
+        .await
+        .unwrap();
+    let org = store
+        .create_org(Org::new("Cert Org", "cert-org"), user.id)
+        .await
+        .unwrap();
+    let project = store
+        .create_project(Project::new(org.id, "Factory", "factory"))
+        .await
+        .unwrap();
+    let device = store
+        .create_device(Device::new(project.id, "press-1", json!({})))
+        .await
+        .unwrap();
+    let certificate = store
+        .create_device_certificate(DeviceCertificate::new(
+            project.id,
+            device.id,
+            "fingerprint",
+            Utc::now() + chrono::Duration::days(1),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .get_active_device_by_certificate_fingerprint("fingerprint")
+            .await
+            .unwrap()
+            .id,
+        device.id
+    );
+    store
+        .revoke_device_certificate(project.id, device.id, certificate.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_active_device_by_certificate_fingerprint("fingerprint")
+            .await
+            .unwrap_err(),
+        StoreError::NotFound("certificate")
+    );
+
+    let mut future = DeviceCertificate::new(
+        project.id,
+        device.id,
+        "future-fingerprint",
+        Utc::now() + chrono::Duration::days(2),
+    );
+    future.not_before = Utc::now() + chrono::Duration::days(1);
+    store.create_device_certificate(future).await.unwrap();
+    assert_eq!(
+        store
+            .get_active_device_by_certificate_fingerprint("future-fingerprint")
+            .await
+            .unwrap_err(),
+        StoreError::NotFound("certificate")
+    );
+
+    store
+        .create_device_certificate(DeviceCertificate::new(
+            project.id,
+            device.id,
+            "expired-fingerprint",
+            Utc::now() - chrono::Duration::seconds(1),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_active_device_by_certificate_fingerprint("expired-fingerprint")
+            .await
+            .unwrap_err(),
+        StoreError::NotFound("certificate")
+    );
+
+    let mut disabled_device = Device::new(project.id, "disabled-press", json!({}));
+    disabled_device.status = DeviceStatus::Disabled;
+    let disabled_device = store.create_device(disabled_device).await.unwrap();
+    store
+        .create_device_certificate(DeviceCertificate::new(
+            project.id,
+            disabled_device.id,
+            "disabled-fingerprint",
+            Utc::now() + chrono::Duration::days(1),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_active_device_by_certificate_fingerprint("disabled-fingerprint")
+            .await
+            .unwrap_err(),
+        StoreError::NotFound("certificate")
+    );
+}
+
+#[tokio::test]
 async fn pg_store_contract_runs_when_database_url_is_set() {
     let Ok(database_url) = std::env::var("EXCALIBUR_SQL_TEST_DATABASE_URL") else {
         eprintln!("skipping PgStore contract; EXCALIBUR_SQL_TEST_DATABASE_URL is not set");
@@ -462,6 +794,121 @@ async fn pg_store_contract_runs_when_database_url_is_set() {
             .unwrap_err(),
         StoreError::Conflict("user")
     );
+    let session = store
+        .create_session(UserSession::new(
+            owner.id,
+            format!("sql-access-{suffix}-1"),
+            format!("sql-refresh-{suffix}-1"),
+            Utc::now() + chrono::Duration::hours(1),
+            Utc::now() + chrono::Duration::days(30),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_active_session_by_token_hash(&format!("sql-access-{suffix}-1"))
+            .await
+            .unwrap()
+            .id,
+        session.id
+    );
+    store
+        .rotate_session_refresh_token(
+            &format!("sql-refresh-{suffix}-1"),
+            format!("sql-access-{suffix}-2"),
+            format!("sql-refresh-{suffix}-2"),
+            Utc::now() + chrono::Duration::hours(1),
+            Utc::now() + chrono::Duration::days(30),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .rotate_session_refresh_token(
+                &format!("sql-refresh-{suffix}-1"),
+                format!("sql-access-{suffix}-3"),
+                format!("sql-refresh-{suffix}-3"),
+                Utc::now() + chrono::Duration::hours(1),
+                Utc::now() + chrono::Duration::days(30),
+            )
+            .await
+            .unwrap_err(),
+        StoreError::Conflict("refresh token reuse")
+    );
+    assert_eq!(
+        store
+            .get_active_session_by_token_hash(&format!("sql-access-{suffix}-2"))
+            .await
+            .unwrap_err(),
+        StoreError::NotFound("session")
+    );
+    store
+        .create_session(UserSession::new(
+            owner.id,
+            format!("sql-expired-access-{suffix}"),
+            format!("sql-valid-refresh-for-expired-access-{suffix}"),
+            Utc::now() - chrono::Duration::seconds(1),
+            Utc::now() + chrono::Duration::days(30),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_active_session_by_token_hash(&format!("sql-expired-access-{suffix}"))
+            .await
+            .unwrap_err(),
+        StoreError::NotFound("session")
+    );
+    store
+        .create_session(UserSession::new(
+            owner.id,
+            format!("sql-valid-access-for-expired-refresh-{suffix}"),
+            format!("sql-expired-refresh-{suffix}"),
+            Utc::now() + chrono::Duration::hours(1),
+            Utc::now() - chrono::Duration::seconds(1),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .rotate_session_refresh_token(
+                &format!("sql-expired-refresh-{suffix}"),
+                format!("sql-unused-access-{suffix}"),
+                format!("sql-unused-refresh-{suffix}"),
+                Utc::now() + chrono::Duration::hours(1),
+                Utc::now() + chrono::Duration::days(30),
+            )
+            .await
+            .unwrap_err(),
+        StoreError::NotFound("refresh token")
+    );
+    store
+        .create_session(UserSession::new(
+            owner.id,
+            format!("sql-revoked-access-{suffix}"),
+            format!("sql-revoked-refresh-{suffix}"),
+            Utc::now() + chrono::Duration::hours(1),
+            Utc::now() + chrono::Duration::days(30),
+        ))
+        .await
+        .unwrap();
+    store
+        .revoke_session_by_token_hash(&format!("sql-revoked-access-{suffix}"))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .rotate_session_refresh_token(
+                &format!("sql-revoked-refresh-{suffix}"),
+                format!("sql-unused-revoked-access-{suffix}"),
+                format!("sql-unused-revoked-refresh-{suffix}"),
+                Utc::now() + chrono::Duration::hours(1),
+                Utc::now() + chrono::Duration::days(30),
+            )
+            .await
+            .unwrap_err(),
+        StoreError::NotFound("refresh token")
+    );
     let org = store
         .create_org(
             Org::new("SQL Contract Org", format!("sql-contract-{suffix}")),
@@ -481,6 +928,53 @@ async fn pg_store_contract_runs_when_database_url_is_set() {
         ))
         .await
         .unwrap();
+    let api_key = store
+        .create_api_key(ApiKey::new(
+            org.id,
+            Some(project.id),
+            "SQL ingest",
+            format!("sql-api-key-{suffix}"),
+            vec!["ingest:write".to_owned()],
+            None,
+            Some(owner.id),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_active_api_key_by_hash(&format!("sql-api-key-{suffix}"))
+            .await
+            .unwrap()
+            .id,
+        api_key.id
+    );
+    assert_eq!(
+        store
+            .list_api_keys(org.id, Some(project.id))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    store
+        .create_api_key(ApiKey::new(
+            org.id,
+            Some(project.id),
+            "Expired SQL ingest",
+            format!("sql-expired-api-key-{suffix}"),
+            vec!["ingest:write".to_owned()],
+            Some(Utc::now() - chrono::Duration::seconds(1)),
+            Some(owner.id),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_active_api_key_by_hash(&format!("sql-expired-api-key-{suffix}"))
+            .await
+            .unwrap_err(),
+        StoreError::NotFound("api key")
+    );
     let other_org = store
         .create_org(
             Org::new(
@@ -499,6 +993,13 @@ async fn pg_store_contract_runs_when_database_url_is_set() {
         ))
         .await
         .unwrap();
+    assert_eq!(
+        store
+            .revoke_api_key(other_org.id, api_key.id)
+            .await
+            .unwrap_err(),
+        StoreError::NotFound("api key")
+    );
     assert_eq!(
         store.user_role(org.id, owner.id).await.unwrap(),
         Some(Role::Owner)
@@ -547,10 +1048,18 @@ async fn pg_store_contract_runs_when_database_url_is_set() {
             project.id,
             device.id,
             format!("fingerprint-{suffix}"),
-            Utc::now(),
+            Utc::now() + chrono::Duration::days(1),
         ))
         .await
         .unwrap();
+    assert_eq!(
+        store
+            .get_active_device_by_certificate_fingerprint(&format!("fingerprint-{suffix}"))
+            .await
+            .unwrap()
+            .id,
+        device.id
+    );
     assert_eq!(
         store
             .list_device_certificates(project.id, device.id)
@@ -573,6 +1082,59 @@ async fn pg_store_contract_runs_when_database_url_is_set() {
             .await
             .unwrap_err(),
         StoreError::TenantScope
+    );
+    let mut future_certificate = DeviceCertificate::new(
+        project.id,
+        device.id,
+        format!("future-fingerprint-{suffix}"),
+        Utc::now() + chrono::Duration::days(2),
+    );
+    future_certificate.not_before = Utc::now() + chrono::Duration::days(1);
+    store
+        .create_device_certificate(future_certificate)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_active_device_by_certificate_fingerprint(&format!("future-fingerprint-{suffix}"))
+            .await
+            .unwrap_err(),
+        StoreError::NotFound("certificate")
+    );
+    store
+        .create_device_certificate(DeviceCertificate::new(
+            project.id,
+            device.id,
+            format!("expired-fingerprint-{suffix}"),
+            Utc::now() - chrono::Duration::seconds(1),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_active_device_by_certificate_fingerprint(&format!("expired-fingerprint-{suffix}"))
+            .await
+            .unwrap_err(),
+        StoreError::NotFound("certificate")
+    );
+    let mut disabled_device = Device::new(project.id, "disabled-sql-device", json!({}));
+    disabled_device.status = DeviceStatus::Disabled;
+    let disabled_device = store.create_device(disabled_device).await.unwrap();
+    store
+        .create_device_certificate(DeviceCertificate::new(
+            project.id,
+            disabled_device.id,
+            format!("disabled-fingerprint-{suffix}"),
+            Utc::now() + chrono::Duration::days(1),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_active_device_by_certificate_fingerprint(&format!("disabled-fingerprint-{suffix}"))
+            .await
+            .unwrap_err(),
+        StoreError::NotFound("certificate")
     );
 
     let stream = store

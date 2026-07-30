@@ -50,6 +50,7 @@ migrations:
   enabled: true
   image: postgres:16-alpine
   backoffLimit: 3
+  activeDeadlineSeconds: 600
 
 env:
   STORAGE_BACKEND: timescale

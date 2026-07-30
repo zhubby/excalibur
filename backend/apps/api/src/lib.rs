@@ -1,6 +1,6 @@
 mod auth;
 
-use std::{collections::HashMap, convert::Infallible, sync::Arc};
+use std::convert::Infallible;
 
 use axum::{
     Json, Router,
@@ -12,6 +12,7 @@ use axum::{
     },
     routing::{get, post},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{Duration, Utc};
 use excalibur_device_protocol::{
     DeviceAgentAuthentication, DeviceConfig, DiagnosticsCollectPayload, OtaInstallPayload,
@@ -19,40 +20,41 @@ use excalibur_device_protocol::{
     parse_publish_topic,
 };
 use excalibur_domain::{
-    Action, ActionState, ActionStatusUpdate, AlertKind, AlertRule, AuditLog, Dashboard, Device,
-    DeviceCertificate, FirmwareArtifact, Id, Org, Project, Role, StreamDefinition, StreamField,
-    StreamFieldType, TelemetryPoint, User,
+    Action, ActionState, ActionStatusUpdate, AlertKind, AlertRule, ApiKey, AuditLog, Dashboard,
+    Device, DeviceCertificate, FirmwareArtifact, Id, Org, Project, Role, StreamDefinition,
+    StreamField, StreamFieldType, TelemetryPoint, User, UserSession,
 };
 use excalibur_storage::{Store, StoreError, map_terminal_action_state};
 use futures_util::stream;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::RwLock;
+use sha2::{Digest, Sha256};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
+const ACCESS_TOKEN_PREFIX: &str = "excs_";
+const REFRESH_TOKEN_PREFIX: &str = "excr_";
+const API_KEY_PREFIX: &str = "excak_";
+const ACCESS_TOKEN_TTL_HOURS: i64 = 1;
+const REFRESH_TOKEN_TTL_DAYS: i64 = 30;
+
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub store: Store,
-    sessions: Arc<RwLock<HashMap<String, Id>>>,
 }
 
 impl Default for AppState {
     fn default() -> Self {
         Self {
             store: Store::memory(),
-            sessions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
 
 impl AppState {
     pub fn new(store: Store) -> Self {
-        Self {
-            store,
-            sessions: Arc::new(RwLock::new(HashMap::new())),
-        }
+        Self { store }
     }
 }
 
@@ -68,6 +70,10 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/api/v1/events", get(events))
         .route("/api/v1/auth/register", post(register))
         .route("/api/v1/auth/login", post(login))
+        .route("/api/v1/auth/refresh", post(refresh_session))
+        .route("/api/v1/auth/logout", post(logout))
+        .route("/api/v1/api-keys", get(list_api_keys).post(create_api_key))
+        .route("/api/v1/api-keys/{api_key_id}/revoke", post(revoke_api_key))
         .route("/api/v1/orgs", get(list_orgs).post(create_org))
         .route("/api/v1/projects", get(list_projects).post(create_project))
         .route("/api/v1/devices", get(list_devices).post(create_device))
@@ -116,6 +122,11 @@ pub fn app_with_state(state: AppState) -> Router {
         readiness,
         register,
         login,
+        refresh_session,
+        logout,
+        create_api_key,
+        list_api_keys,
+        revoke_api_key,
         create_org,
         list_orgs,
         create_project,
@@ -145,7 +156,11 @@ pub fn app_with_state(state: AppState) -> Router {
         HealthResponse,
         RegisterRequest,
         LoginRequest,
+        RefreshRequest,
         AuthResponse,
+        LogoutResponse,
+        CreateApiKeyRequest,
+        ApiKeyResponse,
         CreateOrgRequest,
         CreateProjectRequest,
         CreateDeviceRequest,
@@ -245,12 +260,14 @@ async fn require_actor(headers: &HeaderMap, state: &AppState) -> Result<Id, ApiE
         .and_then(|value| value.strip_prefix("Bearer "))
         .ok_or_else(|| ApiError::Unauthorized("missing bearer token".to_owned()))?;
     state
-        .sessions
-        .read()
+        .store
+        .get_active_session_by_token_hash(&auth::hash_secret(token))
         .await
-        .get(token)
-        .copied()
-        .ok_or_else(|| ApiError::Unauthorized("invalid session".to_owned()))
+        .map(|session| session.user_id)
+        .map_err(|error| match error {
+            StoreError::NotFound("session") => ApiError::Unauthorized("invalid session".to_owned()),
+            error => ApiError::from(error),
+        })
 }
 
 async fn require_org_role(
@@ -331,11 +348,48 @@ pub struct LoginRequest {
     pub password: String,
 }
 
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct RefreshRequest {
+    pub refresh_token: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct AuthResponse {
     pub token: String,
+    pub refresh_token: String,
+    pub expires_at: chrono::DateTime<Utc>,
+    pub refresh_expires_at: chrono::DateTime<Utc>,
     #[schema(value_type = String, format = Uuid)]
     pub user_id: Id,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct LogoutResponse {
+    pub status: String,
+}
+
+async fn issue_auth_response(state: &AppState, user_id: Id) -> Result<AuthResponse, ApiError> {
+    let token = auth::generate_secret(ACCESS_TOKEN_PREFIX);
+    let refresh_token = auth::generate_secret(REFRESH_TOKEN_PREFIX);
+    let expires_at = Utc::now() + Duration::hours(ACCESS_TOKEN_TTL_HOURS);
+    let refresh_expires_at = Utc::now() + Duration::days(REFRESH_TOKEN_TTL_DAYS);
+    state
+        .store
+        .create_session(UserSession::new(
+            user_id,
+            auth::hash_secret(&token),
+            auth::hash_secret(&refresh_token),
+            expires_at,
+            refresh_expires_at,
+        ))
+        .await?;
+    Ok(AuthResponse {
+        token,
+        refresh_token,
+        expires_at,
+        refresh_expires_at,
+        user_id,
+    })
 }
 
 #[utoipa::path(post, path = "/api/v1/auth/register", request_body = RegisterRequest, responses((status = 200, body = AuthResponse)))]
@@ -359,12 +413,7 @@ async fn register(
             password_hash,
         ))
         .await?;
-    let token = Uuid::now_v7().to_string();
-    state.sessions.write().await.insert(token.clone(), user.id);
-    Ok(Json(AuthResponse {
-        token,
-        user_id: user.id,
-    }))
+    Ok(Json(issue_auth_response(&state, user.id).await?))
 }
 
 #[utoipa::path(post, path = "/api/v1/auth/login", request_body = LoginRequest, responses((status = 200, body = AuthResponse)))]
@@ -386,12 +435,236 @@ async fn login(
     let Some(user) = user.filter(|_| verified) else {
         return Err(ApiError::Unauthorized("invalid credentials".to_owned()));
     };
-    let token = Uuid::now_v7().to_string();
-    state.sessions.write().await.insert(token.clone(), user.id);
+    Ok(Json(issue_auth_response(&state, user.id).await?))
+}
+
+#[utoipa::path(post, path = "/api/v1/auth/refresh", request_body = RefreshRequest, responses((status = 200, body = AuthResponse)))]
+async fn refresh_session(
+    State(state): State<AppState>,
+    Json(request): Json<RefreshRequest>,
+) -> ApiResult<AuthResponse> {
+    let token = auth::generate_secret(ACCESS_TOKEN_PREFIX);
+    let refresh_token = auth::generate_secret(REFRESH_TOKEN_PREFIX);
+    let expires_at = Utc::now() + Duration::hours(ACCESS_TOKEN_TTL_HOURS);
+    let refresh_expires_at = Utc::now() + Duration::days(REFRESH_TOKEN_TTL_DAYS);
+    let session = state
+        .store
+        .rotate_session_refresh_token(
+            &auth::hash_secret(&request.refresh_token),
+            auth::hash_secret(&token),
+            auth::hash_secret(&refresh_token),
+            expires_at,
+            refresh_expires_at,
+        )
+        .await
+        .map_err(|error| match error {
+            StoreError::Conflict("refresh token reuse") => {
+                ApiError::Unauthorized("refresh token reuse detected".to_owned())
+            }
+            StoreError::NotFound("refresh token") => {
+                ApiError::Unauthorized("invalid refresh token".to_owned())
+            }
+            error => ApiError::from(error),
+        })?;
     Ok(Json(AuthResponse {
         token,
-        user_id: user.id,
+        refresh_token,
+        expires_at,
+        refresh_expires_at,
+        user_id: session.user_id,
     }))
+}
+
+#[utoipa::path(post, path = "/api/v1/auth/logout", responses((status = 200, body = LogoutResponse)))]
+async fn logout(headers: HeaderMap, State(state): State<AppState>) -> ApiResult<LogoutResponse> {
+    let token = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or_else(|| ApiError::Unauthorized("missing bearer token".to_owned()))?;
+    state
+        .store
+        .revoke_session_by_token_hash(&auth::hash_secret(token))
+        .await
+        .map_err(|error| match error {
+            StoreError::NotFound("session") => ApiError::Unauthorized("invalid session".to_owned()),
+            error => ApiError::from(error),
+        })?;
+    Ok(Json(LogoutResponse {
+        status: "logged_out".to_owned(),
+    }))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateApiKeyRequest {
+    #[schema(value_type = String, format = Uuid)]
+    pub org_id: Id,
+    #[schema(value_type = String, format = Uuid)]
+    pub project_id: Option<Id>,
+    pub name: String,
+    pub scopes: Vec<String>,
+    pub expires_at: Option<chrono::DateTime<Utc>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ApiKeyResponse {
+    #[schema(value_type = String, format = Uuid)]
+    pub id: Id,
+    #[schema(value_type = String, format = Uuid)]
+    pub org_id: Id,
+    #[schema(value_type = String, format = Uuid)]
+    pub project_id: Option<Id>,
+    pub name: String,
+    pub scopes: Vec<String>,
+    pub expires_at: Option<chrono::DateTime<Utc>>,
+    pub revoked_at: Option<chrono::DateTime<Utc>>,
+    pub last_used_at: Option<chrono::DateTime<Utc>>,
+    #[schema(value_type = String, format = Uuid)]
+    pub created_by: Option<Id>,
+    pub created_at: chrono::DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct ApiKeyListQuery {
+    #[param(value_type = String, format = Uuid)]
+    pub org_id: Id,
+    #[param(value_type = String, format = Uuid)]
+    pub project_id: Option<Id>,
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct ApiKeyRevokeQuery {
+    #[param(value_type = String, format = Uuid)]
+    pub org_id: Id,
+}
+
+impl ApiKeyResponse {
+    fn from_api_key(api_key: ApiKey, key: Option<String>) -> Self {
+        Self {
+            id: api_key.id,
+            org_id: api_key.org_id,
+            project_id: api_key.project_id,
+            name: api_key.name,
+            scopes: api_key.scopes,
+            expires_at: api_key.expires_at,
+            revoked_at: api_key.revoked_at,
+            last_used_at: api_key.last_used_at,
+            created_by: api_key.created_by,
+            created_at: api_key.created_at,
+            key,
+        }
+    }
+}
+
+#[utoipa::path(post, path = "/api/v1/api-keys", request_body = CreateApiKeyRequest, responses((status = 200, body = ApiKeyResponse)))]
+async fn create_api_key(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<CreateApiKeyRequest>,
+) -> ApiResult<ApiKeyResponse> {
+    let actor_id = require_actor(&headers, &state).await?;
+    let org_id = request.org_id;
+    let project = if let Some(project_id) = request.project_id {
+        Some(require_project_role(&state, actor_id, project_id, Role::Admin).await?)
+    } else {
+        require_org_role(&state, actor_id, org_id, Role::Admin).await?;
+        None
+    };
+    if project
+        .as_ref()
+        .is_some_and(|project| project.org_id != request.org_id)
+    {
+        return Err(ApiError::Unauthorized("project scope violation".to_owned()));
+    }
+    if request.name.trim().is_empty() {
+        return Err(ApiError::BadRequest("name is required".to_owned()));
+    }
+    if request.scopes.is_empty() || request.scopes.iter().any(|scope| scope.trim().is_empty()) {
+        return Err(ApiError::BadRequest(
+            "scopes must contain non-empty values".to_owned(),
+        ));
+    }
+
+    let key = auth::generate_secret(API_KEY_PREFIX);
+    let api_key = state
+        .store
+        .create_api_key(ApiKey::new(
+            request.org_id,
+            request.project_id,
+            request.name,
+            auth::hash_secret(&key),
+            request.scopes,
+            request.expires_at,
+            Some(actor_id),
+        ))
+        .await?;
+    record_audit(
+        &state,
+        AuditLog::new(
+            api_key.org_id,
+            api_key.project_id,
+            Some(actor_id),
+            "api_key.create",
+            format!("api_key:{}", api_key.id),
+            json!({ "name": api_key.name, "scopes": api_key.scopes }),
+        ),
+    )
+    .await;
+    Ok(Json(ApiKeyResponse::from_api_key(api_key, Some(key))))
+}
+
+#[utoipa::path(get, path = "/api/v1/api-keys", params(ApiKeyListQuery), responses((status = 200, body = Vec<ApiKeyResponse>)))]
+async fn list_api_keys(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(query): Query<ApiKeyListQuery>,
+) -> ApiResult<Vec<ApiKeyResponse>> {
+    let actor_id = require_actor(&headers, &state).await?;
+    let org_id = query.org_id;
+    require_org_role(&state, actor_id, org_id, Role::Admin).await?;
+    if let Some(project_id) = query.project_id {
+        let project = state.store.get_project(project_id).await?;
+        if project.org_id != org_id {
+            return Err(ApiError::Unauthorized("project scope violation".to_owned()));
+        }
+    }
+    Ok(Json(
+        state
+            .store
+            .list_api_keys(org_id, query.project_id)
+            .await?
+            .into_iter()
+            .map(|api_key| ApiKeyResponse::from_api_key(api_key, None))
+            .collect(),
+    ))
+}
+
+#[utoipa::path(post, path = "/api/v1/api-keys/{api_key_id}/revoke", params(("api_key_id" = String, Path), ApiKeyRevokeQuery), responses((status = 200, body = ApiKeyResponse)))]
+async fn revoke_api_key(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(api_key_id): Path<Id>,
+    Query(query): Query<ApiKeyRevokeQuery>,
+) -> ApiResult<ApiKeyResponse> {
+    let actor_id = require_actor(&headers, &state).await?;
+    let org_id = query.org_id;
+    require_org_role(&state, actor_id, org_id, Role::Admin).await?;
+    let api_key = state.store.revoke_api_key(org_id, api_key_id).await?;
+    record_audit(
+        &state,
+        AuditLog::new(
+            api_key.org_id,
+            api_key.project_id,
+            Some(actor_id),
+            "api_key.revoke",
+            format!("api_key:{}", api_key.id),
+            json!({ "name": api_key.name }),
+        ),
+    )
+    .await;
+    Ok(Json(ApiKeyResponse::from_api_key(api_key, None)))
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -563,6 +836,7 @@ async fn provision_device(
         ProvisioningMode::DevGeneratedKeypair,
         Some(dev_private_key_pem(device_id)),
         None,
+        None,
     )
     .await?;
     record_audit(
@@ -615,6 +889,7 @@ async fn provision_device_csr(
         ProvisioningMode::Csr,
         None,
         request.device_private_key_path,
+        Some(request.csr_pem),
     )
     .await?;
     let project = state.store.get_project(request.project_id).await?;
@@ -648,6 +923,7 @@ async fn provision_device_dev_auth(
         device_id,
         ProvisioningMode::DevGeneratedKeypair,
         Some(dev_private_key_pem(device_id)),
+        None,
         None,
     )
     .await?;
@@ -705,18 +981,20 @@ async fn issue_device_auth_config(
     provisioning_mode: ProvisioningMode,
     device_private_key: Option<String>,
     device_private_key_path: Option<String>,
+    csr_pem: Option<String>,
 ) -> Result<DeviceConfig, ApiError> {
     state.store.get_device(project_id, device_id).await?;
-    let fingerprint = fake_fingerprint();
-    state
-        .store
-        .create_device_certificate(DeviceCertificate::new(
-            project_id,
-            device_id,
-            fingerprint,
-            Utc::now() + Duration::days(365),
-        ))
-        .await?;
+    let certificate_id = Uuid::now_v7();
+    let device_certificate = device_certificate_pem(certificate_id, device_id, csr_pem.as_deref());
+    let fingerprint = certificate_fingerprint_sha256(&device_certificate)?;
+    let mut certificate = DeviceCertificate::new(
+        project_id,
+        device_id,
+        fingerprint,
+        Utc::now() + Duration::days(365),
+    );
+    certificate.id = certificate_id;
+    state.store.create_device_certificate(certificate).await?;
     Ok(DeviceConfig {
         broker: device_mqtt_broker(),
         port: device_mqtt_port(),
@@ -724,7 +1002,7 @@ async fn issue_device_auth_config(
         device_id,
         authentication: DeviceAgentAuthentication {
             ca_certificate: local_ca_pem(),
-            device_certificate: device_certificate_pem(device_id),
+            device_certificate,
             device_private_key,
             device_private_key_path,
         },
@@ -744,18 +1022,57 @@ fn device_mqtt_port() -> u16 {
         .unwrap_or(1883)
 }
 
-fn fake_fingerprint() -> String {
-    format!("{}{}", Uuid::now_v7().simple(), Uuid::now_v7().simple())
-}
-
 fn local_ca_pem() -> String {
-    "-----BEGIN CERTIFICATE-----\nEXCALIBUR-LOCAL-DEV-CA\n-----END CERTIFICATE-----".to_owned()
+    pem_block("CERTIFICATE", b"EXCALIBUR-LOCAL-DEV-CA")
 }
 
-fn device_certificate_pem(device_id: Id) -> String {
-    format!(
-        "-----BEGIN CERTIFICATE-----\nEXCALIBUR-DEVICE-CERT-{device_id}\n-----END CERTIFICATE-----"
-    )
+fn device_certificate_pem(certificate_id: Id, device_id: Id, csr_pem: Option<&str>) -> String {
+    let mut body = format!("EXCALIBUR-DEVICE-CERT-{device_id}-{certificate_id}").into_bytes();
+    if let Some(csr_pem) = csr_pem {
+        let csr_hash = auth::hash_secret(csr_pem);
+        body.extend_from_slice(b"-CSR-");
+        body.extend_from_slice(csr_hash.as_bytes());
+    }
+    pem_block("CERTIFICATE", &body)
+}
+
+fn pem_block(label: &str, der: &[u8]) -> String {
+    let encoded = BASE64.encode(der);
+    let mut wrapped = String::new();
+    for chunk in encoded.as_bytes().chunks(64) {
+        wrapped.push_str(std::str::from_utf8(chunk).expect("base64 is utf8"));
+        wrapped.push('\n');
+    }
+    format!("-----BEGIN {label}-----\n{wrapped}-----END {label}-----")
+}
+
+fn certificate_fingerprint_sha256(certificate_pem: &str) -> Result<String, ApiError> {
+    let der = pem_body_der(certificate_pem, "CERTIFICATE")?;
+    Ok(encode_hex(&Sha256::digest(der)))
+}
+
+fn pem_body_der(pem: &str, label: &str) -> Result<Vec<u8>, ApiError> {
+    let begin = format!("-----BEGIN {label}-----");
+    let end = format!("-----END {label}-----");
+    let body = pem
+        .lines()
+        .skip_while(|line| line.trim() != begin)
+        .skip(1)
+        .take_while(|line| line.trim() != end)
+        .map(str::trim)
+        .collect::<String>();
+    if body.is_empty() {
+        return Err(ApiError::BadRequest(format!(
+            "{label} PEM block is missing"
+        )));
+    }
+    BASE64
+        .decode(body)
+        .map_err(|_| ApiError::BadRequest(format!("{label} PEM block is not valid base64")))
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn dev_private_key_pem(device_id: Id) -> String {
@@ -1357,6 +1674,20 @@ mod tests {
     };
     use tower::ServiceExt;
 
+    async fn seed_session(state: &AppState, token: &str, user_id: Id) {
+        state
+            .store
+            .create_session(UserSession::new(
+                user_id,
+                auth::hash_secret(token),
+                auth::hash_secret(&format!("{token}-refresh")),
+                Utc::now() + Duration::hours(1),
+                Utc::now() + Duration::days(30),
+            ))
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn health_endpoint_works() {
         let response = app()
@@ -1450,6 +1781,267 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auth_refresh_rotates_tokens_and_logout_revokes_session() {
+        let state = AppState::default();
+        let register_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "email": "session-api@example.com",
+                            "password": "correct horse battery staple",
+                            "display_name": "Session API"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(register_response.status(), StatusCode::OK);
+        let body = to_bytes(register_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let auth: AuthResponse = serde_json::from_slice(&body).unwrap();
+
+        let refresh_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/refresh")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "refresh_token": auth.refresh_token }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refresh_response.status(), StatusCode::OK);
+        let body = to_bytes(refresh_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let refreshed: AuthResponse = serde_json::from_slice(&body).unwrap();
+        assert_ne!(refreshed.token, auth.token);
+        assert_ne!(refreshed.refresh_token, auth.refresh_token);
+
+        let old_token_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/orgs")
+                    .header("authorization", format!("Bearer {}", auth.token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(old_token_response.status(), StatusCode::UNAUTHORIZED);
+
+        let logout_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/logout")
+                    .header("authorization", format!("Bearer {}", refreshed.token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(logout_response.status(), StatusCode::OK);
+
+        let revoked_response = app_with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/orgs")
+                    .header("authorization", format!("Bearer {}", refreshed.token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoked_response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn refresh_token_reuse_revokes_rotated_session() {
+        let state = AppState::default();
+        let register_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "email": "reuse-api@example.com",
+                            "password": "correct horse battery staple",
+                            "display_name": "Reuse API"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(register_response.status(), StatusCode::OK);
+        let body = to_bytes(register_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let auth: AuthResponse = serde_json::from_slice(&body).unwrap();
+
+        let refresh_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/refresh")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "refresh_token": auth.refresh_token }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refresh_response.status(), StatusCode::OK);
+        let body = to_bytes(refresh_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let refreshed: AuthResponse = serde_json::from_slice(&body).unwrap();
+
+        let reuse_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/refresh")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "refresh_token": auth.refresh_token }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reuse_response.status(), StatusCode::UNAUTHORIZED);
+
+        let revoked_response = app_with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/orgs")
+                    .header("authorization", format!("Bearer {}", refreshed.token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoked_response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn api_key_management_returns_secret_once_and_audits() {
+        let state = AppState::default();
+        let user = state
+            .store
+            .create_user(User::new("api-key-api@example.com", "API Key API", "hash"))
+            .await
+            .unwrap();
+        let org = state
+            .store
+            .create_org(Org::new("API Key API Org", "api-key-api-org"), user.id)
+            .await
+            .unwrap();
+        let project = state
+            .store
+            .create_project(Project::new(org.id, "Factory", "factory"))
+            .await
+            .unwrap();
+        seed_session(&state, "owner-token", user.id).await;
+
+        let create_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/api-keys")
+                    .header("authorization", "Bearer owner-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "org_id": org.id,
+                            "project_id": project.id,
+                            "name": "ingest automation",
+                            "scopes": ["ingest:write"]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_response.status(), StatusCode::OK);
+        let body = to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let created: ApiKeyResponse = serde_json::from_slice(&body).unwrap();
+        assert!(
+            created
+                .key
+                .as_deref()
+                .is_some_and(|key| key.starts_with("excak_"))
+        );
+
+        let stored = state
+            .store
+            .get_active_api_key_by_hash(&auth::hash_secret(created.key.as_deref().unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(stored.id, created.id);
+
+        let list_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/api-keys?org_id={}", org.id))
+                    .header("authorization", "Bearer owner-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let body = to_bytes(list_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let listed: Vec<ApiKeyResponse> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].key.is_none());
+
+        let revoke_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/v1/api-keys/{}/revoke?org_id={}",
+                        created.id, org.id
+                    ))
+                    .header("authorization", "Bearer owner-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoke_response.status(), StatusCode::OK);
+        let audit = state
+            .store
+            .list_audit(org.id, Some(project.id))
+            .await
+            .unwrap();
+        assert!(audit.iter().any(|entry| entry.action == "api_key.create"));
+        assert!(audit.iter().any(|entry| entry.action == "api_key.revoke"));
+    }
+
+    #[tokio::test]
     async fn record_audit_is_best_effort() {
         let state = AppState::default();
         let user = state
@@ -1519,11 +2111,7 @@ mod tests {
             .create_project(Project::new(org.id, "Factory", "factory"))
             .await
             .unwrap();
-        state
-            .sessions
-            .write()
-            .await
-            .insert("outsider-token".to_owned(), outsider.id);
+        seed_session(&state, "outsider-token", outsider.id).await;
 
         let response = app_with_state(state)
             .oneshot(
@@ -1611,11 +2199,7 @@ mod tests {
             .unwrap();
         let topic =
             excalibur_device_protocol::telemetry_topic(project.id, device.id, "temperature");
-        state
-            .sessions
-            .write()
-            .await
-            .insert("owner-token".to_owned(), user.id);
+        seed_session(&state, "owner-token", user.id).await;
 
         let response = app_with_state(state)
             .oneshot(
@@ -1673,11 +2257,7 @@ mod tests {
             .create_device(Device::new(other_project.id, "lab-1", json!({})))
             .await
             .unwrap();
-        state
-            .sessions
-            .write()
-            .await
-            .insert("owner-token".to_owned(), user.id);
+        seed_session(&state, "owner-token", user.id).await;
 
         let response = app_with_state(state)
             .oneshot(
@@ -1726,11 +2306,7 @@ mod tests {
             .create_device(Device::new(project.id, "press-1", json!({})))
             .await
             .unwrap();
-        state
-            .sessions
-            .write()
-            .await
-            .insert("owner-token".to_owned(), user.id);
+        seed_session(&state, "owner-token", user.id).await;
 
         let response = app_with_state(state.clone())
             .oneshot(
@@ -1760,6 +2336,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(certificates.len(), 1);
+        assert_eq!(
+            certificates[0].fingerprint_sha256,
+            certificate_fingerprint_sha256(&auth.authentication.device_certificate).unwrap()
+        );
+        assert_eq!(
+            state
+                .store
+                .get_active_device_by_certificate_fingerprint(&certificates[0].fingerprint_sha256)
+                .await
+                .unwrap()
+                .id,
+            device.id
+        );
 
         let legacy_response = app_with_state(state.clone())
             .oneshot(
@@ -1788,6 +2377,91 @@ mod tests {
                 .filter(|entry| entry.action == "device.dev_auth_download")
                 .count()
                 >= 2
+        );
+    }
+
+    #[tokio::test]
+    async fn csr_provisioning_hashes_returned_certificate_and_rejects_invalid_csr() {
+        let state = AppState::default();
+        let user = state
+            .store
+            .create_user(User::new("csr-owner@example.com", "CSR Owner", "hash"))
+            .await
+            .unwrap();
+        let org = state
+            .store
+            .create_org(Org::new("CSR Org", "csr-org"), user.id)
+            .await
+            .unwrap();
+        let project = state
+            .store
+            .create_project(Project::new(org.id, "CSR Factory", "csr-factory"))
+            .await
+            .unwrap();
+        let device = state
+            .store
+            .create_device(Device::new(project.id, "csr-press", json!({})))
+            .await
+            .unwrap();
+        seed_session(&state, "csr-owner-token", user.id).await;
+
+        let invalid_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/devices/{}/provision/csr", device.id))
+                    .header("authorization", "Bearer csr-owner-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "project_id": project.id,
+                            "csr_pem": "not a csr"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid_response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/devices/{}/provision/csr", device.id))
+                    .header("authorization", "Bearer csr-owner-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "project_id": project.id,
+                            "csr_pem": "-----BEGIN CERTIFICATE REQUEST-----\nZXhjYWxpYnVyLWNzcg==\n-----END CERTIFICATE REQUEST-----",
+                            "device_private_key_path": "/etc/excalibur/device.key"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let config: DeviceConfig = serde_json::from_slice(&body).unwrap();
+        assert!(config.production);
+        assert_eq!(
+            config.authentication.device_private_key_path.as_deref(),
+            Some("/etc/excalibur/device.key")
+        );
+
+        let certificates = state
+            .store
+            .list_device_certificates(project.id, device.id)
+            .await
+            .unwrap();
+        assert_eq!(certificates.len(), 1);
+        assert_eq!(
+            certificates[0].fingerprint_sha256,
+            certificate_fingerprint_sha256(&config.authentication.device_certificate).unwrap()
         );
     }
 
@@ -1831,11 +2505,7 @@ mod tests {
             .unwrap()
             .pop()
             .unwrap();
-        state
-            .sessions
-            .write()
-            .await
-            .insert("owner-token".to_owned(), user.id);
+        seed_session(&state, "owner-token", user.id).await;
 
         let response = app_with_state(state)
             .oneshot(
@@ -1881,11 +2551,7 @@ mod tests {
             .create_device(Device::new(project.id, "press-1", json!({})))
             .await
             .unwrap();
-        state
-            .sessions
-            .write()
-            .await
-            .insert("owner-token".to_owned(), user.id);
+        seed_session(&state, "owner-token", user.id).await;
 
         let diagnostics_response = app_with_state(state.clone())
             .oneshot(
@@ -1960,11 +2626,7 @@ mod tests {
             .create_device(Device::new(project.id, "press-1", json!({})))
             .await
             .unwrap();
-        state
-            .sessions
-            .write()
-            .await
-            .insert("owner-token".to_owned(), user.id);
+        seed_session(&state, "owner-token", user.id).await;
 
         let stream_response = app_with_state(state.clone())
             .oneshot(
@@ -2170,11 +2832,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        state
-            .sessions
-            .write()
-            .await
-            .insert("owner-token".to_owned(), user.id);
+        seed_session(&state, "owner-token", user.id).await;
 
         let response = app_with_state(state)
             .oneshot(
@@ -2238,11 +2896,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        state
-            .sessions
-            .write()
-            .await
-            .insert("viewer-token".to_owned(), viewer.id);
+        seed_session(&state, "viewer-token", viewer.id).await;
 
         let read_response = app_with_state(state.clone())
             .oneshot(

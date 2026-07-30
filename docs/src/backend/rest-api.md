@@ -1,6 +1,6 @@
 # REST API
 
-REST API 前缀是 `/api/v1`。当前 API 使用 Bearer token 认证：
+REST API 前缀是 `/api/v1`。当前 API 使用 SQL-backed Bearer token session 认证：
 
 ```http
 Authorization: Bearer <token>
@@ -30,8 +30,10 @@ GET /api/v1/openapi.json
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `POST` | `/api/v1/auth/register` | 注册用户并返回 token。 |
-| `POST` | `/api/v1/auth/login` | 登录并返回 token。 |
+| `POST` | `/api/v1/auth/register` | 注册用户并返回 access token 与 refresh token。 |
+| `POST` | `/api/v1/auth/login` | 登录并返回 access token 与 refresh token。 |
+| `POST` | `/api/v1/auth/refresh` | 轮换 refresh token，并返回新的 access token 与 refresh token。 |
+| `POST` | `/api/v1/auth/logout` | 撤销当前 session。 |
 
 `RegisterRequest`：
 
@@ -40,6 +42,42 @@ GET /api/v1/openapi.json
   "email": "ops@example.com",
   "password": "correct horse battery staple",
   "display_name": "Ops"
+}
+```
+
+`AuthResponse`：
+
+```json
+{
+  "token": "excs_...",
+  "refresh_token": "excr_...",
+  "expires_at": "2026-07-30T12:00:00Z",
+  "refresh_expires_at": "2026-08-29T12:00:00Z",
+  "user_id": "018f4c5c-9b4d-7cc2-a62a-44590f671010"
+}
+```
+
+Refresh token 使用 rotation 语义：旧 refresh token 成功使用后会写入 reuse detection 表，再次使用会返回 unauthorized。Logout 会撤销当前 access token 对应的 session。
+
+## API Keys
+
+API key 用于后续自动化和服务端集成。当前管理接口仍要求用户 Bearer session，创建和撤销都会写 audit。
+
+| 方法 | 路径 | 最小角色 | 说明 |
+| --- | --- | --- | --- |
+| `GET` | `/api/v1/api-keys?org_id=...&project_id=...` | Admin | 列出 org 或 project scope 下的 API keys，不返回明文 key。 |
+| `POST` | `/api/v1/api-keys` | Admin | 创建 API key，明文 key 只在本次响应返回。 |
+| `POST` | `/api/v1/api-keys/{api_key_id}/revoke?org_id=...` | Admin | 撤销 API key。 |
+
+`CreateApiKeyRequest`：
+
+```json
+{
+  "org_id": "018f4c5c-9b4d-7cc2-a62a-44590f671000",
+  "project_id": "018f4c5c-9b4d-7cc2-a62a-44590f671001",
+  "name": "ci-ingest",
+  "scopes": ["telemetry:write"],
+  "expires_at": "2026-08-29T12:00:00Z"
 }
 ```
 

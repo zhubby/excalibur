@@ -18,13 +18,14 @@
 
 首页位于 `frontend/src/app/page.tsx`，当前加载 `ConsoleApp` client component，并调用 Axum REST API。Console 支持：
 
-- 注册/登录并保存本地 Bearer session。
+- 注册/登录并保存开发态本地 access/refresh session，access token 临近过期时调用 `/auth/refresh` 轮换。
+- 登出时调用 `/auth/logout` 撤销服务端 session。
 - 空库启动时自动创建默认 org/project/stream/alert/dashboard。
 - 设备创建、dev auth JSON 下载、shadow/telemetry HTTP ingest。
 - diagnostics/OTA action 创建和 action status 回写。
 - fleet metrics、telemetry trend、device table、agent panel、actions、alerts、protocol topic 和 audit log 展示。
 
-API base URL 默认来自 `NEXT_PUBLIC_API_BASE_URL`，未设置时使用 `http://localhost:8080`。当前 session 仍是开发态 localStorage Bearer token；生产前端应切到 HttpOnly cookie session。
+API base URL 默认来自 `NEXT_PUBLIC_API_BASE_URL`，未设置时使用 `http://localhost:8080`。当前 session 仍是开发态 localStorage access/refresh token；生产前端应切到 HttpOnly cookie session。
 
 ## 组件边界
 

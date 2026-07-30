@@ -46,6 +46,144 @@ describe("Excalibur API client", () => {
     } satisfies Partial<ExcaliburApiError>);
   });
 
+  it("preserves auth refresh token response contracts", async () => {
+    const auth = {
+      token: "xclb_access_token",
+      refresh_token: "xclb_refresh_token",
+      expires_at: "2026-07-30T12:00:00Z",
+      refresh_expires_at: "2026-08-29T12:00:00Z",
+      user_id: "user-1",
+    };
+    const fetcher = vi.fn(async () => new Response(JSON.stringify(auth)));
+    const api = createExcaliburApi({ baseUrl: "http://api.example", fetcher });
+
+    await expect(
+      api.register({
+        email: "ops@example.com",
+        password: "correct horse battery staple",
+        display_name: "Ops",
+      }),
+    ).resolves.toEqual(auth);
+    await expect(api.login({ email: "ops@example.com", password: "correct horse battery staple" })).resolves.toEqual(
+      auth,
+    );
+    await expect(api.refreshSession({ refresh_token: auth.refresh_token })).resolves.toEqual(auth);
+
+    const calls = (fetcher.mock.calls as unknown as [string, RequestInit][]).map(([url, init]) => ({
+      url: String(url),
+      method: init?.method ?? "GET",
+      body: init?.body,
+    }));
+    expect(calls).toMatchObject([
+      {
+        url: "http://api.example/api/v1/auth/register",
+        method: "POST",
+        body: JSON.stringify({
+          email: "ops@example.com",
+          password: "correct horse battery staple",
+          display_name: "Ops",
+        }),
+      },
+      {
+        url: "http://api.example/api/v1/auth/login",
+        method: "POST",
+        body: JSON.stringify({
+          email: "ops@example.com",
+          password: "correct horse battery staple",
+        }),
+      },
+      {
+        url: "http://api.example/api/v1/auth/refresh",
+        method: "POST",
+        body: JSON.stringify({ refresh_token: "xclb_refresh_token" }),
+      },
+    ]);
+  });
+
+  it("covers logout and API key endpoint contracts", async () => {
+    const apiKeyBase = {
+      id: "api-key-1",
+      org_id: "org-1",
+      project_id: "project-1",
+      name: "worker ingest",
+      scopes: ["telemetry:write"],
+      expires_at: "2026-08-30T12:00:00Z",
+      revoked_at: null,
+      last_used_at: null,
+      created_by: "user-1",
+      created_at: "2026-07-30T12:00:00Z",
+    };
+    const createdApiKey = {
+      ...apiKeyBase,
+      key: "xclb_api_secret",
+    };
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ status: "logged_out" })))
+      .mockResolvedValueOnce(new Response(JSON.stringify([apiKeyBase])))
+      .mockResolvedValueOnce(new Response(JSON.stringify(createdApiKey)))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ ...apiKeyBase, revoked_at: "2026-07-30T12:30:00Z" })),
+      );
+    const api = createExcaliburApi({
+      baseUrl: "http://api.example",
+      token: "session-token",
+      fetcher,
+    });
+
+    await expect(api.logout()).resolves.toEqual({ status: "logged_out" });
+    await expect(api.listApiKeys("org-1", "project-1")).resolves.toEqual([apiKeyBase]);
+    await expect(
+      api.createApiKey({
+        org_id: "org-1",
+        project_id: "project-1",
+        name: "worker ingest",
+        scopes: ["telemetry:write"],
+        expires_at: "2026-08-30T12:00:00Z",
+      }),
+    ).resolves.toEqual(createdApiKey);
+    await expect(api.revokeApiKey("api-key-1", "org-1")).resolves.toMatchObject({
+      id: "api-key-1",
+      revoked_at: "2026-07-30T12:30:00Z",
+    });
+
+    const calls = (fetcher.mock.calls as unknown as [string, RequestInit][]).map(([url, init]) => ({
+      url: String(url),
+      method: init?.method ?? "GET",
+      body: init?.body,
+      authorization: new Headers(init.headers).get("authorization"),
+    }));
+    expect(calls).toMatchObject([
+      {
+        url: "http://api.example/api/v1/auth/logout",
+        method: "POST",
+        authorization: "Bearer session-token",
+      },
+      {
+        url: "http://api.example/api/v1/api-keys?org_id=org-1&project_id=project-1",
+        method: "GET",
+        authorization: "Bearer session-token",
+      },
+      {
+        url: "http://api.example/api/v1/api-keys",
+        method: "POST",
+        body: JSON.stringify({
+          org_id: "org-1",
+          project_id: "project-1",
+          name: "worker ingest",
+          scopes: ["telemetry:write"],
+          expires_at: "2026-08-30T12:00:00Z",
+        }),
+        authorization: "Bearer session-token",
+      },
+      {
+        url: "http://api.example/api/v1/api-keys/api-key-1/revoke?org_id=org-1",
+        method: "POST",
+        authorization: "Bearer session-token",
+      },
+    ]);
+  });
+
   it("preserves HTTP status for non-JSON API errors", async () => {
     const fetcher = vi.fn(
       async () =>

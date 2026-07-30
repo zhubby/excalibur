@@ -8,8 +8,10 @@ Excalibur 使用一个 TimescaleDB 集群承载控制面 PostgreSQL 表和遥测
 
 - `backend/migrations/001_initial.sql`
 - `backend/migrations/002_sql_repository_upgrade.sql`
+- `backend/migrations/003_auth_control_plane.sql`
 - `infra/helm/excalibur/migrations/001_initial.sql`
 - `infra/helm/excalibur/migrations/002_sql_repository_upgrade.sql`
+- `infra/helm/excalibur/migrations/003_auth_control_plane.sql`
 
 它包含：
 
@@ -17,8 +19,10 @@ Excalibur 使用一个 TimescaleDB 集群承载控制面 PostgreSQL 表和遥测
 - `pgcrypto` extension。
 - enum 类型：`member_role`、`device_status`、`certificate_status`、`action_state`、`alert_kind`。
 - 控制面表：`users`、`orgs`、`memberships`、`projects`、`devices`、`device_certificates`、`stream_definitions`、`actions`、`action_targets`、`firmware_artifacts`、`dashboards`、`alert_rules`、`audit_logs`。
+- Auth 控制面表：`user_sessions`、`used_refresh_tokens`、`api_keys`。
 - 遥测表：`telemetry_points` hypertable。
 - 遥测去重表：`telemetry_sequence_dedup`，按 `(project_id, device_id, stream, sequence)` 保证重放幂等。
+- Helm migration runner 元数据表：`schema_migrations`、`schema_migration_events`。
 
 ## 控制面表
 
@@ -37,7 +41,12 @@ orgs
     firmware_artifacts
     dashboards
     alert_rules
+    api_keys
   audit_logs
+  api_keys
+users
+  user_sessions
+    used_refresh_tokens
 ```
 
 关键约束：
@@ -47,9 +56,29 @@ orgs
 - `projects` 额外使用 `UNIQUE (org_id, id)`，为 audit log 的 org/project 复合外键提供租户约束。
 - `devices` 使用 `UNIQUE (project_id, id)`，为复合外键提供租户约束。
 - `device_certificates` 通过 `(project_id, device_id)` 引用 devices，避免跨项目证书绑定。
+- `user_sessions` 保存 access token hash、refresh token hash、过期时间、撤销时间和 last-used 时间；`used_refresh_tokens` 保存已轮换 refresh token hash，用于复用检测。
+- `api_keys` 保存 key hash、org/project scope、scopes、过期时间、撤销时间和 last-used 时间；明文 key 只在创建响应返回一次。
 - `actions` 使用 `UNIQUE (project_id, id)`，`action_targets` 通过 `(project_id, action_id)` 和 `(project_id, device_id)` 绑定作用域。
 - `audit_logs` 通过 `(org_id, project_id)` 引用 projects，避免 audit entry 绑定到错误 org。
 - `audit_logs_scope_idx` 和 `audit_logs_org_created_idx` 支持 project-scoped 和 org-scoped 最新日志查询。
+
+## Helm migration runner
+
+Helm chart 的 pre-install/pre-upgrade migration Job 会：
+
+- 初始化 `schema_migrations` 和 `schema_migration_events`。
+- 对每个 migration 使用 `pg_advisory_lock(hashtext('excalibur_schema_migrations'))` 串行化执行，避免多个 Helm release/upgrade 同时写 schema。
+- 执行前写入 `applying` 事件，成功后在同一事务内写入 `schema_migrations` 并更新为 `applied`，失败时写入 `failed` 和恢复提示。
+- 保留旧集群兼容：如果已存在完整的 001 核心表但没有 migration 记录，会自动把 `001_initial.sql` 标记为已应用；如果只存在部分旧表，Job 会失败并提示缺失对象，避免把半初始化 schema 误标为已迁移。
+- `002_sql_repository_upgrade.sql` 会在加 case-insensitive email unique index 和 audit org/project 外键前检查冲突数据，失败时输出需要清理的样例。
+- `002_sql_repository_upgrade.sql` 仍包含 telemetry index 调整和 dedupe 回填；已有大量 telemetry 的生产库应在维护窗口执行，或先拆成后续 online DDL/分块 backfill 方案。
+- 通过 `migrations.activeDeadlineSeconds` 限制 Job 最长运行时间，避免锁等待无限挂住 release。
+
+失败恢复：
+
+1. 查看 Job 日志和 `schema_migration_events` 最新 `failed` 记录。
+2. 修复数据库状态或 migration SQL。
+3. 重新执行 Helm upgrade；已写入 `schema_migrations` 的版本会跳过，失败版本会重新尝试。
 
 ## Telemetry hypertable
 
@@ -133,6 +162,7 @@ API 通过统一 `Store` enum 调用 repository 方法，`STORAGE_BACKEND=timesc
 
 - users、orgs、memberships、projects。
 - devices、device_certificates、shadow/online heartbeat。
+- user_sessions、used_refresh_tokens、api_keys。
 - stream definitions。
 - telemetry_points 写入和查询。
 - actions 与 action_targets；父 action 状态和进度从所有 target 聚合，避免单个设备完成时把批量 action 误标为完成。
@@ -157,7 +187,7 @@ EXCALIBUR_SQL_TEST_DATABASE_URL=postgres://excalibur:excalibur@localhost:5432/ex
   cargo test -p excalibur-storage pg_store_contract_runs_when_database_url_is_set -- --nocapture
 ```
 
-未设置 `EXCALIBUR_SQL_TEST_DATABASE_URL` 时，本地测试会跳过 live SQL contract。设置该变量后，storage contract 会覆盖 SQL schema validation、tenant scope、telemetry sequence 去重和多 target action 聚合；mqtt-ingest 也有同变量门控的 SQL-backed ingest contract。CI workflow 会启动 TimescaleDB 并设置该变量，因此 SQL contract 在 CI 中强制执行。
+未设置 `EXCALIBUR_SQL_TEST_DATABASE_URL` 时，本地测试会跳过 live SQL contract。设置该变量后，storage contract 会覆盖 SQL schema validation、tenant scope、session rotation/reuse detection、API key scope/revoke、active certificate fingerprint lookup、telemetry sequence 去重和多 target action 聚合；mqtt-ingest 也有同变量门控的 SQL-backed ingest contract。CI workflow 会启动 TimescaleDB 并设置该变量，因此 SQL contract 在 CI 中强制执行。
 
 ## 生产 repository 要求
 

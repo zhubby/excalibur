@@ -64,6 +64,86 @@ impl User {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UserSession {
+    pub id: Id,
+    pub user_id: Id,
+    pub token_hash: String,
+    pub refresh_token_hash: String,
+    pub expires_at: DateTime<Utc>,
+    pub refresh_expires_at: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl UserSession {
+    pub fn new(
+        user_id: Id,
+        token_hash: impl Into<String>,
+        refresh_token_hash: impl Into<String>,
+        expires_at: DateTime<Utc>,
+        refresh_expires_at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            id: Uuid::now_v7(),
+            user_id,
+            token_hash: token_hash.into(),
+            refresh_token_hash: refresh_token_hash.into(),
+            expires_at,
+            refresh_expires_at,
+            revoked_at: None,
+            last_used_at: None,
+            created_at: Utc::now(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApiKey {
+    pub id: Id,
+    pub org_id: Id,
+    pub project_id: Option<Id>,
+    pub name: String,
+    pub key_hash: String,
+    pub scopes: Vec<String>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub created_by: Option<Id>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl ApiKey {
+    pub fn new(
+        org_id: Id,
+        project_id: Option<Id>,
+        name: impl Into<String>,
+        key_hash: impl Into<String>,
+        scopes: Vec<String>,
+        expires_at: Option<DateTime<Utc>>,
+        created_by: Option<Id>,
+    ) -> Self {
+        Self {
+            id: Uuid::now_v7(),
+            org_id,
+            project_id,
+            name: name.into(),
+            key_hash: key_hash.into(),
+            scopes,
+            expires_at,
+            revoked_at: None,
+            last_used_at: None,
+            created_by,
+            created_at: Utc::now(),
+        }
+    }
+
+    pub fn has_scope(&self, required: &str) -> bool {
+        self.scopes.iter().any(|scope| scope == required)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Org {
     pub id: Id,
     pub name: String,

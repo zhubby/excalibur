@@ -1,6 +1,7 @@
 use excalibur_domain::{
-    Action, ActionStatusUpdate, AlertRule, AuditLog, Dashboard, Device, DeviceCertificate,
+    Action, ActionStatusUpdate, AlertRule, ApiKey, AuditLog, Dashboard, Device, DeviceCertificate,
     FirmwareArtifact, Id, Membership, Org, Project, Role, StreamDefinition, TelemetryPoint, User,
+    UserSession,
 };
 use serde_json::Value;
 
@@ -45,6 +46,96 @@ impl Store {
         match self {
             Store::Memory(store) => store.get_user_by_email(email).await,
             Store::Postgres(store) => store.get_user_by_email(email).await,
+        }
+    }
+
+    pub async fn create_session(&self, session: UserSession) -> StoreResult<UserSession> {
+        match self {
+            Store::Memory(store) => store.create_session(session).await,
+            Store::Postgres(store) => store.create_session(session).await,
+        }
+    }
+
+    pub async fn get_active_session_by_token_hash(
+        &self,
+        token_hash: &str,
+    ) -> StoreResult<UserSession> {
+        match self {
+            Store::Memory(store) => store.get_active_session_by_token_hash(token_hash).await,
+            Store::Postgres(store) => store.get_active_session_by_token_hash(token_hash).await,
+        }
+    }
+
+    pub async fn rotate_session_refresh_token(
+        &self,
+        refresh_token_hash: &str,
+        next_token_hash: String,
+        next_refresh_token_hash: String,
+        next_expires_at: chrono::DateTime<chrono::Utc>,
+        next_refresh_expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<UserSession> {
+        match self {
+            Store::Memory(store) => {
+                store
+                    .rotate_session_refresh_token(
+                        refresh_token_hash,
+                        next_token_hash,
+                        next_refresh_token_hash,
+                        next_expires_at,
+                        next_refresh_expires_at,
+                    )
+                    .await
+            }
+            Store::Postgres(store) => {
+                store
+                    .rotate_session_refresh_token(
+                        refresh_token_hash,
+                        next_token_hash,
+                        next_refresh_token_hash,
+                        next_expires_at,
+                        next_refresh_expires_at,
+                    )
+                    .await
+            }
+        }
+    }
+
+    pub async fn revoke_session_by_token_hash(&self, token_hash: &str) -> StoreResult<()> {
+        match self {
+            Store::Memory(store) => store.revoke_session_by_token_hash(token_hash).await,
+            Store::Postgres(store) => store.revoke_session_by_token_hash(token_hash).await,
+        }
+    }
+
+    pub async fn create_api_key(&self, api_key: ApiKey) -> StoreResult<ApiKey> {
+        match self {
+            Store::Memory(store) => store.create_api_key(api_key).await,
+            Store::Postgres(store) => store.create_api_key(api_key).await,
+        }
+    }
+
+    pub async fn get_active_api_key_by_hash(&self, key_hash: &str) -> StoreResult<ApiKey> {
+        match self {
+            Store::Memory(store) => store.get_active_api_key_by_hash(key_hash).await,
+            Store::Postgres(store) => store.get_active_api_key_by_hash(key_hash).await,
+        }
+    }
+
+    pub async fn list_api_keys(
+        &self,
+        org_id: Id,
+        project_id: Option<Id>,
+    ) -> StoreResult<Vec<ApiKey>> {
+        match self {
+            Store::Memory(store) => Ok(store.list_api_keys(org_id, project_id).await),
+            Store::Postgres(store) => store.list_api_keys(org_id, project_id).await,
+        }
+    }
+
+    pub async fn revoke_api_key(&self, org_id: Id, api_key_id: Id) -> StoreResult<ApiKey> {
+        match self {
+            Store::Memory(store) => store.revoke_api_key(org_id, api_key_id).await,
+            Store::Postgres(store) => store.revoke_api_key(org_id, api_key_id).await,
         }
     }
 
@@ -143,6 +234,24 @@ impl Store {
         match self {
             Store::Memory(store) => store.list_device_certificates(project_id, device_id).await,
             Store::Postgres(store) => store.list_device_certificates(project_id, device_id).await,
+        }
+    }
+
+    pub async fn get_active_device_by_certificate_fingerprint(
+        &self,
+        fingerprint_sha256: &str,
+    ) -> StoreResult<Device> {
+        match self {
+            Store::Memory(store) => {
+                store
+                    .get_active_device_by_certificate_fingerprint(fingerprint_sha256)
+                    .await
+            }
+            Store::Postgres(store) => {
+                store
+                    .get_active_device_by_certificate_fingerprint(fingerprint_sha256)
+                    .await
+            }
         }
     }
 
