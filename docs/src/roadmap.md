@@ -4,13 +4,12 @@
 
 ## Milestone 1: 持久控制面
 
-状态：SQL repository 已实现；session/refresh token/API key 已迁到 SQL-backed store；Helm migration runner 已补 advisory lock、applied/failed audit 和失败恢复说明。
+状态：SQL repository 已实现；session/refresh token/API key 已迁到 SQL-backed store；Helm migration runner 已补 advisory lock、applied/failed audit 和失败恢复说明；API key scope enforcement 和 Console HttpOnly cookie session 已接入。
 
 剩余目标：
 
 - 保持所有 tenant scope 测试。
-- 将 Console session 从 local token 过渡到 HttpOnly cookie。
-- 将 API key scope enforcement 接入自动化/ingest 入口。
+- 扩展 API key scope 到后续 worker/MQTT ingest 服务间调用。
 
 验收：
 

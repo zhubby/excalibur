@@ -5,7 +5,10 @@ use std::convert::Infallible;
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
+    http::{
+        HeaderMap, HeaderName, HeaderValue, Method, StatusCode,
+        header::{AUTHORIZATION, CONTENT_TYPE, COOKIE, SET_COOKIE},
+    },
     response::{
         IntoResponse, Response,
         sse::{Event, Sse},
@@ -29,7 +32,10 @@ use futures_util::stream;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::{
+    cors::{AllowOrigin, CorsLayer},
+    trace::TraceLayer,
+};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
@@ -38,6 +44,13 @@ const REFRESH_TOKEN_PREFIX: &str = "excr_";
 const API_KEY_PREFIX: &str = "excak_";
 const ACCESS_TOKEN_TTL_HOURS: i64 = 1;
 const REFRESH_TOKEN_TTL_DAYS: i64 = 30;
+const ACCESS_COOKIE_NAME: &str = "excalibur_access";
+const REFRESH_COOKIE_NAME: &str = "excalibur_refresh";
+const API_KEY_HEADER: &str = "x-api-key";
+const DEFAULT_CORS_ALLOWED_ORIGINS: &str =
+    "http://localhost:3000,http://127.0.0.1:3000,http://localhost:9001,http://127.0.0.1:9001";
+const COOKIE_ACCESS_MAX_AGE_SECONDS: i64 = ACCESS_TOKEN_TTL_HOURS * 60 * 60;
+const COOKIE_REFRESH_MAX_AGE_SECONDS: i64 = REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60;
 
 #[derive(Debug, Clone)]
 pub struct AppState {
@@ -111,8 +124,31 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/api/v1/alerts", get(list_alerts).post(create_alert))
         .route("/api/v1/audit", get(list_audit))
         .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive())
+        .layer(cors_layer())
         .with_state(state)
+}
+
+fn cors_layer() -> CorsLayer {
+    let allowed_origins = std::env::var("CORS_ALLOWED_ORIGINS")
+        .unwrap_or_else(|_| DEFAULT_CORS_ALLOWED_ORIGINS.to_owned())
+        .split(',')
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::predicate(move |origin, _| {
+            origin
+                .to_str()
+                .is_ok_and(|origin| allowed_origins.iter().any(|allowed| allowed == origin))
+        }))
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([
+            AUTHORIZATION,
+            CONTENT_TYPE,
+            HeaderName::from_static(API_KEY_HEADER),
+        ])
+        .allow_credentials(true)
 }
 
 #[derive(OpenApi)]
@@ -253,15 +289,50 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
     Json(ApiDoc::openapi())
 }
 
-async fn require_actor(headers: &HeaderMap, state: &AppState) -> Result<Id, ApiError> {
-    let token = headers
-        .get(AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .ok_or_else(|| ApiError::Unauthorized("missing bearer token".to_owned()))?;
+#[derive(Debug, Clone)]
+enum AuthenticatedActor {
+    User { user_id: Id },
+    ApiKey { api_key: ApiKey },
+}
+
+impl AuthenticatedActor {
+    fn audit_actor_id(&self) -> Option<Id> {
+        match self {
+            AuthenticatedActor::User { user_id } => Some(*user_id),
+            AuthenticatedActor::ApiKey { .. } => None,
+        }
+    }
+}
+
+async fn require_actor(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Result<AuthenticatedActor, ApiError> {
+    if let Some(token) = api_key_token_from_headers(headers) {
+        return state
+            .store
+            .get_active_api_key_by_hash(&auth::hash_secret(&token))
+            .await
+            .map(|api_key| AuthenticatedActor::ApiKey { api_key })
+            .map_err(|error| match error {
+                StoreError::NotFound("api key") => {
+                    ApiError::Unauthorized("invalid api key".to_owned())
+                }
+                error => ApiError::from(error),
+            });
+    }
+
+    require_user_actor(headers, state)
+        .await
+        .map(|user_id| AuthenticatedActor::User { user_id })
+}
+
+async fn require_user_actor(headers: &HeaderMap, state: &AppState) -> Result<Id, ApiError> {
+    let token = session_token_from_headers(headers)
+        .ok_or_else(|| ApiError::Unauthorized("missing session".to_owned()))?;
     state
         .store
-        .get_active_session_by_token_hash(&auth::hash_secret(token))
+        .get_active_session_by_token_hash(&auth::hash_secret(&token))
         .await
         .map(|session| session.user_id)
         .map_err(|error| match error {
@@ -270,45 +341,141 @@ async fn require_actor(headers: &HeaderMap, state: &AppState) -> Result<Id, ApiE
         })
 }
 
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::to_owned)
+}
+
+fn api_key_token_from_headers(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(API_KEY_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .or_else(|| bearer_token(headers).filter(|token| token.starts_with(API_KEY_PREFIX)))
+}
+
+fn session_token_from_headers(headers: &HeaderMap) -> Option<String> {
+    bearer_token(headers)
+        .filter(|token| !token.starts_with(API_KEY_PREFIX))
+        .or_else(|| cookie_value(headers, ACCESS_COOKIE_NAME))
+}
+
+fn refresh_token_from_headers(headers: &HeaderMap) -> Option<String> {
+    cookie_value(headers, REFRESH_COOKIE_NAME)
+}
+
+fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|cookies| {
+            cookies.split(';').find_map(|cookie| {
+                let (cookie_name, cookie_value) = cookie.trim().split_once('=')?;
+                (cookie_name == name).then(|| cookie_value.to_owned())
+            })
+        })
+}
+
 async fn require_org_role(
     state: &AppState,
-    actor_id: Id,
+    actor: &AuthenticatedActor,
     org_id: Id,
     minimum: Role,
+    required_scope: &str,
 ) -> Result<Role, ApiError> {
-    let role = state
-        .store
-        .user_role(org_id, actor_id)
-        .await?
-        .ok_or_else(|| ApiError::Unauthorized("org access denied".to_owned()))?;
-    if role.permits(minimum) {
-        Ok(role)
-    } else {
-        Err(ApiError::Unauthorized("insufficient role".to_owned()))
+    match actor {
+        AuthenticatedActor::User { user_id } => {
+            let role = state
+                .store
+                .user_role(org_id, *user_id)
+                .await?
+                .ok_or_else(|| ApiError::Unauthorized("org access denied".to_owned()))?;
+            if role.permits(minimum) {
+                Ok(role)
+            } else {
+                Err(ApiError::Unauthorized("insufficient role".to_owned()))
+            }
+        }
+        AuthenticatedActor::ApiKey { api_key } => {
+            if api_key.org_id != org_id {
+                return Err(ApiError::Unauthorized("tenant scope violation".to_owned()));
+            }
+            if api_key.project_id.is_some() {
+                return Err(ApiError::Unauthorized(
+                    "org-scoped api key required".to_owned(),
+                ));
+            }
+            require_api_key_scope(api_key, required_scope)?;
+            Ok(minimum)
+        }
     }
 }
 
-async fn require_org_access(state: &AppState, actor_id: Id, org_id: Id) -> Result<Role, ApiError> {
-    require_org_role(state, actor_id, org_id, Role::Viewer).await
+async fn require_org_access(
+    state: &AppState,
+    actor: &AuthenticatedActor,
+    org_id: Id,
+    required_scope: &str,
+) -> Result<Role, ApiError> {
+    require_org_role(state, actor, org_id, Role::Viewer, required_scope).await
 }
 
 async fn require_project_role(
     state: &AppState,
-    actor_id: Id,
+    actor: &AuthenticatedActor,
     project_id: Id,
     minimum: Role,
+    required_scope: &str,
 ) -> Result<Project, ApiError> {
     let project = state.store.get_project(project_id).await?;
-    require_org_role(state, actor_id, project.org_id, minimum).await?;
+    match actor {
+        AuthenticatedActor::User { .. } => {
+            require_org_role(state, actor, project.org_id, minimum, required_scope).await?;
+        }
+        AuthenticatedActor::ApiKey { api_key } => {
+            if api_key.org_id != project.org_id {
+                return Err(ApiError::Unauthorized("tenant scope violation".to_owned()));
+            }
+            if api_key.project_id.is_some_and(|id| id != project_id) {
+                return Err(ApiError::Unauthorized("project scope violation".to_owned()));
+            }
+            require_api_key_scope(api_key, required_scope)?;
+        }
+    }
     Ok(project)
 }
 
 async fn require_project_access(
     state: &AppState,
-    actor_id: Id,
+    actor: &AuthenticatedActor,
     project_id: Id,
+    required_scope: &str,
 ) -> Result<Project, ApiError> {
-    require_project_role(state, actor_id, project_id, Role::Viewer).await
+    require_project_role(state, actor, project_id, Role::Viewer, required_scope).await
+}
+
+fn require_api_key_scope(api_key: &ApiKey, required_scope: &str) -> Result<(), ApiError> {
+    if api_key_has_scope(api_key, required_scope) {
+        Ok(())
+    } else {
+        Err(ApiError::Unauthorized(
+            "insufficient api key scope".to_owned(),
+        ))
+    }
+}
+
+fn api_key_has_scope(api_key: &ApiKey, required_scope: &str) -> bool {
+    api_key.scopes.iter().any(|scope| {
+        scope == "*"
+            || scope == required_scope
+            || scope
+                .strip_suffix(":*")
+                .is_some_and(|prefix| required_scope.starts_with(&format!("{prefix}:")))
+    })
 }
 
 async fn record_audit(state: &AppState, audit: AuditLog) {
@@ -323,7 +490,7 @@ async fn events(
     headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
-    require_actor(&headers, &state).await?;
+    require_user_actor(&headers, &state).await?;
     let events = stream::iter([
         Ok(Event::default()
             .event("device.online")
@@ -350,7 +517,7 @@ pub struct LoginRequest {
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct RefreshRequest {
-    pub refresh_token: String,
+    pub refresh_token: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -392,11 +559,52 @@ async fn issue_auth_response(state: &AppState, user_id: Id) -> Result<AuthRespon
     })
 }
 
+fn auth_cookie_headers(auth: &AuthResponse) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    append_cookie(
+        &mut headers,
+        ACCESS_COOKIE_NAME,
+        &auth.token,
+        COOKIE_ACCESS_MAX_AGE_SECONDS,
+    );
+    append_cookie(
+        &mut headers,
+        REFRESH_COOKIE_NAME,
+        &auth.refresh_token,
+        COOKIE_REFRESH_MAX_AGE_SECONDS,
+    );
+    headers
+}
+
+fn clear_auth_cookie_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    append_cookie(&mut headers, ACCESS_COOKIE_NAME, "", 0);
+    append_cookie(&mut headers, REFRESH_COOKIE_NAME, "", 0);
+    headers
+}
+
+fn append_cookie(headers: &mut HeaderMap, name: &str, value: &str, max_age_seconds: i64) {
+    let secure = if cookie_secure() { "; Secure" } else { "" };
+    let cookie = format!(
+        "{name}={value}; Max-Age={max_age_seconds}; Path=/; HttpOnly; SameSite=Lax{secure}"
+    );
+    headers.append(
+        SET_COOKIE,
+        HeaderValue::from_str(&cookie).expect("auth cookie value is valid"),
+    );
+}
+
+fn cookie_secure() -> bool {
+    std::env::var("SESSION_COOKIE_SECURE")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
 #[utoipa::path(post, path = "/api/v1/auth/register", request_body = RegisterRequest, responses((status = 200, body = AuthResponse)))]
 async fn register(
     State(state): State<AppState>,
     Json(request): Json<RegisterRequest>,
-) -> ApiResult<AuthResponse> {
+) -> Result<(HeaderMap, Json<AuthResponse>), ApiError> {
     if request.password.len() < 12 {
         return Err(ApiError::BadRequest(
             "password must be at least 12 characters".to_owned(),
@@ -413,14 +621,15 @@ async fn register(
             password_hash,
         ))
         .await?;
-    Ok(Json(issue_auth_response(&state, user.id).await?))
+    let auth = issue_auth_response(&state, user.id).await?;
+    Ok((auth_cookie_headers(&auth), Json(auth)))
 }
 
 #[utoipa::path(post, path = "/api/v1/auth/login", request_body = LoginRequest, responses((status = 200, body = AuthResponse)))]
 async fn login(
     State(state): State<AppState>,
     Json(request): Json<LoginRequest>,
-) -> ApiResult<AuthResponse> {
+) -> Result<(HeaderMap, Json<AuthResponse>), ApiError> {
     let user = match state.store.get_user_by_email(&request.email).await {
         Ok(user) => Some(user),
         Err(StoreError::NotFound("user")) => None,
@@ -435,14 +644,20 @@ async fn login(
     let Some(user) = user.filter(|_| verified) else {
         return Err(ApiError::Unauthorized("invalid credentials".to_owned()));
     };
-    Ok(Json(issue_auth_response(&state, user.id).await?))
+    let auth = issue_auth_response(&state, user.id).await?;
+    Ok((auth_cookie_headers(&auth), Json(auth)))
 }
 
 #[utoipa::path(post, path = "/api/v1/auth/refresh", request_body = RefreshRequest, responses((status = 200, body = AuthResponse)))]
 async fn refresh_session(
+    headers: HeaderMap,
     State(state): State<AppState>,
-    Json(request): Json<RefreshRequest>,
-) -> ApiResult<AuthResponse> {
+    request: Option<Json<RefreshRequest>>,
+) -> Result<(HeaderMap, Json<AuthResponse>), ApiError> {
+    let current_refresh_token = request
+        .and_then(|Json(request)| request.refresh_token)
+        .or_else(|| refresh_token_from_headers(&headers))
+        .ok_or_else(|| ApiError::Unauthorized("missing refresh token".to_owned()))?;
     let token = auth::generate_secret(ACCESS_TOKEN_PREFIX);
     let refresh_token = auth::generate_secret(REFRESH_TOKEN_PREFIX);
     let expires_at = Utc::now() + Duration::hours(ACCESS_TOKEN_TTL_HOURS);
@@ -450,7 +665,7 @@ async fn refresh_session(
     let session = state
         .store
         .rotate_session_refresh_token(
-            &auth::hash_secret(&request.refresh_token),
+            &auth::hash_secret(&current_refresh_token),
             auth::hash_secret(&token),
             auth::hash_secret(&refresh_token),
             expires_at,
@@ -466,33 +681,37 @@ async fn refresh_session(
             }
             error => ApiError::from(error),
         })?;
-    Ok(Json(AuthResponse {
+    let auth = AuthResponse {
         token,
         refresh_token,
         expires_at,
         refresh_expires_at,
         user_id: session.user_id,
-    }))
+    };
+    Ok((auth_cookie_headers(&auth), Json(auth)))
 }
 
 #[utoipa::path(post, path = "/api/v1/auth/logout", responses((status = 200, body = LogoutResponse)))]
-async fn logout(headers: HeaderMap, State(state): State<AppState>) -> ApiResult<LogoutResponse> {
-    let token = headers
-        .get(AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .ok_or_else(|| ApiError::Unauthorized("missing bearer token".to_owned()))?;
+async fn logout(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<(HeaderMap, Json<LogoutResponse>), ApiError> {
+    let token = session_token_from_headers(&headers)
+        .ok_or_else(|| ApiError::Unauthorized("missing session".to_owned()))?;
     state
         .store
-        .revoke_session_by_token_hash(&auth::hash_secret(token))
+        .revoke_session_by_token_hash(&auth::hash_secret(&token))
         .await
         .map_err(|error| match error {
             StoreError::NotFound("session") => ApiError::Unauthorized("invalid session".to_owned()),
             error => ApiError::from(error),
         })?;
-    Ok(Json(LogoutResponse {
-        status: "logged_out".to_owned(),
-    }))
+    Ok((
+        clear_auth_cookie_headers(),
+        Json(LogoutResponse {
+            status: "logged_out".to_owned(),
+        }),
+    ))
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -564,12 +783,14 @@ async fn create_api_key(
     State(state): State<AppState>,
     Json(request): Json<CreateApiKeyRequest>,
 ) -> ApiResult<ApiKeyResponse> {
-    let actor_id = require_actor(&headers, &state).await?;
+    let actor_id = require_user_actor(&headers, &state).await?;
     let org_id = request.org_id;
     let project = if let Some(project_id) = request.project_id {
-        Some(require_project_role(&state, actor_id, project_id, Role::Admin).await?)
+        let actor = AuthenticatedActor::User { user_id: actor_id };
+        Some(require_project_role(&state, &actor, project_id, Role::Admin, "api_keys:admin").await?)
     } else {
-        require_org_role(&state, actor_id, org_id, Role::Admin).await?;
+        let actor = AuthenticatedActor::User { user_id: actor_id };
+        require_org_role(&state, &actor, org_id, Role::Admin, "api_keys:admin").await?;
         None
     };
     if project
@@ -621,9 +842,10 @@ async fn list_api_keys(
     State(state): State<AppState>,
     Query(query): Query<ApiKeyListQuery>,
 ) -> ApiResult<Vec<ApiKeyResponse>> {
-    let actor_id = require_actor(&headers, &state).await?;
+    let actor_id = require_user_actor(&headers, &state).await?;
     let org_id = query.org_id;
-    require_org_role(&state, actor_id, org_id, Role::Admin).await?;
+    let actor = AuthenticatedActor::User { user_id: actor_id };
+    require_org_role(&state, &actor, org_id, Role::Admin, "api_keys:admin").await?;
     if let Some(project_id) = query.project_id {
         let project = state.store.get_project(project_id).await?;
         if project.org_id != org_id {
@@ -648,9 +870,10 @@ async fn revoke_api_key(
     Path(api_key_id): Path<Id>,
     Query(query): Query<ApiKeyRevokeQuery>,
 ) -> ApiResult<ApiKeyResponse> {
-    let actor_id = require_actor(&headers, &state).await?;
+    let actor_id = require_user_actor(&headers, &state).await?;
     let org_id = query.org_id;
-    require_org_role(&state, actor_id, org_id, Role::Admin).await?;
+    let actor = AuthenticatedActor::User { user_id: actor_id };
+    require_org_role(&state, &actor, org_id, Role::Admin, "api_keys:admin").await?;
     let api_key = state.store.revoke_api_key(org_id, api_key_id).await?;
     record_audit(
         &state,
@@ -679,7 +902,7 @@ async fn create_org(
     State(state): State<AppState>,
     Json(request): Json<CreateOrgRequest>,
 ) -> ApiResult<Org> {
-    let actor_id = require_actor(&headers, &state).await?;
+    let actor_id = require_user_actor(&headers, &state).await?;
     let org = state
         .store
         .create_org(Org::new(request.name, request.slug), actor_id)
@@ -701,7 +924,7 @@ async fn create_org(
 
 #[utoipa::path(get, path = "/api/v1/orgs", responses((status = 200)))]
 async fn list_orgs(headers: HeaderMap, State(state): State<AppState>) -> ApiResult<Vec<Org>> {
-    let actor_id = require_actor(&headers, &state).await?;
+    let actor_id = require_user_actor(&headers, &state).await?;
     Ok(Json(state.store.list_orgs_for_user(actor_id).await?))
 }
 
@@ -727,8 +950,15 @@ async fn create_project(
     State(state): State<AppState>,
     Json(request): Json<CreateProjectRequest>,
 ) -> ApiResult<Project> {
-    let actor_id = require_actor(&headers, &state).await?;
-    require_org_role(&state, actor_id, request.org_id, Role::Admin).await?;
+    let actor = require_actor(&headers, &state).await?;
+    require_org_role(
+        &state,
+        &actor,
+        request.org_id,
+        Role::Admin,
+        "projects:write",
+    )
+    .await?;
     let project = state
         .store
         .create_project(Project::new(request.org_id, request.name, request.slug))
@@ -738,7 +968,7 @@ async fn create_project(
         AuditLog::new(
             project.org_id,
             Some(project.id),
-            Some(actor_id),
+            actor.audit_actor_id(),
             "project.create",
             format!("project:{}", project.id),
             json!({ "name": project.name }),
@@ -754,11 +984,11 @@ async fn list_projects(
     State(state): State<AppState>,
     Query(query): Query<ProjectQuery>,
 ) -> ApiResult<Vec<Project>> {
-    let actor_id = require_actor(&headers, &state).await?;
+    let actor = require_actor(&headers, &state).await?;
     let org_id = query
         .org_id
         .ok_or_else(|| ApiError::BadRequest("org_id is required".to_owned()))?;
-    require_org_access(&state, actor_id, org_id).await?;
+    require_org_access(&state, &actor, org_id, "projects:read").await?;
     Ok(Json(state.store.list_projects(org_id).await?))
 }
 
@@ -776,9 +1006,15 @@ async fn create_device(
     State(state): State<AppState>,
     Json(request): Json<CreateDeviceRequest>,
 ) -> ApiResult<Device> {
-    let actor_id = require_actor(&headers, &state).await?;
-    let project =
-        require_project_role(&state, actor_id, request.project_id, Role::Operator).await?;
+    let actor = require_actor(&headers, &state).await?;
+    let project = require_project_role(
+        &state,
+        &actor,
+        request.project_id,
+        Role::Operator,
+        "devices:write",
+    )
+    .await?;
     let device = state
         .store
         .create_device(Device::new(
@@ -792,7 +1028,7 @@ async fn create_device(
         AuditLog::new(
             project.org_id,
             Some(project.id),
-            Some(actor_id),
+            actor.audit_actor_id(),
             "device.create",
             format!("device:{}", device.id),
             json!({ "name": device.name }),
@@ -808,11 +1044,11 @@ async fn list_devices(
     State(state): State<AppState>,
     Query(query): Query<ProjectQuery>,
 ) -> ApiResult<Vec<Device>> {
-    let actor_id = require_actor(&headers, &state).await?;
+    let actor = require_actor(&headers, &state).await?;
     let project_id = query
         .project_id
         .ok_or_else(|| ApiError::BadRequest("project_id is required".to_owned()))?;
-    require_project_access(&state, actor_id, project_id).await?;
+    require_project_access(&state, &actor, project_id, "devices:read").await?;
     Ok(Json(state.store.list_devices(project_id).await?))
 }
 
@@ -823,11 +1059,18 @@ async fn provision_device(
     Path(device_id): Path<Id>,
     Query(query): Query<ProjectQuery>,
 ) -> ApiResult<DeviceConfig> {
-    let actor_id = require_actor(&headers, &state).await?;
+    let actor = require_actor(&headers, &state).await?;
     let project_id = query
         .project_id
         .ok_or_else(|| ApiError::BadRequest("project_id is required".to_owned()))?;
-    let project = require_project_role(&state, actor_id, project_id, Role::Operator).await?;
+    let project = require_project_role(
+        &state,
+        &actor,
+        project_id,
+        Role::Operator,
+        "devices:provision",
+    )
+    .await?;
     let _device = state.store.get_device(project_id, device_id).await?;
     let config = issue_device_auth_config(
         &state,
@@ -844,7 +1087,7 @@ async fn provision_device(
         AuditLog::new(
             project.org_id,
             Some(project.id),
-            Some(actor_id),
+            actor.audit_actor_id(),
             "device.dev_auth_download",
             format!("device:{device_id}"),
             json!({ "production": false, "legacy_endpoint": true }),
@@ -875,8 +1118,15 @@ async fn provision_device_csr(
     Path(device_id): Path<Id>,
     Json(request): Json<CsrProvisionRequest>,
 ) -> ApiResult<DeviceConfig> {
-    let actor_id = require_actor(&headers, &state).await?;
-    require_project_role(&state, actor_id, request.project_id, Role::Operator).await?;
+    let actor = require_actor(&headers, &state).await?;
+    require_project_role(
+        &state,
+        &actor,
+        request.project_id,
+        Role::Operator,
+        "devices:provision",
+    )
+    .await?;
     if !request.csr_pem.contains("BEGIN CERTIFICATE REQUEST") {
         return Err(ApiError::BadRequest(
             "csr_pem must be a PEM encoded CSR".to_owned(),
@@ -898,7 +1148,7 @@ async fn provision_device_csr(
         AuditLog::new(
             project.org_id,
             Some(project.id),
-            Some(actor_id),
+            actor.audit_actor_id(),
             "device.csr_sign",
             format!("device:{device_id}"),
             json!({ "production": true }),
@@ -915,8 +1165,15 @@ async fn provision_device_dev_auth(
     Path(device_id): Path<Id>,
     Json(request): Json<DevAuthProvisionRequest>,
 ) -> ApiResult<DeviceConfig> {
-    let actor_id = require_actor(&headers, &state).await?;
-    require_project_role(&state, actor_id, request.project_id, Role::Operator).await?;
+    let actor = require_actor(&headers, &state).await?;
+    require_project_role(
+        &state,
+        &actor,
+        request.project_id,
+        Role::Operator,
+        "devices:provision",
+    )
+    .await?;
     let config = issue_device_auth_config(
         &state,
         request.project_id,
@@ -933,7 +1190,7 @@ async fn provision_device_dev_auth(
         AuditLog::new(
             project.org_id,
             Some(project.id),
-            Some(actor_id),
+            actor.audit_actor_id(),
             "device.dev_auth_download",
             format!("device:{device_id}"),
             json!({ "production": false }),
@@ -950,11 +1207,18 @@ async fn revoke_device_certificate(
     Path((device_id, certificate_id)): Path<(Id, Id)>,
     Query(query): Query<ProjectQuery>,
 ) -> ApiResult<DeviceCertificate> {
-    let actor_id = require_actor(&headers, &state).await?;
+    let actor = require_actor(&headers, &state).await?;
     let project_id = query
         .project_id
         .ok_or_else(|| ApiError::BadRequest("project_id is required".to_owned()))?;
-    let project = require_project_role(&state, actor_id, project_id, Role::Operator).await?;
+    let project = require_project_role(
+        &state,
+        &actor,
+        project_id,
+        Role::Operator,
+        "devices:provision",
+    )
+    .await?;
     let certificate = state
         .store
         .revoke_device_certificate(project_id, device_id, certificate_id)
@@ -964,7 +1228,7 @@ async fn revoke_device_certificate(
         AuditLog::new(
             project.org_id,
             Some(project.id),
-            Some(actor_id),
+            actor.audit_actor_id(),
             "device.certificate_revoke",
             format!("certificate:{certificate_id}"),
             json!({ "device_id": device_id }),
@@ -1123,9 +1387,15 @@ async fn create_stream(
     State(state): State<AppState>,
     Json(request): Json<CreateStreamRequest>,
 ) -> ApiResult<StreamDefinition> {
-    let actor_id = require_actor(&headers, &state).await?;
-    let project =
-        require_project_role(&state, actor_id, request.project_id, Role::Operator).await?;
+    let actor = require_actor(&headers, &state).await?;
+    let project = require_project_role(
+        &state,
+        &actor,
+        request.project_id,
+        Role::Operator,
+        "streams:write",
+    )
+    .await?;
     let fields = request
         .fields
         .into_iter()
@@ -1148,7 +1418,7 @@ async fn create_stream(
         AuditLog::new(
             project.org_id,
             Some(project.id),
-            Some(actor_id),
+            actor.audit_actor_id(),
             "stream.create",
             format!("stream:{}", stream.id),
             json!({ "name": stream.name }),
@@ -1164,11 +1434,11 @@ async fn list_streams(
     State(state): State<AppState>,
     Query(query): Query<ProjectQuery>,
 ) -> ApiResult<Vec<StreamDefinition>> {
-    let actor_id = require_actor(&headers, &state).await?;
+    let actor = require_actor(&headers, &state).await?;
     let project_id = query
         .project_id
         .ok_or_else(|| ApiError::BadRequest("project_id is required".to_owned()))?;
-    require_project_access(&state, actor_id, project_id).await?;
+    require_project_access(&state, &actor, project_id, "streams:read").await?;
     Ok(Json(state.store.list_streams(project_id).await?))
 }
 
@@ -1184,10 +1454,17 @@ async fn ingest_telemetry(
     State(state): State<AppState>,
     Json(request): Json<IngestTelemetryRequest>,
 ) -> ApiResult<Value> {
-    let actor_id = require_actor(&headers, &state).await?;
+    let actor = require_actor(&headers, &state).await?;
     let topic = parse_publish_topic(&request.topic)
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-    require_project_role(&state, actor_id, topic.project_id(), Role::Operator).await?;
+    require_project_role(
+        &state,
+        &actor,
+        topic.project_id(),
+        Role::Operator,
+        "telemetry:write",
+    )
+    .await?;
 
     match topic {
         PublishTopic::Telemetry {
@@ -1271,8 +1548,8 @@ async fn query_telemetry(
     State(state): State<AppState>,
     Query(query): Query<TelemetryQuery>,
 ) -> ApiResult<Vec<TelemetryPoint>> {
-    let actor_id = require_actor(&headers, &state).await?;
-    require_project_access(&state, actor_id, query.project_id).await?;
+    let actor = require_actor(&headers, &state).await?;
+    require_project_access(&state, &actor, query.project_id, "telemetry:read").await?;
     Ok(Json(
         state
             .store
@@ -1302,9 +1579,15 @@ async fn create_action(
     State(state): State<AppState>,
     Json(request): Json<CreateActionRequest>,
 ) -> ApiResult<Action> {
-    let actor_id = require_actor(&headers, &state).await?;
-    let project =
-        require_project_role(&state, actor_id, request.project_id, Role::Operator).await?;
+    let actor = require_actor(&headers, &state).await?;
+    let project = require_project_role(
+        &state,
+        &actor,
+        request.project_id,
+        Role::Operator,
+        "actions:write",
+    )
+    .await?;
     if request.device_ids.is_empty() {
         return Err(ApiError::BadRequest(
             "device_ids must not be empty".to_owned(),
@@ -1324,7 +1607,7 @@ async fn create_action(
             request.device_ids,
             request.name,
             request.payload,
-            Some(actor_id),
+            actor.audit_actor_id(),
         ))
         .await?;
     record_audit(
@@ -1332,7 +1615,7 @@ async fn create_action(
         AuditLog::new(
             project.org_id,
             Some(project.id),
-            Some(actor_id),
+            actor.audit_actor_id(),
             "action.create",
             format!("action:{}", action.id),
             json!({ "name": action.name, "target_count": action.device_ids.len() }),
@@ -1375,11 +1658,11 @@ async fn list_actions(
     State(state): State<AppState>,
     Query(query): Query<ProjectQuery>,
 ) -> ApiResult<Vec<Action>> {
-    let actor_id = require_actor(&headers, &state).await?;
+    let actor = require_actor(&headers, &state).await?;
     let project_id = query
         .project_id
         .ok_or_else(|| ApiError::BadRequest("project_id is required".to_owned()))?;
-    require_project_access(&state, actor_id, project_id).await?;
+    require_project_access(&state, &actor, project_id, "actions:read").await?;
     Ok(Json(state.store.list_actions(project_id).await?))
 }
 
@@ -1426,9 +1709,15 @@ async fn update_action_status(
     Path(action_id): Path<Id>,
     Json(request): Json<ActionStatusRequest>,
 ) -> ApiResult<Action> {
-    let actor_id = require_actor(&headers, &state).await?;
-    let project =
-        require_project_role(&state, actor_id, request.project_id, Role::Operator).await?;
+    let actor = require_actor(&headers, &state).await?;
+    let project = require_project_role(
+        &state,
+        &actor,
+        request.project_id,
+        Role::Operator,
+        "actions:write",
+    )
+    .await?;
     let action_state = ActionState::from(request.state);
     let progress = request.progress.min(100);
     let device_id = request.device_id;
@@ -1449,7 +1738,7 @@ async fn update_action_status(
         AuditLog::new(
             project.org_id,
             Some(project.id),
-            Some(actor_id),
+            actor.audit_actor_id(),
             "action.status_update",
             format!("action:{action_id}"),
             json!({ "device_id": device_id, "state": format!("{action_state:?}"), "progress": progress }),
@@ -1476,9 +1765,15 @@ async fn create_firmware(
     State(state): State<AppState>,
     Json(request): Json<CreateFirmwareRequest>,
 ) -> ApiResult<FirmwareArtifact> {
-    let actor_id = require_actor(&headers, &state).await?;
-    let project =
-        require_project_role(&state, actor_id, request.project_id, Role::Operator).await?;
+    let actor = require_actor(&headers, &state).await?;
+    let project = require_project_role(
+        &state,
+        &actor,
+        request.project_id,
+        Role::Operator,
+        "firmware:write",
+    )
+    .await?;
     let artifact = state
         .store
         .create_firmware(FirmwareArtifact::new(
@@ -1495,7 +1790,7 @@ async fn create_firmware(
         AuditLog::new(
             project.org_id,
             Some(project.id),
-            Some(actor_id),
+            actor.audit_actor_id(),
             "firmware.create",
             format!("firmware:{}", artifact.id),
             json!({ "component": artifact.component, "version": artifact.version }),
@@ -1511,11 +1806,11 @@ async fn list_firmware(
     State(state): State<AppState>,
     Query(query): Query<ProjectQuery>,
 ) -> ApiResult<Vec<FirmwareArtifact>> {
-    let actor_id = require_actor(&headers, &state).await?;
+    let actor = require_actor(&headers, &state).await?;
     let project_id = query
         .project_id
         .ok_or_else(|| ApiError::BadRequest("project_id is required".to_owned()))?;
-    require_project_access(&state, actor_id, project_id).await?;
+    require_project_access(&state, &actor, project_id, "firmware:read").await?;
     Ok(Json(state.store.list_firmware(project_id).await?))
 }
 
@@ -1533,9 +1828,15 @@ async fn create_dashboard(
     State(state): State<AppState>,
     Json(request): Json<CreateDashboardRequest>,
 ) -> ApiResult<Dashboard> {
-    let actor_id = require_actor(&headers, &state).await?;
-    let project =
-        require_project_role(&state, actor_id, request.project_id, Role::Operator).await?;
+    let actor = require_actor(&headers, &state).await?;
+    let project = require_project_role(
+        &state,
+        &actor,
+        request.project_id,
+        Role::Operator,
+        "dashboards:write",
+    )
+    .await?;
     let dashboard = state
         .store
         .create_dashboard(Dashboard {
@@ -1550,7 +1851,7 @@ async fn create_dashboard(
         AuditLog::new(
             project.org_id,
             Some(project.id),
-            Some(actor_id),
+            actor.audit_actor_id(),
             "dashboard.create",
             format!("dashboard:{}", dashboard.id),
             json!({ "name": dashboard.name }),
@@ -1566,11 +1867,11 @@ async fn list_dashboards(
     State(state): State<AppState>,
     Query(query): Query<ProjectQuery>,
 ) -> ApiResult<Vec<Dashboard>> {
-    let actor_id = require_actor(&headers, &state).await?;
+    let actor = require_actor(&headers, &state).await?;
     let project_id = query
         .project_id
         .ok_or_else(|| ApiError::BadRequest("project_id is required".to_owned()))?;
-    require_project_access(&state, actor_id, project_id).await?;
+    require_project_access(&state, &actor, project_id, "dashboards:read").await?;
     Ok(Json(state.store.list_dashboards(project_id).await?))
 }
 
@@ -1606,9 +1907,15 @@ async fn create_alert(
     State(state): State<AppState>,
     Json(request): Json<CreateAlertRequest>,
 ) -> ApiResult<AlertRule> {
-    let actor_id = require_actor(&headers, &state).await?;
-    let project =
-        require_project_role(&state, actor_id, request.project_id, Role::Operator).await?;
+    let actor = require_actor(&headers, &state).await?;
+    let project = require_project_role(
+        &state,
+        &actor,
+        request.project_id,
+        Role::Operator,
+        "alerts:write",
+    )
+    .await?;
     let alert = state
         .store
         .create_alert(AlertRule {
@@ -1625,7 +1932,7 @@ async fn create_alert(
         AuditLog::new(
             project.org_id,
             Some(project.id),
-            Some(actor_id),
+            actor.audit_actor_id(),
             "alert.create",
             format!("alert:{}", alert.id),
             json!({ "name": alert.name }),
@@ -1641,11 +1948,11 @@ async fn list_alerts(
     State(state): State<AppState>,
     Query(query): Query<ProjectQuery>,
 ) -> ApiResult<Vec<AlertRule>> {
-    let actor_id = require_actor(&headers, &state).await?;
+    let actor = require_actor(&headers, &state).await?;
     let project_id = query
         .project_id
         .ok_or_else(|| ApiError::BadRequest("project_id is required".to_owned()))?;
-    require_project_access(&state, actor_id, project_id).await?;
+    require_project_access(&state, &actor, project_id, "alerts:read").await?;
     Ok(Json(state.store.list_alerts(project_id).await?))
 }
 
@@ -1655,11 +1962,11 @@ async fn list_audit(
     State(state): State<AppState>,
     Query(query): Query<ProjectQuery>,
 ) -> ApiResult<Vec<AuditLog>> {
-    let actor_id = require_actor(&headers, &state).await?;
+    let actor = require_actor(&headers, &state).await?;
     let org_id = query
         .org_id
         .ok_or_else(|| ApiError::BadRequest("org_id is required".to_owned()))?;
-    require_org_access(&state, actor_id, org_id).await?;
+    require_org_access(&state, &actor, org_id, "audit:read").await?;
     Ok(Json(
         state.store.list_audit(org_id, query.project_id).await?,
     ))
@@ -1686,6 +1993,39 @@ mod tests {
             ))
             .await
             .unwrap();
+    }
+
+    fn cookie_pair(response: &axum::response::Response, name: &str) -> String {
+        response
+            .headers()
+            .get_all(SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .find_map(|cookie| {
+                cookie
+                    .split(';')
+                    .next()
+                    .filter(|pair| pair.starts_with(&format!("{name}=")))
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| panic!("missing {name} set-cookie header"))
+    }
+
+    fn cookie_header(response: &axum::response::Response) -> String {
+        format!(
+            "{}; {}",
+            cookie_pair(response, ACCESS_COOKIE_NAME),
+            cookie_pair(response, REFRESH_COOKIE_NAME)
+        )
+    }
+
+    fn cookie_pair_from_header(cookies: &str, name: &str) -> String {
+        cookies
+            .split(';')
+            .map(str::trim)
+            .find(|cookie| cookie.starts_with(&format!("{name}=")))
+            .unwrap_or_else(|| panic!("missing {name} cookie"))
+            .to_owned()
     }
 
     #[tokio::test]
@@ -1867,6 +2207,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auth_cookies_can_refresh_and_logout_without_bearer_tokens() {
+        let state = AppState::default();
+        let register_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "email": "cookie-api@example.com",
+                            "password": "correct horse battery staple",
+                            "display_name": "Cookie API"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(register_response.status(), StatusCode::OK);
+        let initial_cookie = cookie_header(&register_response);
+        assert!(
+            register_response
+                .headers()
+                .get_all(SET_COOKIE)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .all(|cookie| cookie.contains("HttpOnly") && cookie.contains("SameSite=Lax"))
+        );
+        let body = to_bytes(register_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let auth: AuthResponse = serde_json::from_slice(&body).unwrap();
+
+        let cookie_auth_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/orgs")
+                    .header(
+                        COOKIE,
+                        cookie_pair_from_header(&initial_cookie, ACCESS_COOKIE_NAME),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cookie_auth_response.status(), StatusCode::OK);
+
+        let refresh_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/refresh")
+                    .header(
+                        COOKIE,
+                        cookie_pair_from_header(&initial_cookie, REFRESH_COOKIE_NAME),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refresh_response.status(), StatusCode::OK);
+        let refreshed_cookie = cookie_header(&refresh_response);
+        let body = to_bytes(refresh_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let refreshed: AuthResponse = serde_json::from_slice(&body).unwrap();
+        assert_ne!(refreshed.token, auth.token);
+
+        let old_cookie_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/orgs")
+                    .header(
+                        COOKIE,
+                        cookie_pair_from_header(&initial_cookie, ACCESS_COOKIE_NAME),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(old_cookie_response.status(), StatusCode::UNAUTHORIZED);
+
+        let logout_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/logout")
+                    .header(
+                        COOKIE,
+                        cookie_pair_from_header(&refreshed_cookie, ACCESS_COOKIE_NAME),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(logout_response.status(), StatusCode::OK);
+        assert!(
+            logout_response
+                .headers()
+                .get_all(SET_COOKIE)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .any(|cookie| {
+                    cookie.starts_with(&format!("{ACCESS_COOKIE_NAME}="))
+                        && cookie.contains("Max-Age=0")
+                })
+        );
+    }
+
+    #[tokio::test]
     async fn refresh_token_reuse_revokes_rotated_session() {
         let state = AppState::default();
         let register_response = app_with_state(state.clone())
@@ -2039,6 +2495,99 @@ mod tests {
             .unwrap();
         assert!(audit.iter().any(|entry| entry.action == "api_key.create"));
         assert!(audit.iter().any(|entry| entry.action == "api_key.revoke"));
+    }
+
+    #[tokio::test]
+    async fn api_keys_authenticate_with_scopes_and_project_bounds() {
+        let state = AppState::default();
+        let user = state
+            .store
+            .create_user(User::new(
+                "api-key-scope@example.com",
+                "API Key Scope",
+                "hash",
+            ))
+            .await
+            .unwrap();
+        let org = state
+            .store
+            .create_org(Org::new("API Key Scope Org", "api-key-scope-org"), user.id)
+            .await
+            .unwrap();
+        let project = state
+            .store
+            .create_project(Project::new(org.id, "Factory", "factory"))
+            .await
+            .unwrap();
+        let other_project = state
+            .store
+            .create_project(Project::new(org.id, "Other", "other"))
+            .await
+            .unwrap();
+        state
+            .store
+            .create_device(Device::new(project.id, "edge-1", json!({})))
+            .await
+            .unwrap();
+        let raw_api_key = "excak_project_read";
+        state
+            .store
+            .create_api_key(ApiKey::new(
+                org.id,
+                Some(project.id),
+                "project reader",
+                auth::hash_secret(raw_api_key),
+                vec!["devices:read".to_owned()],
+                None,
+                Some(user.id),
+            ))
+            .await
+            .unwrap();
+
+        let read_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/devices?project_id={}", project.id))
+                    .header(API_KEY_HEADER, raw_api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read_response.status(), StatusCode::OK);
+
+        let missing_scope_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/devices")
+                    .header(AUTHORIZATION, format!("Bearer {raw_api_key}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "project_id": project.id,
+                            "name": "edge-2",
+                            "metadata": {}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_scope_response.status(), StatusCode::UNAUTHORIZED);
+
+        let cross_project_response = app_with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/devices?project_id={}", other_project.id))
+                    .header(API_KEY_HEADER, raw_api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cross_project_response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

@@ -36,8 +36,6 @@ import type {
 import { commandStatusTopic, commandTopic, shadowTopic, telemetryTopic } from "@/lib/protocol";
 
 type Session = {
-  token: string;
-  refreshToken: string;
   expiresAt: string;
   refreshExpiresAt: string;
   userId: string;
@@ -62,7 +60,7 @@ type ProjectData = {
 
 type Api = ReturnType<typeof createExcaliburApi>;
 
-const SESSION_KEY = "excalibur.console.session.v1";
+const SESSION_KEY = "excalibur.console.session.v2";
 const API_BASE_KEY = "excalibur.console.apiBaseUrl.v1";
 const THEME_KEY = "excalibur.console.theme.v1";
 const DEFAULT_API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8080";
@@ -100,8 +98,6 @@ function isStoredSession(value: unknown): value is Session {
   }
   const session = value as Partial<Record<keyof Session, unknown>>;
   return (
-    typeof session.token === "string" &&
-    typeof session.refreshToken === "string" &&
     typeof session.expiresAt === "string" &&
     typeof session.refreshExpiresAt === "string" &&
     typeof session.userId === "string"
@@ -110,8 +106,6 @@ function isStoredSession(value: unknown): value is Session {
 
 function sessionFromAuth(auth: AuthResponse): Session {
   return {
-    token: auth.token,
-    refreshToken: auth.refresh_token,
     expiresAt: auth.expires_at,
     refreshExpiresAt: auth.refresh_expires_at,
     userId: auth.user_id,
@@ -492,7 +486,6 @@ export function ConsoleApp() {
 
   const getApiForSession = useCallback(
     async (activeSession: Session) => {
-      let usableSession = activeSession;
       if (expiresBefore(activeSession.expiresAt, Date.now() + SESSION_REFRESH_SKEW_MS)) {
         if (expiresBefore(activeSession.refreshExpiresAt, Date.now())) {
           clearSession();
@@ -500,14 +493,14 @@ export function ConsoleApp() {
         }
         try {
           const authApi = createExcaliburApi({ baseUrl: apiBaseUrl });
-          const auth = await authApi.refreshSession({ refresh_token: activeSession.refreshToken });
-          usableSession = persistSession(sessionFromAuth(auth));
+          const auth = await authApi.refreshSession();
+          persistSession(sessionFromAuth(auth));
         } catch (refreshError) {
           clearSession();
           throw refreshError;
         }
       }
-      return createExcaliburApi({ baseUrl: apiBaseUrl, token: usableSession.token });
+      return createExcaliburApi({ baseUrl: apiBaseUrl });
     },
     [apiBaseUrl, clearSession, persistSession],
   );
@@ -584,7 +577,7 @@ export function ConsoleApp() {
 
   useEffect(() => {
     if (session) {
-      const sessionKey = `${apiBaseUrl}:${session.token}`;
+      const sessionKey = `${apiBaseUrl}:${session.userId}:${session.expiresAt}`;
       if (initializedSessionKey.current === sessionKey) {
         return;
       }

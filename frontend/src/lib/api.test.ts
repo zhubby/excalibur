@@ -26,6 +26,7 @@ describe("Excalibur API client", () => {
     const [url, init] = fetcher.mock.calls[0] as unknown as [string, RequestInit];
     expect(url).toBe("http://api.example/api/v1/orgs");
     expect(init.method).toBe("POST");
+    expect(init.credentials).toBe("include");
     expect(new Headers(init.headers).get("authorization")).toBe("Bearer session-token");
     expect(new Headers(init.headers).get("content-type")).toBe("application/json");
     expect(init.body).toBe(JSON.stringify({ name: "Excalibur", slug: "excalibur" }));
@@ -68,16 +69,19 @@ describe("Excalibur API client", () => {
       auth,
     );
     await expect(api.refreshSession({ refresh_token: auth.refresh_token })).resolves.toEqual(auth);
+    await expect(api.refreshSession()).resolves.toEqual(auth);
 
     const calls = (fetcher.mock.calls as unknown as [string, RequestInit][]).map(([url, init]) => ({
       url: String(url),
       method: init?.method ?? "GET",
       body: init?.body,
+      credentials: init?.credentials,
     }));
     expect(calls).toMatchObject([
       {
         url: "http://api.example/api/v1/auth/register",
         method: "POST",
+        credentials: "include",
         body: JSON.stringify({
           email: "ops@example.com",
           password: "correct horse battery staple",
@@ -87,6 +91,7 @@ describe("Excalibur API client", () => {
       {
         url: "http://api.example/api/v1/auth/login",
         method: "POST",
+        credentials: "include",
         body: JSON.stringify({
           email: "ops@example.com",
           password: "correct horse battery staple",
@@ -95,7 +100,13 @@ describe("Excalibur API client", () => {
       {
         url: "http://api.example/api/v1/auth/refresh",
         method: "POST",
+        credentials: "include",
         body: JSON.stringify({ refresh_token: "xclb_refresh_token" }),
+      },
+      {
+        url: "http://api.example/api/v1/auth/refresh",
+        method: "POST",
+        credentials: "include",
       },
     ]);
   });
