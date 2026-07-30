@@ -3,17 +3,20 @@ mod mappers;
 
 use std::collections::{HashMap, HashSet};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use excalibur_domain::{
-    Action, ActionStatusUpdate, AlertRule, ApiKey, AuditLog, Dashboard, Device, DeviceCertificate,
-    FirmwareArtifact, Id, Membership, Org, Project, Role, StreamDefinition, TelemetryPoint, User,
-    UserSession,
+    Action, ActionDispatchTarget, ActionState, ActionStatusUpdate, ActionTargetStatusChange,
+    ActionTargetTransition, AlertEvent, AlertEventState, AlertRule, ApiKey, AuditLog, Dashboard,
+    Device, DeviceCertificate, DiagnosticsSession, FirmwareArtifact, FirmwareRollout, Id,
+    Membership, Org, Project, Role, StreamDefinition, TelemetryAggregateBucket, TelemetryPoint,
+    User, UserSession,
 };
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, QueryBuilder, Row, postgres::PgPoolOptions};
 
 use crate::{
     StoreError, StoreResult,
+    actions::action_status_allowed_source_states,
     postgres::{
         helpers::{
             SQL_INSERT_CHUNK_SIZE, action_device_ids_in_tx, aggregate_action_in_tx,
@@ -21,9 +24,11 @@ use crate::{
             ensure_exists_in_tx, map_decode_error, map_json_error, map_sqlx_error,
         },
         mappers::{
-            action_state_to_db, alert_kind_to_db, certificate_status_to_db, device_status_to_db,
-            map_action_row, map_alert, map_api_key, map_audit, map_certificate, map_dashboard,
-            map_device, map_firmware, map_membership, map_org, map_project, map_stream,
+            action_state_from_db, action_state_to_db, alert_event_state_to_db, alert_kind_to_db,
+            certificate_status_to_db, device_status_to_db, diagnostics_session_state_to_db,
+            firmware_rollout_state_to_db, map_action_row, map_alert, map_alert_event, map_api_key,
+            map_audit, map_certificate, map_dashboard, map_device, map_diagnostics_session,
+            map_firmware, map_firmware_rollout, map_membership, map_org, map_project, map_stream,
             map_telemetry, map_user, map_user_session, role_from_db, role_to_db,
         },
     },
@@ -72,9 +77,44 @@ impl PgStore {
                 to_regclass('public.telemetry_points') IS NOT NULL AS telemetry_points,
                 to_regclass('public.telemetry_sequence_dedup') IS NOT NULL AS telemetry_sequence_dedup,
                 to_regclass('public.action_targets') IS NOT NULL AS action_targets,
+                to_regclass('public.alert_events') IS NOT NULL AS alert_events,
+                to_regclass('public.diagnostics_sessions') IS NOT NULL AS diagnostics_sessions,
+                to_regclass('public.firmware_rollouts') IS NOT NULL AS firmware_rollouts,
                 to_regclass('public.audit_logs') IS NOT NULL AS audit_logs,
                 to_regclass('public.users_email_lower_unique_idx') IS NOT NULL AS users_email_lower_unique_idx,
                 to_regclass('public.telemetry_points_project_device_stream_ts_idx') IS NOT NULL AS telemetry_index,
+                to_regclass('public.action_targets_state_updated_idx') IS NOT NULL AS action_targets_state_updated_idx,
+                to_regclass('public.alert_events_open_dedupe_idx') IS NOT NULL AS alert_events_open_dedupe_idx,
+                to_regclass('public.diagnostics_sessions_project_state_idx') IS NOT NULL AS diagnostics_sessions_project_state_idx,
+                to_regclass('public.firmware_rollouts_project_state_idx') IS NOT NULL AS firmware_rollouts_project_state_idx,
+                EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'firmware_artifacts'
+                      AND column_name = 'content_type'
+                ) AS firmware_content_type,
+                EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'firmware_artifacts'
+                      AND column_name = 'signature'
+                ) AS firmware_signature,
+                EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'firmware_artifacts'
+                      AND column_name = 'uploaded_at'
+                ) AS firmware_uploaded_at,
+                EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'firmware_artifacts'
+                      AND column_name = 'verified_at'
+                ) AS firmware_verified_at,
                 EXISTS (
                     SELECT 1
                     FROM pg_extension
@@ -121,9 +161,20 @@ impl PgStore {
                 "telemetry_points",
                 "telemetry_sequence_dedup",
                 "action_targets",
+                "alert_events",
+                "diagnostics_sessions",
+                "firmware_rollouts",
                 "audit_logs",
                 "users_email_lower_unique_idx",
                 "telemetry_index",
+                "action_targets_state_updated_idx",
+                "alert_events_open_dedupe_idx",
+                "diagnostics_sessions_project_state_idx",
+                "firmware_rollouts_project_state_idx",
+                "firmware_content_type",
+                "firmware_signature",
+                "firmware_uploaded_at",
+                "firmware_verified_at",
                 "telemetry_hypertable",
                 "telemetry_compression",
                 "telemetry_compression_policy",
@@ -1063,6 +1114,87 @@ impl PgStore {
         rows.iter().map(map_telemetry).collect()
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn aggregate_telemetry(
+        &self,
+        project_id: Id,
+        device_id: Option<Id>,
+        stream: &str,
+        field: Option<&str>,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        bucket_seconds: i64,
+        limit: usize,
+    ) -> StoreResult<Vec<TelemetryAggregateBucket>> {
+        let bucket_seconds = bucket_seconds.max(1);
+        let limit = limit.min(10_000) as i64;
+        let rows = sqlx::query(
+            "WITH filtered AS (
+                SELECT
+                  ts,
+                  CASE
+                    WHEN $7::text IS NULL THEN NULL
+                    WHEN (payload ->> $7::text) ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                      THEN (payload ->> $7::text)::double precision
+                    ELSE NULL
+                  END AS value
+                FROM telemetry_points
+                WHERE project_id = $1
+                  AND ($2::uuid IS NULL OR device_id = $2)
+                  AND stream = $3
+                  AND ts >= $4
+                  AND ts < $5
+              ),
+              bucketed AS (
+                SELECT
+                  to_timestamp(floor(extract(epoch FROM ts) / $6::double precision) * $6::double precision) AS bucket_start,
+                  ts,
+                  value
+                FROM filtered
+              )
+              SELECT
+                bucket_start,
+                count(*)::bigint AS count,
+                min(value) AS min,
+                max(value) AS max,
+                avg(value) AS avg,
+                (array_agg(value ORDER BY ts DESC) FILTER (WHERE value IS NOT NULL))[1] AS last
+              FROM bucketed
+              GROUP BY bucket_start
+              ORDER BY bucket_start DESC
+              LIMIT $8",
+        )
+        .bind(project_id)
+        .bind(device_id)
+        .bind(stream)
+        .bind(from)
+        .bind(to)
+        .bind(bucket_seconds)
+        .bind(field)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "telemetry aggregate"))?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(TelemetryAggregateBucket {
+                    project_id,
+                    device_id,
+                    stream: stream.to_owned(),
+                    field: field.map(str::to_owned),
+                    bucket_start: row.try_get("bucket_start").map_err(map_decode_error)?,
+                    bucket_seconds,
+                    count: row.try_get("count").map_err(map_decode_error)?,
+                    min: row.try_get("min").map_err(map_decode_error)?,
+                    max: row.try_get("max").map_err(map_decode_error)?,
+                    avg: row.try_get("avg").map_err(map_decode_error)?,
+                    last: row.try_get("last").map_err(map_decode_error)?,
+                })
+            })
+            .collect()
+    }
+
     pub async fn create_action(&self, action: Action) -> StoreResult<Action> {
         self.ensure_project_exists(action.project_id).await?;
         let mut seen_targets = HashSet::new();
@@ -1199,23 +1331,43 @@ impl PgStore {
             "device",
         )
         .await?;
-        let target = sqlx::query(
-            "UPDATE action_targets
-             SET state = $4::action_state, progress = $5, errors = $6, updated_at = $7
-             WHERE project_id = $1 AND action_id = $2 AND device_id = $3",
+        let target_row = sqlx::query(
+            "SELECT state::text AS state
+             FROM action_targets
+             WHERE project_id = $1 AND action_id = $2 AND device_id = $3
+             FOR UPDATE",
         )
         .bind(update.project_id)
         .bind(update.action_id)
         .bind(update.device_id)
-        .bind(action_state_to_db(&update.state))
-        .bind(update.progress.min(100) as i16)
-        .bind(&update.errors)
-        .bind(update.ts)
-        .execute(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|error| map_sqlx_error(error, "action target"))?;
-        if target.rows_affected() == 0 {
+        let Some(target_row) = target_row else {
             return Err(StoreError::NotFound("action target"));
+        };
+        let current_state =
+            action_state_from_db(target_row.try_get("state").map_err(map_decode_error)?)?;
+        let allowed_source_states = action_status_allowed_source_states(&update.state);
+        if allowed_source_states
+            .iter()
+            .any(|state| state == &current_state)
+        {
+            sqlx::query(
+                "UPDATE action_targets
+                 SET state = $4::action_state, progress = $5, errors = $6, updated_at = $7
+                 WHERE project_id = $1 AND action_id = $2 AND device_id = $3",
+            )
+            .bind(update.project_id)
+            .bind(update.action_id)
+            .bind(update.device_id)
+            .bind(action_state_to_db(&update.state))
+            .bind(update.progress.min(100) as i16)
+            .bind(&update.errors)
+            .bind(update.ts)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| map_sqlx_error(error, "action target"))?;
         }
         let row =
             aggregate_action_in_tx(&mut tx, update.project_id, update.action_id, update.ts).await?;
@@ -1228,6 +1380,238 @@ impl PgStore {
         Ok(action)
     }
 
+    pub async fn claim_queued_action_targets(
+        &self,
+        limit: usize,
+    ) -> StoreResult<Vec<ActionDispatchTarget>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let now = Utc::now();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| map_sqlx_error(error, "action target"))?;
+        let rows = sqlx::query(
+            "WITH claimed AS (
+                SELECT target.action_id, target.project_id, target.device_id
+                FROM action_targets target
+                WHERE target.state = 'queued'::action_state
+                ORDER BY target.updated_at ASC, target.action_id, target.device_id
+                LIMIT $1
+                FOR UPDATE SKIP LOCKED
+             )
+             UPDATE action_targets target
+             SET state = 'running'::action_state, progress = 0, errors = '{}', updated_at = $2
+             FROM claimed
+             JOIN actions action ON action.project_id = claimed.project_id AND action.id = claimed.action_id
+             WHERE target.project_id = claimed.project_id
+               AND target.action_id = claimed.action_id
+               AND target.device_id = claimed.device_id
+             RETURNING target.project_id, target.action_id, target.device_id, action.name, action.payload",
+        )
+        .bind(limit as i64)
+        .bind(now)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|error| map_sqlx_error(error, "action target"))?;
+
+        let mut dispatch_targets = Vec::with_capacity(rows.len());
+        let mut action_ids = HashSet::new();
+        for row in rows {
+            let project_id = row.try_get("project_id").map_err(map_decode_error)?;
+            let action_id = row.try_get("action_id").map_err(map_decode_error)?;
+            action_ids.insert((project_id, action_id));
+            dispatch_targets.push(ActionDispatchTarget {
+                project_id,
+                action_id,
+                device_id: row.try_get("device_id").map_err(map_decode_error)?,
+                name: row.try_get("name").map_err(map_decode_error)?,
+                payload: row.try_get("payload").map_err(map_decode_error)?,
+            });
+        }
+
+        for (project_id, action_id) in action_ids {
+            aggregate_action_in_tx(&mut tx, project_id, action_id, now).await?;
+        }
+        tx.commit()
+            .await
+            .map_err(|error| map_sqlx_error(error, "action target"))?;
+
+        Ok(dispatch_targets)
+    }
+
+    pub async fn transition_action_targets(
+        &self,
+        transition: ActionTargetTransition,
+    ) -> StoreResult<Action> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| map_sqlx_error(error, "action target"))?;
+        ensure_exists_in_tx(
+            &mut tx,
+            "SELECT 1 FROM actions WHERE project_id = $1 AND id = $2",
+            transition.project_id,
+            transition.action_id,
+            "action",
+        )
+        .await?;
+
+        let target_device_ids = match transition.device_ids.clone() {
+            Some(device_ids) => {
+                if device_ids.is_empty() {
+                    return Err(StoreError::NotFound("action target"));
+                }
+                let mut seen_targets = HashSet::new();
+                for device_id in &device_ids {
+                    if !seen_targets.insert(*device_id) {
+                        return Err(StoreError::Conflict("action target"));
+                    }
+                }
+                let device_projects = device_project_ids_in_tx(&mut tx, &device_ids).await?;
+                for device_id in &device_ids {
+                    ensure_device_project_scope(
+                        &device_projects,
+                        *device_id,
+                        transition.project_id,
+                    )?;
+                }
+                let action_targets =
+                    action_device_ids_in_tx(&mut tx, transition.project_id, transition.action_id)
+                        .await?;
+                for device_id in &device_ids {
+                    if !action_targets.contains(device_id) {
+                        return Err(StoreError::NotFound("action target"));
+                    }
+                }
+                device_ids
+            }
+            None => {
+                action_device_ids_in_tx(&mut tx, transition.project_id, transition.action_id)
+                    .await?
+            }
+        };
+        if target_device_ids.is_empty() {
+            return Err(StoreError::NotFound("action target"));
+        }
+
+        let allowed_source_states = transition
+            .allowed_source_states
+            .iter()
+            .map(action_state_to_db)
+            .collect::<Vec<_>>();
+        let errors = transition.errors.clone();
+        let result = sqlx::query(
+            "UPDATE action_targets
+             SET state = $5::action_state,
+                 progress = COALESCE($6::smallint, progress),
+                 errors = COALESCE($7::text[], errors),
+                 updated_at = $8
+             WHERE project_id = $1
+               AND action_id = $2
+               AND device_id = ANY($3)
+               AND state = ANY($4::action_state[])",
+        )
+        .bind(transition.project_id)
+        .bind(transition.action_id)
+        .bind(&target_device_ids)
+        .bind(&allowed_source_states)
+        .bind(action_state_to_db(&transition.next_state))
+        .bind(transition.progress.map(|progress| progress.min(100) as i16))
+        .bind(errors)
+        .bind(transition.ts)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| map_sqlx_error(error, "action target"))?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::Conflict("action transition"));
+        }
+
+        let row = aggregate_action_in_tx(
+            &mut tx,
+            transition.project_id,
+            transition.action_id,
+            transition.ts,
+        )
+        .await?;
+        let device_ids =
+            action_device_ids_in_tx(&mut tx, transition.project_id, transition.action_id).await?;
+        let action = map_action_row(&row, device_ids)?;
+        tx.commit()
+            .await
+            .map_err(|error| map_sqlx_error(error, "action target"))?;
+        Ok(action)
+    }
+
+    pub async fn timeout_running_action_targets(
+        &self,
+        older_than: DateTime<Utc>,
+        limit: usize,
+        ts: DateTime<Utc>,
+    ) -> StoreResult<Vec<ActionTargetStatusChange>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| map_sqlx_error(error, "action target"))?;
+        let rows = sqlx::query(
+            "WITH timed_out AS (
+                SELECT action_id, project_id, device_id
+                FROM action_targets
+                WHERE state = 'running'::action_state
+                  AND updated_at < $1
+                ORDER BY updated_at ASC, action_id, device_id
+                LIMIT $2
+                FOR UPDATE SKIP LOCKED
+             )
+             UPDATE action_targets target
+             SET state = 'timed_out'::action_state,
+                 errors = ARRAY['action timed out']::text[],
+                 updated_at = $3
+             FROM timed_out
+             WHERE target.project_id = timed_out.project_id
+               AND target.action_id = timed_out.action_id
+               AND target.device_id = timed_out.device_id
+             RETURNING target.project_id, target.action_id, target.device_id",
+        )
+        .bind(older_than)
+        .bind(limit as i64)
+        .bind(ts)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|error| map_sqlx_error(error, "action target"))?;
+
+        let mut changes = Vec::with_capacity(rows.len());
+        let mut action_ids = HashSet::new();
+        for row in rows {
+            let project_id = row.try_get("project_id").map_err(map_decode_error)?;
+            let action_id = row.try_get("action_id").map_err(map_decode_error)?;
+            let device_id = row.try_get("device_id").map_err(map_decode_error)?;
+            action_ids.insert((project_id, action_id));
+            changes.push(ActionTargetStatusChange {
+                project_id,
+                action_id,
+                device_id,
+                state: ActionState::TimedOut,
+            });
+        }
+
+        for (project_id, action_id) in action_ids {
+            aggregate_action_in_tx(&mut tx, project_id, action_id, ts).await?;
+        }
+        tx.commit()
+            .await
+            .map_err(|error| map_sqlx_error(error, "action target"))?;
+        Ok(changes)
+    }
+
     pub async fn create_firmware(
         &self,
         artifact: FirmwareArtifact,
@@ -1235,9 +1619,9 @@ impl PgStore {
         self.ensure_project_exists(artifact.project_id).await?;
         let row = sqlx::query(
             "INSERT INTO firmware_artifacts
-                (id, project_id, component, version, object_key, sha256, size_bytes, active, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-             RETURNING id, project_id, component, version, object_key, sha256, size_bytes, active, created_at",
+                (id, project_id, component, version, object_key, sha256, content_type, signature, size_bytes, active, uploaded_at, verified_at, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+             RETURNING id, project_id, component, version, object_key, sha256, content_type, signature, size_bytes, active, uploaded_at, verified_at, created_at",
         )
         .bind(artifact.id)
         .bind(artifact.project_id)
@@ -1245,8 +1629,12 @@ impl PgStore {
         .bind(&artifact.version)
         .bind(&artifact.object_key)
         .bind(&artifact.sha256)
+        .bind(&artifact.content_type)
+        .bind(&artifact.signature)
         .bind(artifact.size_bytes)
         .bind(artifact.active)
+        .bind(artifact.uploaded_at)
+        .bind(artifact.verified_at)
         .bind(artifact.created_at)
         .fetch_one(&self.pool)
         .await
@@ -1254,9 +1642,57 @@ impl PgStore {
         map_firmware(&row)
     }
 
+    pub async fn finalize_firmware(
+        &self,
+        project_id: Id,
+        firmware_id: Id,
+        sha256: &str,
+        size_bytes: i64,
+        signature: Option<&str>,
+        ts: DateTime<Utc>,
+    ) -> StoreResult<FirmwareArtifact> {
+        let row = sqlx::query(
+            "UPDATE firmware_artifacts
+                SET uploaded_at = $6,
+                    verified_at = $6,
+                    active = TRUE
+              WHERE project_id = $1
+                AND id = $2
+                AND sha256 = $3
+                AND size_bytes = $4
+                AND signature IS NOT DISTINCT FROM $5
+              RETURNING id, project_id, component, version, object_key, sha256, content_type, signature, size_bytes, active, uploaded_at, verified_at, created_at",
+        )
+        .bind(project_id)
+        .bind(firmware_id)
+        .bind(sha256)
+        .bind(size_bytes)
+        .bind(signature)
+        .bind(ts)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "firmware"))?;
+        match row {
+            Some(row) => map_firmware(&row),
+            None => {
+                if sqlx::query("SELECT 1 FROM firmware_artifacts WHERE project_id = $1 AND id = $2")
+                    .bind(project_id)
+                    .bind(firmware_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|error| map_sqlx_error(error, "firmware"))?
+                    .is_none()
+                {
+                    return Err(StoreError::NotFound("firmware"));
+                }
+                Err(StoreError::Conflict("firmware verification"))
+            }
+        }
+    }
+
     pub async fn list_firmware(&self, project_id: Id) -> StoreResult<Vec<FirmwareArtifact>> {
         let rows = sqlx::query(
-            "SELECT id, project_id, component, version, object_key, sha256, size_bytes, active, created_at
+            "SELECT id, project_id, component, version, object_key, sha256, content_type, signature, size_bytes, active, uploaded_at, verified_at, created_at
              FROM firmware_artifacts
              WHERE project_id = $1
              ORDER BY created_at DESC, id",
@@ -1266,6 +1702,71 @@ impl PgStore {
         .await
         .map_err(|error| map_sqlx_error(error, "firmware"))?;
         rows.iter().map(map_firmware).collect()
+    }
+
+    pub async fn create_firmware_rollout(
+        &self,
+        rollout: FirmwareRollout,
+    ) -> StoreResult<FirmwareRollout> {
+        self.ensure_project_exists(rollout.project_id).await?;
+        if sqlx::query("SELECT 1 FROM firmware_artifacts WHERE project_id = $1 AND id = $2")
+            .bind(rollout.project_id)
+            .bind(rollout.firmware_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| map_sqlx_error(error, "firmware"))?
+            .is_none()
+        {
+            return Err(StoreError::NotFound("firmware"));
+        }
+        if sqlx::query("SELECT 1 FROM actions WHERE project_id = $1 AND id = $2")
+            .bind(rollout.project_id)
+            .bind(rollout.action_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| map_sqlx_error(error, "action"))?
+            .is_none()
+        {
+            return Err(StoreError::NotFound("action"));
+        }
+        let row = sqlx::query(
+            "INSERT INTO firmware_rollouts
+                (id, project_id, firmware_id, action_id, cohort_size, strategy, rollback_strategy, state, created_by, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8::firmware_rollout_state, $9, $10, $11)
+             RETURNING id, project_id, firmware_id, action_id, cohort_size, strategy, rollback_strategy, state::text AS state, created_by, created_at, updated_at",
+        )
+        .bind(rollout.id)
+        .bind(rollout.project_id)
+        .bind(rollout.firmware_id)
+        .bind(rollout.action_id)
+        .bind(rollout.cohort_size)
+        .bind(&rollout.strategy)
+        .bind(&rollout.rollback_strategy)
+        .bind(firmware_rollout_state_to_db(&rollout.state))
+        .bind(rollout.created_by)
+        .bind(rollout.created_at)
+        .bind(rollout.updated_at)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "firmware rollout"))?;
+        map_firmware_rollout(&row)
+    }
+
+    pub async fn list_firmware_rollouts(
+        &self,
+        project_id: Id,
+    ) -> StoreResult<Vec<FirmwareRollout>> {
+        let rows = sqlx::query(
+            "SELECT id, project_id, firmware_id, action_id, cohort_size, strategy, rollback_strategy, state::text AS state, created_by, created_at, updated_at
+             FROM firmware_rollouts
+             WHERE project_id = $1
+             ORDER BY created_at DESC, id",
+        )
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "firmware rollout"))?;
+        rows.iter().map(map_firmware_rollout).collect()
     }
 
     pub async fn create_alert(&self, alert: AlertRule) -> StoreResult<AlertRule> {
@@ -1301,6 +1802,163 @@ impl PgStore {
         rows.iter().map(map_alert).collect()
     }
 
+    pub async fn list_enabled_alerts(&self) -> StoreResult<Vec<AlertRule>> {
+        let rows = sqlx::query(
+            "SELECT id, project_id, name, kind::text AS kind, expression, enabled
+             FROM alert_rules
+             WHERE enabled = TRUE
+             ORDER BY project_id, id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "alert"))?;
+        rows.iter().map(map_alert).collect()
+    }
+
+    pub async fn upsert_firing_alert_event(&self, event: AlertEvent) -> StoreResult<AlertEvent> {
+        self.ensure_project_exists(event.project_id).await?;
+        let update_row = sqlx::query(
+            "UPDATE alert_events
+                SET state = 'firing'::alert_event_state,
+                    message = $4,
+                    observed_value = $5,
+                    threshold = $6,
+                    last_seen_at = $7,
+                    last_notification_error = NULL
+              WHERE project_id = $1
+                AND alert_rule_id = $2
+                AND dedupe_key = $3
+                AND resolved_at IS NULL
+              RETURNING id, project_id, alert_rule_id, device_id, dedupe_key, state::text AS state, message, observed_value, threshold, opened_at, resolved_at, last_seen_at, notification_attempts, last_notification_error",
+        )
+        .bind(event.project_id)
+        .bind(event.alert_rule_id)
+        .bind(&event.dedupe_key)
+        .bind(&event.message)
+        .bind(event.observed_value)
+        .bind(event.threshold)
+        .bind(event.last_seen_at)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "alert event"))?;
+        if let Some(row) = update_row {
+            return map_alert_event(&row);
+        }
+
+        let row = sqlx::query(
+            "INSERT INTO alert_events
+                (id, project_id, alert_rule_id, device_id, dedupe_key, state, message, observed_value, threshold, opened_at, resolved_at, last_seen_at, notification_attempts, last_notification_error)
+             VALUES ($1, $2, $3, $4, $5, $6::alert_event_state, $7, $8, $9, $10, $11, $12, $13, $14)
+             RETURNING id, project_id, alert_rule_id, device_id, dedupe_key, state::text AS state, message, observed_value, threshold, opened_at, resolved_at, last_seen_at, notification_attempts, last_notification_error",
+        )
+        .bind(event.id)
+        .bind(event.project_id)
+        .bind(event.alert_rule_id)
+        .bind(event.device_id)
+        .bind(&event.dedupe_key)
+        .bind(alert_event_state_to_db(&event.state))
+        .bind(&event.message)
+        .bind(event.observed_value)
+        .bind(event.threshold)
+        .bind(event.opened_at)
+        .bind(event.resolved_at)
+        .bind(event.last_seen_at)
+        .bind(event.notification_attempts)
+        .bind(&event.last_notification_error)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "alert event"))?;
+        map_alert_event(&row)
+    }
+
+    pub async fn resolve_alert_event(
+        &self,
+        project_id: Id,
+        alert_rule_id: Id,
+        dedupe_key: &str,
+        ts: DateTime<Utc>,
+    ) -> StoreResult<Option<AlertEvent>> {
+        let row = sqlx::query(
+            "UPDATE alert_events
+                SET state = 'resolved'::alert_event_state,
+                    resolved_at = $4,
+                    last_seen_at = $4
+              WHERE project_id = $1
+                AND alert_rule_id = $2
+                AND dedupe_key = $3
+                AND resolved_at IS NULL
+              RETURNING id, project_id, alert_rule_id, device_id, dedupe_key, state::text AS state, message, observed_value, threshold, opened_at, resolved_at, last_seen_at, notification_attempts, last_notification_error",
+        )
+        .bind(project_id)
+        .bind(alert_rule_id)
+        .bind(dedupe_key)
+        .bind(ts)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "alert event"))?;
+        row.map(|row| map_alert_event(&row)).transpose()
+    }
+
+    pub async fn list_alert_events(
+        &self,
+        project_id: Id,
+        state_filter: Option<AlertEventState>,
+    ) -> StoreResult<Vec<AlertEvent>> {
+        let rows = match state_filter {
+            Some(state_filter) => {
+                sqlx::query(
+                    "SELECT id, project_id, alert_rule_id, device_id, dedupe_key, state::text AS state, message, observed_value, threshold, opened_at, resolved_at, last_seen_at, notification_attempts, last_notification_error
+                     FROM alert_events
+                     WHERE project_id = $1 AND state = $2::alert_event_state
+                     ORDER BY last_seen_at DESC, id",
+                )
+                .bind(project_id)
+                .bind(alert_event_state_to_db(&state_filter))
+                .fetch_all(&self.pool)
+                .await
+            }
+            None => {
+                sqlx::query(
+                    "SELECT id, project_id, alert_rule_id, device_id, dedupe_key, state::text AS state, message, observed_value, threshold, opened_at, resolved_at, last_seen_at, notification_attempts, last_notification_error
+                     FROM alert_events
+                     WHERE project_id = $1
+                     ORDER BY last_seen_at DESC, id",
+                )
+                .bind(project_id)
+                .fetch_all(&self.pool)
+                .await
+            }
+        }
+        .map_err(|error| map_sqlx_error(error, "alert event"))?;
+        rows.iter().map(map_alert_event).collect()
+    }
+
+    pub async fn record_alert_notification_attempt(
+        &self,
+        project_id: Id,
+        alert_event_id: Id,
+        error: Option<String>,
+        ts: DateTime<Utc>,
+    ) -> StoreResult<AlertEvent> {
+        let row = sqlx::query(
+            "UPDATE alert_events
+                SET notification_attempts = notification_attempts + 1,
+                    last_notification_error = $3,
+                    last_seen_at = GREATEST(last_seen_at, $4)
+              WHERE project_id = $1 AND id = $2
+              RETURNING id, project_id, alert_rule_id, device_id, dedupe_key, state::text AS state, message, observed_value, threshold, opened_at, resolved_at, last_seen_at, notification_attempts, last_notification_error",
+        )
+        .bind(project_id)
+        .bind(alert_event_id)
+        .bind(error)
+        .bind(ts)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "alert event"))?
+        .ok_or(StoreError::NotFound("alert event"))?;
+        map_alert_event(&row)
+    }
+
     pub async fn create_dashboard(&self, dashboard: Dashboard) -> StoreResult<Dashboard> {
         self.ensure_project_exists(dashboard.project_id).await?;
         let row = sqlx::query(
@@ -1330,6 +1988,129 @@ impl PgStore {
         .await
         .map_err(|error| map_sqlx_error(error, "dashboard"))?;
         rows.iter().map(map_dashboard).collect()
+    }
+
+    pub async fn create_diagnostics_session(
+        &self,
+        session: DiagnosticsSession,
+    ) -> StoreResult<DiagnosticsSession> {
+        if sqlx::query("SELECT 1 FROM devices WHERE project_id = $1 AND id = $2")
+            .bind(session.project_id)
+            .bind(session.device_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| map_sqlx_error(error, "device"))?
+            .is_none()
+        {
+            return Err(StoreError::NotFound("device"));
+        }
+        if let Some(action_id) = session.action_id
+            && sqlx::query("SELECT 1 FROM actions WHERE project_id = $1 AND id = $2")
+                .bind(session.project_id)
+                .bind(action_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|error| map_sqlx_error(error, "action"))?
+                .is_none()
+        {
+            return Err(StoreError::NotFound("action"));
+        }
+        let row = sqlx::query(
+            "INSERT INTO diagnostics_sessions
+                (id, project_id, device_id, action_id, object_key, state, upload_url_expires_at, download_url_expires_at, size_bytes, sha256, error, created_by, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6::diagnostics_session_state, $7, $8, $9, $10, $11, $12, $13, $14)
+             RETURNING id, project_id, device_id, action_id, object_key, state::text AS state, upload_url_expires_at, download_url_expires_at, size_bytes, sha256, error, created_by, created_at, updated_at",
+        )
+        .bind(session.id)
+        .bind(session.project_id)
+        .bind(session.device_id)
+        .bind(session.action_id)
+        .bind(&session.object_key)
+        .bind(diagnostics_session_state_to_db(&session.state))
+        .bind(session.upload_url_expires_at)
+        .bind(session.download_url_expires_at)
+        .bind(session.size_bytes)
+        .bind(&session.sha256)
+        .bind(&session.error)
+        .bind(session.created_by)
+        .bind(session.created_at)
+        .bind(session.updated_at)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "diagnostics session"))?;
+        map_diagnostics_session(&row)
+    }
+
+    pub async fn update_diagnostics_session(
+        &self,
+        session: DiagnosticsSession,
+    ) -> StoreResult<DiagnosticsSession> {
+        let row = sqlx::query(
+            "UPDATE diagnostics_sessions
+                SET action_id = $3,
+                    object_key = $4,
+                    state = $5::diagnostics_session_state,
+                    upload_url_expires_at = $6,
+                    download_url_expires_at = $7,
+                    size_bytes = $8,
+                    sha256 = $9,
+                    error = $10,
+                    updated_at = $11
+              WHERE project_id = $1 AND id = $2
+              RETURNING id, project_id, device_id, action_id, object_key, state::text AS state, upload_url_expires_at, download_url_expires_at, size_bytes, sha256, error, created_by, created_at, updated_at",
+        )
+        .bind(session.project_id)
+        .bind(session.id)
+        .bind(session.action_id)
+        .bind(&session.object_key)
+        .bind(diagnostics_session_state_to_db(&session.state))
+        .bind(session.upload_url_expires_at)
+        .bind(session.download_url_expires_at)
+        .bind(session.size_bytes)
+        .bind(&session.sha256)
+        .bind(&session.error)
+        .bind(session.updated_at)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "diagnostics session"))?
+        .ok_or(StoreError::NotFound("diagnostics session"))?;
+        map_diagnostics_session(&row)
+    }
+
+    pub async fn get_diagnostics_session(
+        &self,
+        project_id: Id,
+        session_id: Id,
+    ) -> StoreResult<DiagnosticsSession> {
+        let row = sqlx::query(
+            "SELECT id, project_id, device_id, action_id, object_key, state::text AS state, upload_url_expires_at, download_url_expires_at, size_bytes, sha256, error, created_by, created_at, updated_at
+             FROM diagnostics_sessions
+             WHERE project_id = $1 AND id = $2",
+        )
+        .bind(project_id)
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "diagnostics session"))?
+        .ok_or(StoreError::NotFound("diagnostics session"))?;
+        map_diagnostics_session(&row)
+    }
+
+    pub async fn list_diagnostics_sessions(
+        &self,
+        project_id: Id,
+    ) -> StoreResult<Vec<DiagnosticsSession>> {
+        let rows = sqlx::query(
+            "SELECT id, project_id, device_id, action_id, object_key, state::text AS state, upload_url_expires_at, download_url_expires_at, size_bytes, sha256, error, created_by, created_at, updated_at
+             FROM diagnostics_sessions
+             WHERE project_id = $1
+             ORDER BY updated_at DESC, id",
+        )
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "diagnostics session"))?;
+        rows.iter().map(map_diagnostics_session).collect()
     }
 
     pub async fn append_audit(&self, audit: AuditLog) -> StoreResult<AuditLog> {

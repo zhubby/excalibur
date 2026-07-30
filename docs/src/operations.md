@@ -6,9 +6,9 @@
 
 | 服务 | 健康信号 |
 | --- | --- |
-| API | `GET /health` 返回 `{"status":"ok","service":"excalibur-api"}`。 |
+| API | `GET /health` 返回 `{"status":"ok","service":"excalibur-api"}`；`GET /ready` 会检查 store；`GET /metrics` 暴露 Prometheus text baseline。 |
 | MQTT ingest | 进程启动日志包含 adapter ready；生产应暴露 metrics/health。 |
-| Worker | 当前每 30s debug heartbeat；生产应暴露 queue lag、job count、error rate。 |
+| Worker | 每 30s debug heartbeat；当前负责 JetStream batch writer、action dispatcher/timeout sweeper 和 alert evaluator。 |
 | Frontend | Next.js build 和 HTTP readiness。 |
 | TimescaleDB | `pg_isready`、连接池、chunk/retention/compression 状态。 |
 | NATS | JetStream health、consumer lag、ack pending。 |
@@ -38,7 +38,14 @@ Rust 服务使用 `tracing` 和 env filter：
 
 ## Metrics
 
-建议核心指标：
+当前 API 已暴露第一版 Prometheus text：
+
+| 指标 | 说明 |
+| --- | --- |
+| `excalibur_api_uptime_seconds` | API 进程 uptime。 |
+| `excalibur_api_auth_rate_limit_keys` | 当前 auth rate limit bucket 数量。 |
+
+生产继续补齐的核心指标：
 
 | 指标 | 维度 |
 | --- | --- |
@@ -54,6 +61,8 @@ Rust 服务使用 `tracing` 和 env filter：
 | `action_state_total` | action name、state。 |
 | `ota_failures_total` | component、reason。 |
 | `alert_notifications_total` | provider、result。 |
+
+Alert event 表会记录 `notification_attempts` 和 `last_notification_error`，用于观察 notification retry。
 
 ## Alerts
 
@@ -119,3 +128,23 @@ SELECT * FROM timescaledb_information.compression_settings;
 - Failure：数据库慢写、NATS broker 重启、MQTT reconnect storm。
 
 验收不能只看平均值，应看 p95/p99、重试堆积和恢复时间。
+
+当前仓库提供 `scripts/api-load-smoke.sh` 作为 HTTP ingest smoke/load-test 起点。它会注册/登录、创建默认 org/project/device、批量写入 telemetry，并输出设备数、点数和耗时。它不能替代 MQTT mTLS 连接压测，但能快速验证 API、store、Timescale ingest 和 dashboard aggregate 的基础吞吐。
+
+```bash
+API_BASE_URL=http://localhost:8080 \
+EXCALIBUR_LOAD_DEVICE_COUNT=100 \
+EXCALIBUR_LOAD_POINTS_PER_DEVICE=100 \
+scripts/api-load-smoke.sh
+```
+
+## Go/No-Go checklist
+
+上线前必须逐项确认：
+
+- `cargo test --workspace --all-features`、frontend typecheck/build、Helm lint/template、mdBook build 全部通过。
+- `/ready`、`/metrics`、NATS JetStream health、Timescale policy jobs、RustFS bucket health 可观测。
+- 最近一次 restore drill 完成，能恢复 Timescale schema、telemetry hypertable 和 object metadata。
+- Auth rate limit、API key scope、mTLS ACL、OTA/diagnostics audit 在 staging 验证通过。
+- Load smoke 和 MQTT simulator 压测记录 p95/p99、consumer lag、Timescale write duration 和恢复时间。
+- 所有生产 secret 来自 Kubernetes Secret/ExternalSecret，values 中没有真实凭证。

@@ -60,6 +60,22 @@ pub struct TelemetryRecord {
     pub fields: Map<String, Value>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TelemetryIngestEnvelope {
+    pub project_id: Id,
+    pub device_id: Id,
+    pub stream: String,
+    pub points: Vec<TelemetryIngestPoint>,
+    pub received_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TelemetryIngestPoint {
+    pub sequence: i64,
+    pub timestamp: DateTime<Utc>,
+    pub payload: Value,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CommandStatusRecord {
     pub action_id: Id,
@@ -90,6 +106,9 @@ pub struct DeviceAgentAuthConfig {
     pub port: u16,
     pub project_id: Id,
     pub device_id: Id,
+    pub certificate_id: Id,
+    pub certificate_fingerprint_sha256: String,
+    pub certificate_not_after: DateTime<Utc>,
     pub authentication: DeviceAgentAuthentication,
     pub provisioning_mode: ProvisioningMode,
     pub production: bool,
@@ -103,6 +122,14 @@ pub struct DeviceCommand {
     pub name: String,
     #[serde(default)]
     pub payload: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DeviceCommandEnvelope {
+    pub project_id: Id,
+    pub device_id: Id,
+    pub topic: String,
+    pub command: DeviceCommand,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -448,6 +475,9 @@ mod tests {
             port: 8883,
             project_id: Uuid::now_v7(),
             device_id: Uuid::now_v7(),
+            certificate_id: Uuid::now_v7(),
+            certificate_fingerprint_sha256: "a".repeat(64),
+            certificate_not_after: Utc::now(),
             authentication: DeviceAgentAuthentication {
                 ca_certificate: "ca".to_owned(),
                 device_certificate: "cert".to_owned(),

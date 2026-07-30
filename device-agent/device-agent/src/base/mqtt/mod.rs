@@ -333,6 +333,13 @@ fn mqttoptions(config: &Config, device_config: &DeviceConfig) -> MqttOptions {
     mqttoptions.set_max_packet_size(config.mqtt.max_packet_size, config.mqtt.max_packet_size);
     mqttoptions.set_keep_alive(Duration::from_secs(config.mqtt.keep_alive));
     mqttoptions.set_inflight(config.mqtt.max_inflight);
+    if let Some(fingerprint) = device_config
+        .certificate_fingerprint_sha256
+        .as_deref()
+        .filter(|fingerprint| !fingerprint.trim().is_empty())
+    {
+        mqttoptions.set_credentials(fingerprint, "");
+    }
 
     if let Some(auth) = device_config.authentication.clone() {
         let ca = auth.ca_certificate.into_bytes();

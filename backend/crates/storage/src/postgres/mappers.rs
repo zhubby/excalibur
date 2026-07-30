@@ -1,7 +1,8 @@
 use excalibur_domain::{
-    Action, ActionState, AlertRule, ApiKey, AuditLog, CertificateStatus, Dashboard, Device,
-    DeviceCertificate, DeviceStatus, FirmwareArtifact, Id, Membership, Org, Project, Role,
-    StreamDefinition, TelemetryPoint, User, UserSession,
+    Action, ActionState, AlertEvent, AlertEventState, AlertRule, ApiKey, AuditLog,
+    CertificateStatus, Dashboard, Device, DeviceCertificate, DeviceStatus, DiagnosticsSession,
+    DiagnosticsSessionState, FirmwareArtifact, FirmwareRollout, FirmwareRolloutState, Id,
+    Membership, Org, Project, Role, StreamDefinition, TelemetryPoint, User, UserSession,
 };
 use serde_json::Value;
 use sqlx::{Row, postgres::PgRow};
@@ -113,6 +114,79 @@ pub(super) fn alert_kind_from_db(value: &str) -> StoreResult<excalibur_domain::A
         "threshold" => Ok(excalibur_domain::AlertKind::Threshold),
         "window_aggregation" => Ok(excalibur_domain::AlertKind::WindowAggregation),
         _ => Err(StoreError::Database(format!("unknown alert kind: {value}"))),
+    }
+}
+
+pub(super) fn alert_event_state_to_db(state: &AlertEventState) -> &'static str {
+    match state {
+        AlertEventState::Firing => "firing",
+        AlertEventState::Resolved => "resolved",
+    }
+}
+
+pub(super) fn alert_event_state_from_db(value: &str) -> StoreResult<AlertEventState> {
+    match value {
+        "firing" => Ok(AlertEventState::Firing),
+        "resolved" => Ok(AlertEventState::Resolved),
+        _ => Err(StoreError::Database(format!(
+            "unknown alert event state: {value}"
+        ))),
+    }
+}
+
+pub(super) fn diagnostics_session_state_to_db(state: &DiagnosticsSessionState) -> &'static str {
+    match state {
+        DiagnosticsSessionState::Requested => "requested",
+        DiagnosticsSessionState::UploadPending => "upload_pending",
+        DiagnosticsSessionState::Uploaded => "uploaded",
+        DiagnosticsSessionState::Completed => "completed",
+        DiagnosticsSessionState::Failed => "failed",
+        DiagnosticsSessionState::Cancelled => "cancelled",
+        DiagnosticsSessionState::Expired => "expired",
+    }
+}
+
+pub(super) fn diagnostics_session_state_from_db(
+    value: &str,
+) -> StoreResult<DiagnosticsSessionState> {
+    match value {
+        "requested" => Ok(DiagnosticsSessionState::Requested),
+        "upload_pending" => Ok(DiagnosticsSessionState::UploadPending),
+        "uploaded" => Ok(DiagnosticsSessionState::Uploaded),
+        "completed" => Ok(DiagnosticsSessionState::Completed),
+        "failed" => Ok(DiagnosticsSessionState::Failed),
+        "cancelled" => Ok(DiagnosticsSessionState::Cancelled),
+        "expired" => Ok(DiagnosticsSessionState::Expired),
+        _ => Err(StoreError::Database(format!(
+            "unknown diagnostics session state: {value}"
+        ))),
+    }
+}
+
+pub(super) fn firmware_rollout_state_to_db(state: &FirmwareRolloutState) -> &'static str {
+    match state {
+        FirmwareRolloutState::Planned => "planned",
+        FirmwareRolloutState::WaitingApproval => "waiting_approval",
+        FirmwareRolloutState::Running => "running",
+        FirmwareRolloutState::Completed => "completed",
+        FirmwareRolloutState::Failed => "failed",
+        FirmwareRolloutState::Cancelled => "cancelled",
+        FirmwareRolloutState::RolledBack => "rolled_back",
+    }
+}
+
+pub(super) fn firmware_rollout_state_from_db(value: &str) -> StoreResult<FirmwareRolloutState> {
+    match value {
+        "planned" => Ok(FirmwareRolloutState::Planned),
+        "waiting_approval" => Ok(FirmwareRolloutState::WaitingApproval),
+        "running" => Ok(FirmwareRolloutState::Running),
+        "completed" => Ok(FirmwareRolloutState::Completed),
+        "failed" => Ok(FirmwareRolloutState::Failed),
+        "cancelled" => Ok(FirmwareRolloutState::Cancelled),
+        "rolled_back" => Ok(FirmwareRolloutState::RolledBack),
+        _ => Err(StoreError::Database(format!(
+            "unknown firmware rollout state: {value}"
+        ))),
     }
 }
 
@@ -270,9 +344,30 @@ pub(super) fn map_firmware(row: &PgRow) -> StoreResult<FirmwareArtifact> {
         version: row.try_get("version").map_err(map_decode_error)?,
         object_key: row.try_get("object_key").map_err(map_decode_error)?,
         sha256: row.try_get("sha256").map_err(map_decode_error)?,
+        content_type: row.try_get("content_type").map_err(map_decode_error)?,
+        signature: row.try_get("signature").map_err(map_decode_error)?,
         size_bytes: row.try_get("size_bytes").map_err(map_decode_error)?,
         active: row.try_get("active").map_err(map_decode_error)?,
+        uploaded_at: row.try_get("uploaded_at").map_err(map_decode_error)?,
+        verified_at: row.try_get("verified_at").map_err(map_decode_error)?,
         created_at: row.try_get("created_at").map_err(map_decode_error)?,
+    })
+}
+
+pub(super) fn map_firmware_rollout(row: &PgRow) -> StoreResult<FirmwareRollout> {
+    let state: String = row.try_get("state").map_err(map_decode_error)?;
+    Ok(FirmwareRollout {
+        id: row.try_get("id").map_err(map_decode_error)?,
+        project_id: row.try_get("project_id").map_err(map_decode_error)?,
+        firmware_id: row.try_get("firmware_id").map_err(map_decode_error)?,
+        action_id: row.try_get("action_id").map_err(map_decode_error)?,
+        cohort_size: row.try_get("cohort_size").map_err(map_decode_error)?,
+        strategy: row.try_get("strategy").map_err(map_decode_error)?,
+        rollback_strategy: row.try_get("rollback_strategy").map_err(map_decode_error)?,
+        state: firmware_rollout_state_from_db(&state)?,
+        created_by: row.try_get("created_by").map_err(map_decode_error)?,
+        created_at: row.try_get("created_at").map_err(map_decode_error)?,
+        updated_at: row.try_get("updated_at").map_err(map_decode_error)?,
     })
 }
 
@@ -288,12 +383,60 @@ pub(super) fn map_alert(row: &PgRow) -> StoreResult<AlertRule> {
     })
 }
 
+pub(super) fn map_alert_event(row: &PgRow) -> StoreResult<AlertEvent> {
+    let state: String = row.try_get("state").map_err(map_decode_error)?;
+    Ok(AlertEvent {
+        id: row.try_get("id").map_err(map_decode_error)?,
+        project_id: row.try_get("project_id").map_err(map_decode_error)?,
+        alert_rule_id: row.try_get("alert_rule_id").map_err(map_decode_error)?,
+        device_id: row.try_get("device_id").map_err(map_decode_error)?,
+        dedupe_key: row.try_get("dedupe_key").map_err(map_decode_error)?,
+        state: alert_event_state_from_db(&state)?,
+        message: row.try_get("message").map_err(map_decode_error)?,
+        observed_value: row.try_get("observed_value").map_err(map_decode_error)?,
+        threshold: row.try_get("threshold").map_err(map_decode_error)?,
+        opened_at: row.try_get("opened_at").map_err(map_decode_error)?,
+        resolved_at: row.try_get("resolved_at").map_err(map_decode_error)?,
+        last_seen_at: row.try_get("last_seen_at").map_err(map_decode_error)?,
+        notification_attempts: row
+            .try_get("notification_attempts")
+            .map_err(map_decode_error)?,
+        last_notification_error: row
+            .try_get("last_notification_error")
+            .map_err(map_decode_error)?,
+    })
+}
+
 pub(super) fn map_dashboard(row: &PgRow) -> StoreResult<Dashboard> {
     Ok(Dashboard {
         id: row.try_get("id").map_err(map_decode_error)?,
         project_id: row.try_get("project_id").map_err(map_decode_error)?,
         name: row.try_get("name").map_err(map_decode_error)?,
         layout: row.try_get("layout").map_err(map_decode_error)?,
+    })
+}
+
+pub(super) fn map_diagnostics_session(row: &PgRow) -> StoreResult<DiagnosticsSession> {
+    let state: String = row.try_get("state").map_err(map_decode_error)?;
+    Ok(DiagnosticsSession {
+        id: row.try_get("id").map_err(map_decode_error)?,
+        project_id: row.try_get("project_id").map_err(map_decode_error)?,
+        device_id: row.try_get("device_id").map_err(map_decode_error)?,
+        action_id: row.try_get("action_id").map_err(map_decode_error)?,
+        object_key: row.try_get("object_key").map_err(map_decode_error)?,
+        state: diagnostics_session_state_from_db(&state)?,
+        upload_url_expires_at: row
+            .try_get("upload_url_expires_at")
+            .map_err(map_decode_error)?,
+        download_url_expires_at: row
+            .try_get("download_url_expires_at")
+            .map_err(map_decode_error)?,
+        size_bytes: row.try_get("size_bytes").map_err(map_decode_error)?,
+        sha256: row.try_get("sha256").map_err(map_decode_error)?,
+        error: row.try_get("error").map_err(map_decode_error)?,
+        created_by: row.try_get("created_by").map_err(map_decode_error)?,
+        created_at: row.try_get("created_at").map_err(map_decode_error)?,
+        updated_at: row.try_get("updated_at").map_err(map_decode_error)?,
     })
 }
 

@@ -7,9 +7,9 @@
 | 路径 | 职责 |
 | --- | --- |
 | `backend/apps/api` | Axum API，负责 auth、RBAC、tenant scope、OpenAPI、SSE 和控制面 handler。 |
-| `backend/apps/mqtt-ingest` | 本地 `rumqttd` MQTT broker runtime，复用 broker-agnostic ACL 和 ingest 逻辑写入 Store。 |
-| `backend/apps/worker` | 后台 worker scaffold，后续负责 alert scan、action timeout、dispatcher、retention/export 等任务。 |
-| `backend/crates/domain` | 领域模型，包含 `User`、`Org`、`Project`、`Device`、`DeviceCertificate`、`StreamDefinition`、`Action`、`FirmwareArtifact`、`AlertRule`、`Dashboard`、`AuditLog`。 |
+| `backend/apps/mqtt-ingest` | 本地 `rumqttd` MQTT broker runtime，复用 broker-agnostic ACL 和 ingest 逻辑写入 Store/JetStream，并桥接 command bus 到设备 topic。 |
+| `backend/apps/worker` | 后台 worker，负责 JetStream telemetry batch writer、action dispatcher、action timeout sweeper 和 alert evaluator；后续继续承载 retention/export。 |
+| `backend/crates/domain` | 领域模型，包含 `User`、`Org`、`Project`、`Device`、`DeviceCertificate`、`StreamDefinition`、`Action`、`FirmwareArtifact`、`FirmwareRollout`、`AlertRule`、`AlertEvent`、`DiagnosticsSession`、`Dashboard`、`AuditLog`。 |
 | `backend/crates/device-protocol` | 设备 wire contract，包含 MQTT topic helper、parser、payload decoder、device auth JSON 和 action payload 类型。 |
 | `backend/crates/storage` | 提供 `MemoryStore`、`PgStore` 和统一 `Store` 包装层，并保留 Toasty integration boundary。 |
 
@@ -23,7 +23,7 @@
 4. 调用 store 层，store 层再次检查 project ownership。
 5. 对安全敏感动作写 audit log。
 
-当前 API 使用 Bearer access token 解析 actor。`STORAGE_BACKEND=memory` 时 session 保存在进程内；`STORAGE_BACKEND=timescale` 时 session、refresh token rotation/reuse detection 和 API key hash 存储在 SQL 表中。生产仍需要 HttpOnly cookie、邮箱验证、邀请流程、登录限流和 MFA。
+当前 API 使用 Bearer access token 或 HttpOnly cookie 解析 actor。`STORAGE_BACKEND=memory` 时 session 保存在进程内；`STORAGE_BACKEND=timescale` 时 session、refresh token rotation/reuse detection 和 API key hash 存储在 SQL 表中。Register/login 已有 in-memory rate limit baseline；生产仍需要邮箱验证、邀请流程、外部 rate limit 和 MFA。
 
 ## OpenAPI
 
@@ -33,7 +33,7 @@ API 使用 `utoipa` 生成 OpenAPI：
 GET /api/v1/openapi.json
 ```
 
-后续前端应基于该 OpenAPI 生成 TS client，避免手写 REST 类型漂移。
+前端已基于该 OpenAPI 生成 TS DTO，并用 thin client wrapper 调用 REST API。
 
 ## Health 与 Readiness
 
@@ -50,11 +50,11 @@ API main 会读取 `STORAGE_BACKEND`：
 | `timescale` | 使用 SQL repository，要求 `DATABASE_URL` 指向已初始化的 TimescaleDB schema；启动时执行 schema validation。 |
 | 其他 | fail fast。 |
 
-生产化前不应把 `memory` 模式暴露为真实 SaaS 环境。SQL repository 已覆盖控制面、telemetry、session/refresh-token 和 API key 表；生产还需要 cookie session 集成、登录安全策略和 API key scope enforcement 接入自动化/ingest 入口。
+生产化前不应把 `memory` 模式暴露为真实 SaaS 环境。SQL repository 已覆盖控制面、telemetry、session/refresh-token、API key、alert events、diagnostics sessions 和 firmware rollout 表；生产还需要外部登录安全策略和 API key scope enforcement 接入更多自动化/ingest 入口。
 
 ## 关键工程约束
 
 - 遥测和 Timescale 特性不通过 Toasty 抽象。
 - 控制面 repositories 可以在 `storage` 边界内替换为 Toasty/SQL 实现。
-- MQTT ingest 必须保持 project/device 作用域校验；本地 runtime 可按 topic 查 device，生产 runtime 必须额外绑定连接证书身份。
+- MQTT ingest 必须保持 project/device 作用域校验；TLS runtime 已绑定连接证书身份，明文 username-as-fingerprint 只能用于显式 dev 过渡。
 - Worker 必须以幂等方式处理 action dispatcher、timeout、alert notification 和 export。

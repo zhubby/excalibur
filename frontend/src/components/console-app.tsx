@@ -190,14 +190,6 @@ function formatCount(value: number) {
   return String(value);
 }
 
-function randomUuid() {
-  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
-    return crypto.randomUUID();
-  }
-  const suffix = Date.now().toString(16).padStart(12, "0").slice(-12);
-  return `00000000-0000-4000-8000-${suffix}`;
-}
-
 function telemetryValue(point: TelemetryPoint) {
   const payload = isRecord(point.payload) ? point.payload : null;
   return (
@@ -243,7 +235,7 @@ function toDeviceRows(devices: Device[], streams: StreamDefinition[], telemetry:
       status: normalizeDeviceStatus(device.status),
       stream: latest?.stream ?? defaultStream,
       firmware: firmwareVersion,
-      lastSeen: formatRelativeTime(device.last_seen_at),
+      lastSeen: formatRelativeTime(device.last_seen_at ?? null),
       rssi: getNumber(payload, "rssi_dbm") ?? getNumber(metadata, "rssi_dbm"),
       shadow: shadowLabel,
     };
@@ -415,26 +407,49 @@ async function ensureDefaultControlPlane(api: Api, projectId: string) {
 async function ensureFirmwareArtifact(api: Api, projectId: string) {
   const existing = await api.listFirmware(projectId);
   if (existing[0]) {
-    return existing[0];
+    if (existing[0].verified_at) {
+      return existing[0];
+    }
+    return api.finalizeFirmware(existing[0].id, {
+      project_id: projectId,
+      sha256: existing[0].sha256,
+      signature: existing[0].signature ?? null,
+      size_bytes: existing[0].size_bytes,
+    });
   }
   const created = await ignoreConflict(() =>
     api.createFirmware({
       project_id: projectId,
       component: "main",
       version: "1.0.0",
-      object_key: "firmware/main/1.0.0/excalibur-agent.bin",
+      object_key: `projects/${projectId}/firmware/main/1.0.0/excalibur-agent.bin`,
       sha256: DEFAULT_SHA256,
+      content_type: "application/octet-stream",
+      signature: "ed25519:local-dev",
       size_bytes: 1_048_576,
     }),
   );
   if (created) {
-    return created;
+    return api.finalizeFirmware(created.id, {
+      project_id: projectId,
+      sha256: created.sha256,
+      signature: created.signature ?? null,
+      size_bytes: created.size_bytes,
+    });
   }
   const retry = await api.listFirmware(projectId);
   if (!retry[0]) {
     throw new Error("firmware artifact could not be initialized");
   }
-  return retry[0];
+  if (retry[0].verified_at) {
+    return retry[0];
+  }
+  return api.finalizeFirmware(retry[0].id, {
+    project_id: projectId,
+    sha256: retry[0].sha256,
+    signature: retry[0].signature ?? null,
+    size_bytes: retry[0].size_bytes,
+  });
 }
 
 function makeSampleTelemetry(sequence: number) {
@@ -813,19 +828,14 @@ export function ConsoleApp() {
       return;
     }
     void runProjectMutation("Diagnostics action queued", async (api, activeWorkspace) => {
-      const action = await api.createAction({
+      const diagnostics = await api.createDiagnosticsSession({
         project_id: activeWorkspace.project.id,
-        device_ids: [selectedDeviceId],
-        name: "diagnostics.collect",
-        payload: {
-          session_id: randomUuid(),
-          paths: ["/var/log/excalibur-agent"],
-          include_logs: true,
-          include_system_stats: true,
-          upload_url: "http://localhost:9000/excalibur-diagnostics/session.tar.zst?dev=1",
-        },
+        device_id: selectedDeviceId,
+        paths: ["/var/log/excalibur-agent"],
+        include_logs: true,
+        include_system_stats: true,
       });
-      await api.updateActionStatus(action.id, {
+      await api.updateActionStatus(diagnostics.action.id, {
         project_id: activeWorkspace.project.id,
         device_id: selectedDeviceId,
         state: "Running",
@@ -841,21 +851,12 @@ export function ConsoleApp() {
     }
     void runProjectMutation("OTA action queued", async (api, activeWorkspace) => {
       const firmware = await ensureFirmwareArtifact(api, activeWorkspace.project.id);
-      const action = await api.createAction({
+      const rollout = await api.createFirmwareRollout(firmware.id, {
         project_id: activeWorkspace.project.id,
         device_ids: [selectedDeviceId],
-        name: "ota.install",
-        payload: {
-          firmware_id: firmware.id,
-          component: firmware.component,
-          version: firmware.version,
-          signed_url: `http://localhost:9000/excalibur-firmware/${firmware.object_key}?dev=1`,
-          sha256: firmware.sha256,
-          signature: "ed25519:local-dev",
-          size_bytes: firmware.size_bytes,
-        },
+        rollback_strategy: "previous_version",
       });
-      await api.updateActionStatus(action.id, {
+      await api.updateActionStatus(rollout.action_id, {
         project_id: activeWorkspace.project.id,
         device_id: selectedDeviceId,
         state: "Running",
@@ -926,19 +927,14 @@ export function ConsoleApp() {
         topic: telemetryTopic(activeWorkspace.project.id, device.id, SYSTEM_STREAM),
         payload: [makeSampleTelemetry(sequence)],
       });
-      const diagnostics = await api.createAction({
+      const diagnostics = await api.createDiagnosticsSession({
         project_id: activeWorkspace.project.id,
-        device_ids: [device.id],
-        name: "diagnostics.collect",
-        payload: {
-          session_id: randomUuid(),
-          paths: ["/var/log/excalibur-agent"],
-          include_logs: true,
-          include_system_stats: true,
-          upload_url: "http://localhost:9000/excalibur-diagnostics/bootstrap.tar.zst?dev=1",
-        },
+        device_id: device.id,
+        paths: ["/var/log/excalibur-agent"],
+        include_logs: true,
+        include_system_stats: true,
       });
-      await api.updateActionStatus(diagnostics.id, {
+      await api.updateActionStatus(diagnostics.action.id, {
         project_id: activeWorkspace.project.id,
         device_id: device.id,
         state: "Completed",

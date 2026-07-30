@@ -22,7 +22,7 @@
 - access token 临近过期时调用 cookie-backed `/auth/refresh` 轮换；登出时调用 `/auth/logout` 撤销服务端 session 并清理 cookies。
 - 空库启动时自动创建默认 org/project/stream/alert/dashboard。
 - 设备创建、dev auth JSON 下载、shadow/telemetry HTTP ingest。
-- diagnostics/OTA action 创建和 action status 回写。
+- diagnostics session 创建、OTA rollout 创建和 action status 回写。
 - fleet metrics、telemetry trend、device table、agent panel、actions、alerts、protocol topic 和 audit log 展示。
 
 API base URL 默认来自 `NEXT_PUBLIC_API_BASE_URL`，未设置时使用 `http://localhost:8080`。Console API client 默认使用 `credentials: "include"`，因此跨端口本地开发需要 API CORS 允许 credentials。
@@ -41,7 +41,7 @@ API base URL 默认来自 `NEXT_PUBLIC_API_BASE_URL`，未设置时使用 `http:
 | `AlertPanel` | alert rule 状态摘要。 |
 | `ConsoleApp` | 认证、workspace bootstrap、API 调用、数据刷新和本地闭环动作编排。 |
 
-`frontend/src/lib/api.ts` 是手写的第一版 TS client，覆盖当前 Axum API。后续仍应从 `/api/v1/openapi.json` 生成 client，避免 DTO 漂移。
+`frontend/src/lib/generated/api-types.ts` 从 `/api/v1/openapi.json` 生成 DTO；`frontend/src/lib/api.ts` 是 thin client wrapper，保留较稳定的调用方法和旧别名，避免 UI 直接依赖手写 DTO。
 
 ## Protocol helper
 
@@ -60,13 +60,12 @@ API base URL 默认来自 `NEXT_PUBLIC_API_BASE_URL`，未设置时使用 `http:
 
 生产前端应：
 
-1. 从 `/api/v1/openapi.json` 生成 TS client。
-2. 用 HttpOnly cookie session，避免在 JS 中持有长期 token。
-3. 对 project switch 做全局 context。
-4. 所有请求显式带 `project_id` 或 `org_id`。
-5. 对 RBAC 禁用按钮和路由，而不仅是隐藏入口。
-6. 对 SSE 建立单 project connection。
-7. Remote shell 使用单独 WebSocket tunnel，并且只在 beta flag 和权限满足时显示。
+1. 从 OpenAPI 继续生成 DTO，并逐步生成 request client。
+2. 对 project switch 做全局 context。
+3. 所有请求显式带 `project_id` 或 `org_id`。
+4. 对 RBAC 禁用按钮和路由，而不仅是隐藏入口。
+5. 对 SSE 建立单 project connection。
+6. Remote shell 使用单独 WebSocket tunnel，并且只在 beta flag 和权限满足时显示。
 
 ## UI 设计原则
 

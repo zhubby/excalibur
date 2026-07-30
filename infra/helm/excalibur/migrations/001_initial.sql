@@ -147,6 +147,7 @@ CREATE TABLE action_targets (
 );
 CREATE INDEX action_targets_project_state_idx ON action_targets (project_id, state, updated_at DESC);
 CREATE INDEX action_targets_device_idx ON action_targets (project_id, device_id, updated_at DESC);
+CREATE INDEX action_targets_state_updated_idx ON action_targets (state, updated_at ASC, action_id, device_id);
 
 CREATE TABLE firmware_artifacts (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

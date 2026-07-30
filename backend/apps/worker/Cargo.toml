@@ -6,7 +6,13 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
+excalibur-device-protocol = { path = "../../crates/device-protocol" }
+excalibur-domain = { path = "../../crates/domain" }
+excalibur-mqtt-ingest = { path = "../mqtt-ingest", default-features = false }
+excalibur-nats-lite = { path = "../../crates/nats-lite" }
+excalibur-storage = { path = "../../crates/storage" }
+serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-

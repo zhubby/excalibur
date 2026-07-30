@@ -670,7 +670,8 @@ mod tests {
             "project_id": "project-a",
             "device_id": "device-1",
             "broker": "mqtt.local",
-            "port": 8883
+            "port": 8883,
+            "certificate_fingerprint_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         }"#;
         let config_toml = format!(
             r#"
@@ -682,7 +683,7 @@ mod tests {
             temp_dir.path().display()
         );
 
-        let (config, _) = parse_config(device_json, &config_toml).unwrap();
+        let (config, device_config) = parse_config(device_json, &config_toml).unwrap();
         let topics = [
             config.actions_subscription.as_str(),
             config.streams["custom"].topic.as_str(),
@@ -705,6 +706,10 @@ mod tests {
         assert_eq!(
             config.streams["action_status"].topic,
             "v1/p/project-a/d/device-1/commands/status"
+        );
+        assert_eq!(
+            device_config.certificate_fingerprint_sha256.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         );
     }
 }

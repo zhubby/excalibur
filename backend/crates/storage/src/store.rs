@@ -1,7 +1,10 @@
+use chrono::{DateTime, Utc};
 use excalibur_domain::{
-    Action, ActionStatusUpdate, AlertRule, ApiKey, AuditLog, Dashboard, Device, DeviceCertificate,
-    FirmwareArtifact, Id, Membership, Org, Project, Role, StreamDefinition, TelemetryPoint, User,
-    UserSession,
+    Action, ActionDispatchTarget, ActionStatusUpdate, ActionTargetStatusChange,
+    ActionTargetTransition, AlertEvent, AlertEventState, AlertRule, ApiKey, AuditLog, Dashboard,
+    Device, DeviceCertificate, DiagnosticsSession, FirmwareArtifact, FirmwareRollout, Id,
+    Membership, Org, Project, Role, StreamDefinition, TelemetryAggregateBucket, TelemetryPoint,
+    User, UserSession,
 };
 use serde_json::Value;
 
@@ -334,6 +337,48 @@ impl Store {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn aggregate_telemetry(
+        &self,
+        project_id: Id,
+        device_id: Option<Id>,
+        stream: &str,
+        field: Option<&str>,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        bucket_seconds: i64,
+        limit: usize,
+    ) -> StoreResult<Vec<TelemetryAggregateBucket>> {
+        match self {
+            Store::Memory(store) => Ok(store
+                .aggregate_telemetry(
+                    project_id,
+                    device_id,
+                    stream,
+                    field,
+                    from,
+                    to,
+                    bucket_seconds,
+                    limit,
+                )
+                .await),
+            Store::Postgres(store) => {
+                store
+                    .aggregate_telemetry(
+                        project_id,
+                        device_id,
+                        stream,
+                        field,
+                        from,
+                        to,
+                        bucket_seconds,
+                        limit,
+                    )
+                    .await
+            }
+        }
+    }
+
     pub async fn create_action(&self, action: Action) -> StoreResult<Action> {
         match self {
             Store::Memory(store) => store.create_action(action).await,
@@ -355,6 +400,46 @@ impl Store {
         }
     }
 
+    pub async fn claim_queued_action_targets(
+        &self,
+        limit: usize,
+    ) -> StoreResult<Vec<ActionDispatchTarget>> {
+        match self {
+            Store::Memory(store) => store.claim_queued_action_targets(limit).await,
+            Store::Postgres(store) => store.claim_queued_action_targets(limit).await,
+        }
+    }
+
+    pub async fn transition_action_targets(
+        &self,
+        transition: ActionTargetTransition,
+    ) -> StoreResult<Action> {
+        match self {
+            Store::Memory(store) => store.transition_action_targets(transition).await,
+            Store::Postgres(store) => store.transition_action_targets(transition).await,
+        }
+    }
+
+    pub async fn timeout_running_action_targets(
+        &self,
+        older_than: DateTime<Utc>,
+        limit: usize,
+        ts: DateTime<Utc>,
+    ) -> StoreResult<Vec<ActionTargetStatusChange>> {
+        match self {
+            Store::Memory(store) => {
+                store
+                    .timeout_running_action_targets(older_than, limit, ts)
+                    .await
+            }
+            Store::Postgres(store) => {
+                store
+                    .timeout_running_action_targets(older_than, limit, ts)
+                    .await
+            }
+        }
+    }
+
     pub async fn create_firmware(
         &self,
         artifact: FirmwareArtifact,
@@ -365,10 +450,53 @@ impl Store {
         }
     }
 
+    pub async fn finalize_firmware(
+        &self,
+        project_id: Id,
+        firmware_id: Id,
+        sha256: &str,
+        size_bytes: i64,
+        signature: Option<&str>,
+        ts: DateTime<Utc>,
+    ) -> StoreResult<FirmwareArtifact> {
+        match self {
+            Store::Memory(store) => {
+                store
+                    .finalize_firmware(project_id, firmware_id, sha256, size_bytes, signature, ts)
+                    .await
+            }
+            Store::Postgres(store) => {
+                store
+                    .finalize_firmware(project_id, firmware_id, sha256, size_bytes, signature, ts)
+                    .await
+            }
+        }
+    }
+
     pub async fn list_firmware(&self, project_id: Id) -> StoreResult<Vec<FirmwareArtifact>> {
         match self {
             Store::Memory(store) => Ok(store.list_firmware(project_id).await),
             Store::Postgres(store) => store.list_firmware(project_id).await,
+        }
+    }
+
+    pub async fn create_firmware_rollout(
+        &self,
+        rollout: FirmwareRollout,
+    ) -> StoreResult<FirmwareRollout> {
+        match self {
+            Store::Memory(store) => store.create_firmware_rollout(rollout).await,
+            Store::Postgres(store) => store.create_firmware_rollout(rollout).await,
+        }
+    }
+
+    pub async fn list_firmware_rollouts(
+        &self,
+        project_id: Id,
+    ) -> StoreResult<Vec<FirmwareRollout>> {
+        match self {
+            Store::Memory(store) => Ok(store.list_firmware_rollouts(project_id).await),
+            Store::Postgres(store) => store.list_firmware_rollouts(project_id).await,
         }
     }
 
@@ -386,6 +514,73 @@ impl Store {
         }
     }
 
+    pub async fn list_enabled_alerts(&self) -> StoreResult<Vec<AlertRule>> {
+        match self {
+            Store::Memory(store) => Ok(store.list_enabled_alerts().await),
+            Store::Postgres(store) => store.list_enabled_alerts().await,
+        }
+    }
+
+    pub async fn upsert_firing_alert_event(&self, event: AlertEvent) -> StoreResult<AlertEvent> {
+        match self {
+            Store::Memory(store) => store.upsert_firing_alert_event(event).await,
+            Store::Postgres(store) => store.upsert_firing_alert_event(event).await,
+        }
+    }
+
+    pub async fn resolve_alert_event(
+        &self,
+        project_id: Id,
+        alert_rule_id: Id,
+        dedupe_key: &str,
+        ts: DateTime<Utc>,
+    ) -> StoreResult<Option<AlertEvent>> {
+        match self {
+            Store::Memory(store) => {
+                store
+                    .resolve_alert_event(project_id, alert_rule_id, dedupe_key, ts)
+                    .await
+            }
+            Store::Postgres(store) => {
+                store
+                    .resolve_alert_event(project_id, alert_rule_id, dedupe_key, ts)
+                    .await
+            }
+        }
+    }
+
+    pub async fn list_alert_events(
+        &self,
+        project_id: Id,
+        state_filter: Option<AlertEventState>,
+    ) -> StoreResult<Vec<AlertEvent>> {
+        match self {
+            Store::Memory(store) => Ok(store.list_alert_events(project_id, state_filter).await),
+            Store::Postgres(store) => store.list_alert_events(project_id, state_filter).await,
+        }
+    }
+
+    pub async fn record_alert_notification_attempt(
+        &self,
+        project_id: Id,
+        alert_event_id: Id,
+        error: Option<String>,
+        ts: DateTime<Utc>,
+    ) -> StoreResult<AlertEvent> {
+        match self {
+            Store::Memory(store) => {
+                store
+                    .record_alert_notification_attempt(project_id, alert_event_id, error, ts)
+                    .await
+            }
+            Store::Postgres(store) => {
+                store
+                    .record_alert_notification_attempt(project_id, alert_event_id, error, ts)
+                    .await
+            }
+        }
+    }
+
     pub async fn create_dashboard(&self, dashboard: Dashboard) -> StoreResult<Dashboard> {
         match self {
             Store::Memory(store) => store.create_dashboard(dashboard).await,
@@ -397,6 +592,47 @@ impl Store {
         match self {
             Store::Memory(store) => Ok(store.list_dashboards(project_id).await),
             Store::Postgres(store) => store.list_dashboards(project_id).await,
+        }
+    }
+
+    pub async fn create_diagnostics_session(
+        &self,
+        session: DiagnosticsSession,
+    ) -> StoreResult<DiagnosticsSession> {
+        match self {
+            Store::Memory(store) => store.create_diagnostics_session(session).await,
+            Store::Postgres(store) => store.create_diagnostics_session(session).await,
+        }
+    }
+
+    pub async fn update_diagnostics_session(
+        &self,
+        session: DiagnosticsSession,
+    ) -> StoreResult<DiagnosticsSession> {
+        match self {
+            Store::Memory(store) => store.update_diagnostics_session(session).await,
+            Store::Postgres(store) => store.update_diagnostics_session(session).await,
+        }
+    }
+
+    pub async fn get_diagnostics_session(
+        &self,
+        project_id: Id,
+        session_id: Id,
+    ) -> StoreResult<DiagnosticsSession> {
+        match self {
+            Store::Memory(store) => store.get_diagnostics_session(project_id, session_id).await,
+            Store::Postgres(store) => store.get_diagnostics_session(project_id, session_id).await,
+        }
+    }
+
+    pub async fn list_diagnostics_sessions(
+        &self,
+        project_id: Id,
+    ) -> StoreResult<Vec<DiagnosticsSession>> {
+        match self {
+            Store::Memory(store) => Ok(store.list_diagnostics_sessions(project_id).await),
+            Store::Postgres(store) => store.list_diagnostics_sessions(project_id).await,
         }
     }
 

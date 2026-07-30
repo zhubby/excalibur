@@ -1,6 +1,7 @@
 mod auth;
+mod pki;
 
-use std::convert::Infallible;
+use std::{collections::HashMap, convert::Infallible, sync::Arc};
 
 use axum::{
     Json, Router,
@@ -15,7 +16,6 @@ use axum::{
     },
     routing::{get, post},
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{Duration, Utc};
 use excalibur_device_protocol::{
     DeviceAgentAuthentication, DeviceConfig, DiagnosticsCollectPayload, OtaInstallPayload,
@@ -23,12 +23,15 @@ use excalibur_device_protocol::{
     parse_publish_topic,
 };
 use excalibur_domain::{
-    Action, ActionState, ActionStatusUpdate, AlertKind, AlertRule, ApiKey, AuditLog, Dashboard,
-    Device, DeviceCertificate, FirmwareArtifact, Id, Org, Project, Role, StreamDefinition,
-    StreamField, StreamFieldType, TelemetryPoint, User, UserSession,
+    Action, ActionState, ActionStatusUpdate, ActionTargetTransition, AlertEventState, AlertKind,
+    AlertRule, ApiKey, AuditLog, Dashboard, Device, DeviceCertificate, DiagnosticsSession,
+    DiagnosticsSessionState, FirmwareArtifact, FirmwareRollout, FirmwareRolloutState, Id,
+    NewFirmwareRollout, Org, Project, Role, StreamDefinition, StreamField, StreamFieldType,
+    TelemetryAggregateBucket, TelemetryPoint, User, UserSession,
 };
-use excalibur_storage::{Store, StoreError, map_terminal_action_state};
+use excalibur_storage::{Store, StoreError, parse_reported_action_state};
 use futures_util::stream;
+use ring::hmac;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -36,6 +39,7 @@ use tower_http::{
     cors::{AllowOrigin, CorsLayer},
     trace::TraceLayer,
 };
+use url::Url;
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
@@ -55,30 +59,138 @@ const COOKIE_REFRESH_MAX_AGE_SECONDS: i64 = REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 6
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub store: Store,
+    config: AppConfig,
+    started_at: chrono::DateTime<Utc>,
+    auth_rate_limits: Arc<tokio::sync::Mutex<HashMap<String, Vec<chrono::DateTime<Utc>>>>>,
 }
 
 impl Default for AppState {
     fn default() -> Self {
         Self {
             store: Store::memory(),
+            config: AppConfig::development(),
+            started_at: Utc::now(),
+            auth_rate_limits: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 }
 
 impl AppState {
     pub fn new(store: Store) -> Self {
-        Self { store }
+        Self {
+            store,
+            config: AppConfig::development(),
+            started_at: Utc::now(),
+            auth_rate_limits: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub fn with_config(store: Store, config: AppConfig) -> Self {
+        Self {
+            store,
+            config,
+            started_at: Utc::now(),
+            auth_rate_limits: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AppConfig {
+    enable_dev_auth: bool,
+    ca_private_key_pem: Option<String>,
+    object_storage: ObjectStorageConfig,
+    auth_rate_limit_max_attempts: usize,
+    auth_rate_limit_window_seconds: i64,
+}
+
+impl AppConfig {
+    pub fn development() -> Self {
+        Self {
+            enable_dev_auth: true,
+            ca_private_key_pem: Some(pki::default_dev_ca_private_key_pem().to_owned()),
+            object_storage: ObjectStorageConfig::development(),
+            auth_rate_limit_max_attempts: 20,
+            auth_rate_limit_window_seconds: 60,
+        }
+    }
+
+    pub fn from_env() -> anyhow::Result<Self> {
+        let allow_dev_ca = parse_bool_env("EXCALIBUR_ALLOW_DEV_CA", false)?;
+        let ca_private_key_pem = match std::env::var("EXCALIBUR_CA_PRIVATE_KEY_PEM") {
+            Ok(value) if !value.trim().is_empty() => Some(value),
+            _ if allow_dev_ca => Some(pki::default_dev_ca_private_key_pem().to_owned()),
+            _ => anyhow::bail!(
+                "EXCALIBUR_CA_PRIVATE_KEY_PEM is required unless EXCALIBUR_ALLOW_DEV_CA=true"
+            ),
+        };
+
+        Ok(Self {
+            enable_dev_auth: parse_bool_env("EXCALIBUR_ENABLE_DEV_AUTH", false)?,
+            ca_private_key_pem,
+            object_storage: ObjectStorageConfig::from_env()?,
+            auth_rate_limit_max_attempts: parse_env_usize("API_AUTH_RATE_LIMIT_MAX_ATTEMPTS", 20)?,
+            auth_rate_limit_window_seconds: parse_env_i64(
+                "API_AUTH_RATE_LIMIT_WINDOW_SECONDS",
+                60,
+            )?,
+        })
+    }
+
+    fn ca_private_key_pem(&self) -> Result<&str, ApiError> {
+        self.ca_private_key_pem
+            .as_deref()
+            .ok_or_else(|| ApiError::Internal("certificate authority is not configured".to_owned()))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ObjectStorageConfig {
+    public_endpoint: String,
+    bucket: String,
+    region: String,
+    access_key_id: String,
+    secret_access_key: String,
+}
+
+impl ObjectStorageConfig {
+    fn development() -> Self {
+        Self {
+            public_endpoint: "http://localhost:9000".to_owned(),
+            bucket: "excalibur".to_owned(),
+            region: "us-east-1".to_owned(),
+            access_key_id: "excalibur".to_owned(),
+            secret_access_key: "excalibur-secret".to_owned(),
+        }
+    }
+
+    fn from_env() -> anyhow::Result<Self> {
+        let endpoint =
+            std::env::var("S3_PUBLIC_ENDPOINT").or_else(|_| std::env::var("S3_ENDPOINT"))?;
+        Ok(Self {
+            public_endpoint: endpoint,
+            bucket: std::env::var("S3_BUCKET").unwrap_or_else(|_| "excalibur".to_owned()),
+            region: std::env::var("S3_REGION").unwrap_or_else(|_| "us-east-1".to_owned()),
+            access_key_id: std::env::var("S3_ACCESS_KEY_ID")
+                .or_else(|_| std::env::var("AWS_ACCESS_KEY_ID"))
+                .unwrap_or_else(|_| "excalibur".to_owned()),
+            secret_access_key: std::env::var("S3_SECRET_ACCESS_KEY")
+                .or_else(|_| std::env::var("AWS_SECRET_ACCESS_KEY"))
+                .unwrap_or_else(|_| "excalibur-secret".to_owned()),
+        })
     }
 }
 
 pub fn app() -> Router {
-    app_with_state(AppState::default())
+    let config = AppConfig::from_env().expect("invalid API configuration");
+    app_with_state(AppState::with_config(Store::memory(), config))
 }
 
 pub fn app_with_state(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/ready", get(readiness))
+        .route("/metrics", get(metrics))
         .route("/api/v1/openapi.json", get(openapi))
         .route("/api/v1/events", get(events))
         .route("/api/v1/auth/register", post(register))
@@ -111,17 +223,51 @@ pub fn app_with_state(state: AppState) -> Router {
             "/api/v1/telemetry",
             get(query_telemetry).post(ingest_telemetry),
         )
+        .route("/api/v1/telemetry/aggregate", get(aggregate_telemetry))
         .route("/api/v1/actions", get(list_actions).post(create_action))
+        .route("/api/v1/actions/{action_id}/approve", post(approve_action))
+        .route("/api/v1/actions/{action_id}/retry", post(retry_action))
+        .route("/api/v1/actions/{action_id}/cancel", post(cancel_action))
         .route(
             "/api/v1/actions/{action_id}/status",
             post(update_action_status),
         )
         .route("/api/v1/firmware", get(list_firmware).post(create_firmware))
         .route(
+            "/api/v1/firmware/{firmware_id}/upload-url",
+            post(create_firmware_upload_url),
+        )
+        .route(
+            "/api/v1/firmware/{firmware_id}/download-url",
+            post(create_firmware_download_url),
+        )
+        .route(
+            "/api/v1/firmware/{firmware_id}/finalize",
+            post(finalize_firmware_upload),
+        )
+        .route(
+            "/api/v1/firmware/{firmware_id}/rollout",
+            post(create_firmware_rollout),
+        )
+        .route("/api/v1/firmware-rollouts", get(list_firmware_rollouts))
+        .route(
             "/api/v1/dashboards",
             get(list_dashboards).post(create_dashboard),
         )
         .route("/api/v1/alerts", get(list_alerts).post(create_alert))
+        .route("/api/v1/alert-events", get(list_alert_events))
+        .route(
+            "/api/v1/diagnostics/sessions",
+            get(list_diagnostics_sessions).post(create_diagnostics_session),
+        )
+        .route(
+            "/api/v1/diagnostics/sessions/{session_id}/finalize",
+            post(finalize_diagnostics_session),
+        )
+        .route(
+            "/api/v1/diagnostics/sessions/{session_id}/download-url",
+            post(create_diagnostics_download_url),
+        )
         .route("/api/v1/audit", get(list_audit))
         .layer(TraceLayer::new_for_http())
         .layer(cors_layer())
@@ -156,6 +302,7 @@ fn cors_layer() -> CorsLayer {
     paths(
         health,
         readiness,
+        metrics,
         register,
         login,
         refresh_session,
@@ -177,19 +324,40 @@ fn cors_layer() -> CorsLayer {
         list_streams,
         ingest_telemetry,
         query_telemetry,
+        aggregate_telemetry,
         create_action,
         list_actions,
+        approve_action,
+        retry_action,
+        cancel_action,
         update_action_status,
         create_firmware,
         list_firmware,
+        create_firmware_upload_url,
+        create_firmware_download_url,
+        finalize_firmware_upload,
+        create_firmware_rollout,
+        list_firmware_rollouts,
         create_dashboard,
         list_dashboards,
         create_alert,
         list_alerts,
+        list_alert_events,
+        create_diagnostics_session,
+        list_diagnostics_sessions,
+        finalize_diagnostics_session,
+        create_diagnostics_download_url,
         list_audit
     ),
     components(schemas(
         HealthResponse,
+        ActionResponse,
+        ActionStateResponse,
+        AlertKindResponse,
+        AlertEventResponse,
+        AlertEventStateResponse,
+        AlertRuleResponse,
+        AuditLogResponse,
         RegisterRequest,
         LoginRequest,
         RefreshRequest,
@@ -197,6 +365,27 @@ fn cors_layer() -> CorsLayer {
         LogoutResponse,
         CreateApiKeyRequest,
         ApiKeyResponse,
+        CertificateStatusResponse,
+        DashboardResponse,
+        DeviceResponse,
+        DeviceAgentAuthenticationResponse,
+        DeviceCertificateResponse,
+        DeviceConfigResponse,
+        DeviceStatusResponse,
+        DiagnosticsSessionResponse,
+        DiagnosticsSessionStateResponse,
+        DiagnosticsSessionCreateResponse,
+        FirmwareArtifactResponse,
+        FirmwareRolloutResponse,
+        FirmwareRolloutStateResponse,
+        OrgResponse,
+        ProjectResponse,
+        ProvisioningModeResponse,
+        StreamDefinitionResponse,
+        StreamFieldResponse,
+        StreamFieldTypeResponse,
+        TelemetryPointResponse,
+        TelemetryAggregateBucketResponse,
         CreateOrgRequest,
         CreateProjectRequest,
         CreateDeviceRequest,
@@ -206,10 +395,16 @@ fn cors_layer() -> CorsLayer {
         StreamFieldDto,
         IngestTelemetryRequest,
         CreateActionRequest,
+        ActionTransitionRequest,
         ActionStatusRequest,
         CreateFirmwareRequest,
+        FirmwareFinalizeRequest,
+        FirmwareRolloutRequest,
+        SignedObjectUrl,
         CreateDashboardRequest,
-        CreateAlertRequest
+        CreateAlertRequest,
+        CreateDiagnosticsSessionRequest,
+        DiagnosticsFinalizeRequest
     )),
     tags(
         (name = "control-plane", description = "Tenant, device, stream, action, and dashboard APIs")
@@ -222,12 +417,370 @@ struct ErrorBody {
     error: String,
 }
 
+mod openapi_schemas {
+    #![allow(dead_code)]
+
+    use chrono::{DateTime, Utc};
+    use serde::{Deserialize, Serialize};
+    use serde_json::Value;
+    use utoipa::ToSchema;
+
+    #[derive(Debug, ToSchema)]
+    pub struct OrgResponse {
+        pub id: String,
+        pub name: String,
+        pub slug: String,
+        pub created_at: DateTime<Utc>,
+    }
+
+    #[derive(Debug, ToSchema)]
+    pub struct ProjectResponse {
+        pub id: String,
+        pub org_id: String,
+        pub name: String,
+        pub slug: String,
+        pub created_at: DateTime<Utc>,
+    }
+
+    #[derive(Debug, ToSchema)]
+    pub enum DeviceStatusResponse {
+        Provisioned,
+        Online,
+        Offline,
+        Disabled,
+    }
+
+    #[derive(Debug, ToSchema)]
+    pub struct DeviceResponse {
+        pub id: String,
+        pub project_id: String,
+        pub name: String,
+        pub status: DeviceStatusResponse,
+        pub metadata: Value,
+        pub last_seen_at: Option<DateTime<Utc>>,
+        pub latest_shadow: Value,
+        pub created_at: DateTime<Utc>,
+    }
+
+    #[derive(Debug, ToSchema)]
+    pub enum CertificateStatusResponse {
+        Active,
+        Revoked,
+        Expired,
+    }
+
+    #[derive(Debug, ToSchema)]
+    pub struct DeviceCertificateResponse {
+        pub id: String,
+        pub project_id: String,
+        pub device_id: String,
+        pub fingerprint_sha256: String,
+        pub status: CertificateStatusResponse,
+        pub not_before: DateTime<Utc>,
+        pub not_after: DateTime<Utc>,
+        pub created_at: DateTime<Utc>,
+    }
+
+    #[derive(Debug, ToSchema)]
+    pub enum ProvisioningModeResponse {
+        Csr,
+        DevGeneratedKeypair,
+    }
+
+    #[derive(Debug, ToSchema)]
+    pub struct DeviceAgentAuthenticationResponse {
+        pub ca_certificate: String,
+        pub device_certificate: String,
+        pub device_private_key: Option<String>,
+        pub device_private_key_path: Option<String>,
+    }
+
+    #[derive(Debug, ToSchema)]
+    pub struct DeviceConfigResponse {
+        pub broker: String,
+        pub port: u16,
+        pub project_id: String,
+        pub device_id: String,
+        pub certificate_id: String,
+        pub certificate_fingerprint_sha256: String,
+        pub certificate_not_after: DateTime<Utc>,
+        pub authentication: DeviceAgentAuthenticationResponse,
+        pub provisioning_mode: ProvisioningModeResponse,
+        pub production: bool,
+    }
+
+    #[derive(Debug, ToSchema)]
+    pub enum StreamFieldTypeResponse {
+        String,
+        Integer,
+        Float,
+        Boolean,
+        Json,
+    }
+
+    #[derive(Debug, ToSchema)]
+    pub struct StreamFieldResponse {
+        pub name: String,
+        pub field_type: StreamFieldTypeResponse,
+        pub required: bool,
+    }
+
+    #[derive(Debug, ToSchema)]
+    pub struct StreamDefinitionResponse {
+        pub id: String,
+        pub project_id: String,
+        pub name: String,
+        pub fields: Vec<StreamFieldResponse>,
+        pub created_at: DateTime<Utc>,
+    }
+
+    #[derive(Debug, ToSchema)]
+    pub struct TelemetryPointResponse {
+        pub project_id: String,
+        pub device_id: String,
+        pub stream: String,
+        pub sequence: i64,
+        pub ts: DateTime<Utc>,
+        pub payload: Value,
+        pub ingested_at: DateTime<Utc>,
+    }
+
+    #[derive(Debug, ToSchema)]
+    pub struct TelemetryAggregateBucketResponse {
+        pub project_id: String,
+        pub device_id: Option<String>,
+        pub stream: String,
+        pub field: Option<String>,
+        pub bucket_start: DateTime<Utc>,
+        pub bucket_seconds: i64,
+        pub count: i64,
+        pub min: Option<f64>,
+        pub max: Option<f64>,
+        pub avg: Option<f64>,
+        pub last: Option<f64>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, ToSchema)]
+    pub enum ActionStateResponse {
+        Queued,
+        WaitingApproval,
+        Running,
+        Completed,
+        Failed,
+        Cancelled,
+        TimedOut,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, ToSchema)]
+    pub struct ActionResponse {
+        pub id: String,
+        pub project_id: String,
+        pub device_ids: Vec<String>,
+        pub name: String,
+        pub payload: Value,
+        pub state: ActionStateResponse,
+        pub progress: u8,
+        pub errors: Vec<String>,
+        pub created_by: Option<String>,
+        pub created_at: DateTime<Utc>,
+        pub updated_at: DateTime<Utc>,
+    }
+
+    impl From<super::ActionState> for ActionStateResponse {
+        fn from(value: super::ActionState) -> Self {
+            match value {
+                super::ActionState::Queued => Self::Queued,
+                super::ActionState::WaitingApproval => Self::WaitingApproval,
+                super::ActionState::Running => Self::Running,
+                super::ActionState::Completed => Self::Completed,
+                super::ActionState::Failed => Self::Failed,
+                super::ActionState::Cancelled => Self::Cancelled,
+                super::ActionState::TimedOut => Self::TimedOut,
+            }
+        }
+    }
+
+    impl From<super::Action> for ActionResponse {
+        fn from(action: super::Action) -> Self {
+            Self {
+                id: action.id.to_string(),
+                project_id: action.project_id.to_string(),
+                device_ids: action
+                    .device_ids
+                    .into_iter()
+                    .map(|id| id.to_string())
+                    .collect(),
+                name: action.name,
+                payload: super::redacted_action_payload(action.payload),
+                state: action.state.into(),
+                progress: action.progress,
+                errors: action.errors,
+                created_by: action.created_by.map(|id| id.to_string()),
+                created_at: action.created_at,
+                updated_at: action.updated_at,
+            }
+        }
+    }
+
+    #[derive(Debug, ToSchema)]
+    pub struct FirmwareArtifactResponse {
+        pub id: String,
+        pub project_id: String,
+        pub component: String,
+        pub version: String,
+        pub object_key: String,
+        pub sha256: String,
+        pub content_type: String,
+        pub signature: Option<String>,
+        pub size_bytes: i64,
+        pub active: bool,
+        pub uploaded_at: Option<DateTime<Utc>>,
+        pub verified_at: Option<DateTime<Utc>>,
+        pub created_at: DateTime<Utc>,
+    }
+
+    #[derive(Debug, ToSchema)]
+    pub enum FirmwareRolloutStateResponse {
+        Planned,
+        WaitingApproval,
+        Running,
+        Completed,
+        Failed,
+        Cancelled,
+        RolledBack,
+    }
+
+    #[derive(Debug, ToSchema)]
+    pub struct FirmwareRolloutResponse {
+        pub id: String,
+        pub project_id: String,
+        pub firmware_id: String,
+        pub action_id: String,
+        pub cohort_size: i64,
+        pub strategy: String,
+        pub rollback_strategy: Option<String>,
+        pub state: FirmwareRolloutStateResponse,
+        pub created_by: Option<String>,
+        pub created_at: DateTime<Utc>,
+        pub updated_at: DateTime<Utc>,
+    }
+
+    #[derive(Debug, ToSchema)]
+    pub enum AlertKindResponse {
+        Offline,
+        Threshold,
+        WindowAggregation,
+    }
+
+    #[derive(Debug, ToSchema)]
+    pub struct AlertRuleResponse {
+        pub id: String,
+        pub project_id: String,
+        pub name: String,
+        pub kind: AlertKindResponse,
+        pub expression: Value,
+        pub enabled: bool,
+    }
+
+    #[derive(Debug, ToSchema)]
+    pub enum AlertEventStateResponse {
+        Firing,
+        Resolved,
+    }
+
+    #[derive(Debug, ToSchema)]
+    pub struct AlertEventResponse {
+        pub id: String,
+        pub project_id: String,
+        pub alert_rule_id: String,
+        pub device_id: Option<String>,
+        pub dedupe_key: String,
+        pub state: AlertEventStateResponse,
+        pub message: String,
+        pub observed_value: Option<f64>,
+        pub threshold: Option<f64>,
+        pub opened_at: DateTime<Utc>,
+        pub resolved_at: Option<DateTime<Utc>>,
+        pub last_seen_at: DateTime<Utc>,
+        pub notification_attempts: i32,
+        pub last_notification_error: Option<String>,
+    }
+
+    #[derive(Debug, ToSchema)]
+    pub struct DashboardResponse {
+        pub id: String,
+        pub project_id: String,
+        pub name: String,
+        pub layout: Value,
+    }
+
+    #[derive(Debug, ToSchema)]
+    pub enum DiagnosticsSessionStateResponse {
+        Requested,
+        UploadPending,
+        Uploaded,
+        Completed,
+        Failed,
+        Cancelled,
+        Expired,
+    }
+
+    #[derive(Debug, ToSchema)]
+    pub struct DiagnosticsSessionResponse {
+        pub id: String,
+        pub project_id: String,
+        pub device_id: String,
+        pub action_id: Option<String>,
+        pub object_key: String,
+        pub state: DiagnosticsSessionStateResponse,
+        pub upload_url_expires_at: Option<DateTime<Utc>>,
+        pub download_url_expires_at: Option<DateTime<Utc>>,
+        pub size_bytes: Option<i64>,
+        pub sha256: Option<String>,
+        pub error: Option<String>,
+        pub created_by: Option<String>,
+        pub created_at: DateTime<Utc>,
+        pub updated_at: DateTime<Utc>,
+    }
+
+    #[derive(Debug, ToSchema)]
+    pub struct DiagnosticsSessionCreateResponse {
+        pub session: DiagnosticsSessionResponse,
+        pub upload_url: super::SignedObjectUrl,
+        pub action: ActionResponse,
+    }
+
+    #[derive(Debug, ToSchema)]
+    pub struct AuditLogResponse {
+        pub id: String,
+        pub org_id: String,
+        pub project_id: Option<String>,
+        pub actor_id: Option<String>,
+        pub action: String,
+        pub resource: String,
+        pub metadata: Value,
+        pub created_at: DateTime<Utc>,
+    }
+}
+
+use openapi_schemas::{
+    ActionResponse, ActionStateResponse, AlertEventResponse, AlertEventStateResponse,
+    AlertKindResponse, AlertRuleResponse, AuditLogResponse, CertificateStatusResponse,
+    DashboardResponse, DeviceAgentAuthenticationResponse, DeviceCertificateResponse,
+    DeviceConfigResponse, DeviceResponse, DeviceStatusResponse, DiagnosticsSessionCreateResponse,
+    DiagnosticsSessionResponse, DiagnosticsSessionStateResponse, FirmwareArtifactResponse,
+    FirmwareRolloutResponse, FirmwareRolloutStateResponse, OrgResponse, ProjectResponse,
+    ProvisioningModeResponse, StreamDefinitionResponse, StreamFieldResponse,
+    StreamFieldTypeResponse, TelemetryAggregateBucketResponse, TelemetryPointResponse,
+};
+
 #[derive(Debug)]
 pub enum ApiError {
     BadRequest(String),
     Unauthorized(String),
     NotFound(String),
     Conflict(String),
+    RateLimited(String),
     Internal(String),
 }
 
@@ -238,6 +791,7 @@ impl IntoResponse for ApiError {
             ApiError::Unauthorized(error) => (StatusCode::UNAUTHORIZED, error),
             ApiError::NotFound(error) => (StatusCode::NOT_FOUND, error),
             ApiError::Conflict(error) => (StatusCode::CONFLICT, error),
+            ApiError::RateLimited(error) => (StatusCode::TOO_MANY_REQUESTS, error),
             ApiError::Internal(error) => (StatusCode::INTERNAL_SERVER_ERROR, error),
         };
         (status, Json(ErrorBody { error })).into_response()
@@ -283,6 +837,26 @@ async fn readiness(State(state): State<AppState>) -> Result<Json<HealthResponse>
         status: "ready",
         service: "excalibur-api",
     }))
+}
+
+#[utoipa::path(get, path = "/metrics", responses((status = 200, body = String)))]
+async fn metrics(State(state): State<AppState>) -> Response {
+    let uptime_seconds = (Utc::now() - state.started_at).num_seconds().max(0);
+    let auth_rate_limit_keys = state.auth_rate_limits.lock().await.len();
+    let body = format!(
+        "# HELP excalibur_api_uptime_seconds API process uptime in seconds\n\
+         # TYPE excalibur_api_uptime_seconds gauge\n\
+         excalibur_api_uptime_seconds {uptime_seconds}\n\
+         # HELP excalibur_api_auth_rate_limit_keys Active auth rate limit buckets\n\
+         # TYPE excalibur_api_auth_rate_limit_keys gauge\n\
+         excalibur_api_auth_rate_limit_keys {auth_rate_limit_keys}\n"
+    );
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; version=0.0.4"),
+    );
+    (headers, body).into_response()
 }
 
 async fn openapi() -> Json<utoipa::openapi::OpenApi> {
@@ -478,6 +1052,35 @@ fn api_key_has_scope(api_key: &ApiKey, required_scope: &str) -> bool {
     })
 }
 
+fn parse_bool_env(name: &str, default: bool) -> anyhow::Result<bool> {
+    match std::env::var(name) {
+        Ok(value) => match value.as_str() {
+            "1" | "true" | "TRUE" | "yes" | "YES" => Ok(true),
+            "0" | "false" | "FALSE" | "no" | "NO" => Ok(false),
+            _ => anyhow::bail!("{name} must be a boolean"),
+        },
+        Err(_) => Ok(default),
+    }
+}
+
+fn parse_env_usize(name: &str, default: usize) -> anyhow::Result<usize> {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse()
+            .map_err(|error| anyhow::anyhow!("{name} is invalid: {error}")),
+        Err(_) => Ok(default),
+    }
+}
+
+fn parse_env_i64(name: &str, default: i64) -> anyhow::Result<i64> {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse()
+            .map_err(|error| anyhow::anyhow!("{name} is invalid: {error}")),
+        Err(_) => Ok(default),
+    }
+}
+
 async fn record_audit(state: &AppState, audit: AuditLog) {
     let action = audit.action.clone();
     let resource = audit.resource.clone();
@@ -600,11 +1203,41 @@ fn cookie_secure() -> bool {
         .unwrap_or(false)
 }
 
+async fn enforce_auth_rate_limit(
+    state: &AppState,
+    headers: &HeaderMap,
+    operation: &str,
+    email: &str,
+) -> Result<(), ApiError> {
+    let now = Utc::now();
+    let window = Duration::seconds(state.config.auth_rate_limit_window_seconds.max(1));
+    let client = headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("local");
+    let key = format!("{operation}:{client}:{}", email.trim().to_lowercase());
+    let mut buckets = state.auth_rate_limits.lock().await;
+    let attempts = buckets.entry(key).or_default();
+    attempts.retain(|attempt| *attempt > now - window);
+    if attempts.len() >= state.config.auth_rate_limit_max_attempts.max(1) {
+        return Err(ApiError::RateLimited(
+            "too many authentication attempts".to_owned(),
+        ));
+    }
+    attempts.push(now);
+    Ok(())
+}
+
 #[utoipa::path(post, path = "/api/v1/auth/register", request_body = RegisterRequest, responses((status = 200, body = AuthResponse)))]
 async fn register(
+    headers: HeaderMap,
     State(state): State<AppState>,
     Json(request): Json<RegisterRequest>,
 ) -> Result<(HeaderMap, Json<AuthResponse>), ApiError> {
+    enforce_auth_rate_limit(&state, &headers, "register", &request.email).await?;
     if request.password.len() < 12 {
         return Err(ApiError::BadRequest(
             "password must be at least 12 characters".to_owned(),
@@ -627,9 +1260,11 @@ async fn register(
 
 #[utoipa::path(post, path = "/api/v1/auth/login", request_body = LoginRequest, responses((status = 200, body = AuthResponse)))]
 async fn login(
+    headers: HeaderMap,
     State(state): State<AppState>,
     Json(request): Json<LoginRequest>,
 ) -> Result<(HeaderMap, Json<AuthResponse>), ApiError> {
+    enforce_auth_rate_limit(&state, &headers, "login", &request.email).await?;
     let user = match state.store.get_user_by_email(&request.email).await {
         Ok(user) => Some(user),
         Err(StoreError::NotFound("user")) => None,
@@ -718,7 +1353,7 @@ async fn logout(
 pub struct CreateApiKeyRequest {
     #[schema(value_type = String, format = Uuid)]
     pub org_id: Id,
-    #[schema(value_type = String, format = Uuid)]
+    #[schema(value_type = Option<String>, format = Uuid)]
     pub project_id: Option<Id>,
     pub name: String,
     pub scopes: Vec<String>,
@@ -731,14 +1366,14 @@ pub struct ApiKeyResponse {
     pub id: Id,
     #[schema(value_type = String, format = Uuid)]
     pub org_id: Id,
-    #[schema(value_type = String, format = Uuid)]
+    #[schema(value_type = Option<String>, format = Uuid)]
     pub project_id: Option<Id>,
     pub name: String,
     pub scopes: Vec<String>,
     pub expires_at: Option<chrono::DateTime<Utc>>,
     pub revoked_at: Option<chrono::DateTime<Utc>>,
     pub last_used_at: Option<chrono::DateTime<Utc>>,
-    #[schema(value_type = String, format = Uuid)]
+    #[schema(value_type = Option<String>, format = Uuid)]
     pub created_by: Option<Id>,
     pub created_at: chrono::DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -896,7 +1531,7 @@ pub struct CreateOrgRequest {
     pub slug: String,
 }
 
-#[utoipa::path(post, path = "/api/v1/orgs", request_body = CreateOrgRequest, responses((status = 200)))]
+#[utoipa::path(post, path = "/api/v1/orgs", request_body = CreateOrgRequest, responses((status = 200, body = OrgResponse)))]
 async fn create_org(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -922,7 +1557,7 @@ async fn create_org(
     Ok(Json(org))
 }
 
-#[utoipa::path(get, path = "/api/v1/orgs", responses((status = 200)))]
+#[utoipa::path(get, path = "/api/v1/orgs", responses((status = 200, body = Vec<OrgResponse>)))]
 async fn list_orgs(headers: HeaderMap, State(state): State<AppState>) -> ApiResult<Vec<Org>> {
     let actor_id = require_user_actor(&headers, &state).await?;
     Ok(Json(state.store.list_orgs_for_user(actor_id).await?))
@@ -944,7 +1579,7 @@ pub struct ProjectQuery {
     pub project_id: Option<Id>,
 }
 
-#[utoipa::path(post, path = "/api/v1/projects", request_body = CreateProjectRequest, responses((status = 200)))]
+#[utoipa::path(post, path = "/api/v1/projects", request_body = CreateProjectRequest, responses((status = 200, body = ProjectResponse)))]
 async fn create_project(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -978,7 +1613,7 @@ async fn create_project(
     Ok(Json(project))
 }
 
-#[utoipa::path(get, path = "/api/v1/projects", params(ProjectQuery), responses((status = 200)))]
+#[utoipa::path(get, path = "/api/v1/projects", params(ProjectQuery), responses((status = 200, body = Vec<ProjectResponse>)))]
 async fn list_projects(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -1000,7 +1635,7 @@ pub struct CreateDeviceRequest {
     pub metadata: Value,
 }
 
-#[utoipa::path(post, path = "/api/v1/devices", request_body = CreateDeviceRequest, responses((status = 200)))]
+#[utoipa::path(post, path = "/api/v1/devices", request_body = CreateDeviceRequest, responses((status = 200, body = DeviceResponse)))]
 async fn create_device(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -1038,7 +1673,7 @@ async fn create_device(
     Ok(Json(device))
 }
 
-#[utoipa::path(get, path = "/api/v1/devices", params(ProjectQuery), responses((status = 200)))]
+#[utoipa::path(get, path = "/api/v1/devices", params(ProjectQuery), responses((status = 200, body = Vec<DeviceResponse>)))]
 async fn list_devices(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -1052,13 +1687,14 @@ async fn list_devices(
     Ok(Json(state.store.list_devices(project_id).await?))
 }
 
-#[utoipa::path(post, path = "/api/v1/devices/{device_id}/provision", params(("device_id" = String, Path)), responses((status = 200)))]
+#[utoipa::path(post, path = "/api/v1/devices/{device_id}/provision", params(("device_id" = String, Path)), responses((status = 200, body = DeviceConfigResponse)))]
 async fn provision_device(
     headers: HeaderMap,
     State(state): State<AppState>,
     Path(device_id): Path<Id>,
     Query(query): Query<ProjectQuery>,
 ) -> ApiResult<DeviceConfig> {
+    require_dev_auth_enabled(&state)?;
     let actor = require_actor(&headers, &state).await?;
     let project_id = query
         .project_id
@@ -1077,7 +1713,6 @@ async fn provision_device(
         project_id,
         device_id,
         ProvisioningMode::DevGeneratedKeypair,
-        Some(dev_private_key_pem(device_id)),
         None,
         None,
     )
@@ -1111,7 +1746,7 @@ pub struct DevAuthProvisionRequest {
     pub project_id: Id,
 }
 
-#[utoipa::path(post, path = "/api/v1/devices/{device_id}/provision/csr", request_body = CsrProvisionRequest, params(("device_id" = String, Path)), responses((status = 200)))]
+#[utoipa::path(post, path = "/api/v1/devices/{device_id}/provision/csr", request_body = CsrProvisionRequest, params(("device_id" = String, Path)), responses((status = 200, body = DeviceConfigResponse)))]
 async fn provision_device_csr(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -1137,7 +1772,6 @@ async fn provision_device_csr(
         request.project_id,
         device_id,
         ProvisioningMode::Csr,
-        None,
         request.device_private_key_path,
         Some(request.csr_pem),
     )
@@ -1158,13 +1792,14 @@ async fn provision_device_csr(
     Ok(Json(config))
 }
 
-#[utoipa::path(post, path = "/api/v1/devices/{device_id}/provision/dev-auth", request_body = DevAuthProvisionRequest, params(("device_id" = String, Path)), responses((status = 200)))]
+#[utoipa::path(post, path = "/api/v1/devices/{device_id}/provision/dev-auth", request_body = DevAuthProvisionRequest, params(("device_id" = String, Path)), responses((status = 200, body = DeviceConfigResponse)))]
 async fn provision_device_dev_auth(
     headers: HeaderMap,
     State(state): State<AppState>,
     Path(device_id): Path<Id>,
     Json(request): Json<DevAuthProvisionRequest>,
 ) -> ApiResult<DeviceConfig> {
+    require_dev_auth_enabled(&state)?;
     let actor = require_actor(&headers, &state).await?;
     require_project_role(
         &state,
@@ -1179,7 +1814,6 @@ async fn provision_device_dev_auth(
         request.project_id,
         device_id,
         ProvisioningMode::DevGeneratedKeypair,
-        Some(dev_private_key_pem(device_id)),
         None,
         None,
     )
@@ -1200,7 +1834,17 @@ async fn provision_device_dev_auth(
     Ok(Json(config))
 }
 
-#[utoipa::path(post, path = "/api/v1/devices/{device_id}/certificates/{certificate_id}/revoke", params(("device_id" = String, Path), ("certificate_id" = String, Path), ProjectQuery), responses((status = 200)))]
+fn require_dev_auth_enabled(state: &AppState) -> Result<(), ApiError> {
+    if state.config.enable_dev_auth {
+        Ok(())
+    } else {
+        Err(ApiError::Unauthorized(
+            "dev-auth provisioning is disabled".to_owned(),
+        ))
+    }
+}
+
+#[utoipa::path(post, path = "/api/v1/devices/{device_id}/certificates/{certificate_id}/revoke", params(("device_id" = String, Path), ("certificate_id" = String, Path), ProjectQuery), responses((status = 200, body = DeviceCertificateResponse)))]
 async fn revoke_device_certificate(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -1243,19 +1887,38 @@ async fn issue_device_auth_config(
     project_id: Id,
     device_id: Id,
     provisioning_mode: ProvisioningMode,
-    device_private_key: Option<String>,
     device_private_key_path: Option<String>,
     csr_pem: Option<String>,
 ) -> Result<DeviceConfig, ApiError> {
     state.store.get_device(project_id, device_id).await?;
     let certificate_id = Uuid::now_v7();
-    let device_certificate = device_certificate_pem(certificate_id, device_id, csr_pem.as_deref());
-    let fingerprint = certificate_fingerprint_sha256(&device_certificate)?;
+    let not_after = Utc::now() + Duration::days(365);
+    let ca_private_key_pem = state.config.ca_private_key_pem()?;
+    let issued = match provisioning_mode {
+        ProvisioningMode::DevGeneratedKeypair => pki::issue_dev_generated_certificate(
+            certificate_id,
+            device_id,
+            not_after,
+            ca_private_key_pem,
+        )?,
+        ProvisioningMode::Csr => {
+            let csr_pem = csr_pem
+                .as_deref()
+                .ok_or_else(|| ApiError::BadRequest("csr_pem is required".to_owned()))?;
+            pki::issue_csr_certificate(
+                certificate_id,
+                device_id,
+                csr_pem,
+                not_after,
+                ca_private_key_pem,
+            )?
+        }
+    };
     let mut certificate = DeviceCertificate::new(
         project_id,
         device_id,
-        fingerprint,
-        Utc::now() + Duration::days(365),
+        issued.fingerprint_sha256.clone(),
+        not_after,
     );
     certificate.id = certificate_id;
     state.store.create_device_certificate(certificate).await?;
@@ -1264,10 +1927,13 @@ async fn issue_device_auth_config(
         port: device_mqtt_port(),
         project_id,
         device_id,
+        certificate_id,
+        certificate_fingerprint_sha256: issued.fingerprint_sha256,
+        certificate_not_after: not_after,
         authentication: DeviceAgentAuthentication {
-            ca_certificate: local_ca_pem(),
-            device_certificate,
-            device_private_key,
+            ca_certificate: issued.ca_certificate_pem,
+            device_certificate: issued.device_certificate_pem,
+            device_private_key: issued.device_private_key_pem,
             device_private_key_path,
         },
         production: matches!(provisioning_mode, ProvisioningMode::Csr),
@@ -1286,63 +1952,9 @@ fn device_mqtt_port() -> u16 {
         .unwrap_or(1883)
 }
 
-fn local_ca_pem() -> String {
-    pem_block("CERTIFICATE", b"EXCALIBUR-LOCAL-DEV-CA")
-}
-
-fn device_certificate_pem(certificate_id: Id, device_id: Id, csr_pem: Option<&str>) -> String {
-    let mut body = format!("EXCALIBUR-DEVICE-CERT-{device_id}-{certificate_id}").into_bytes();
-    if let Some(csr_pem) = csr_pem {
-        let csr_hash = auth::hash_secret(csr_pem);
-        body.extend_from_slice(b"-CSR-");
-        body.extend_from_slice(csr_hash.as_bytes());
-    }
-    pem_block("CERTIFICATE", &body)
-}
-
-fn pem_block(label: &str, der: &[u8]) -> String {
-    let encoded = BASE64.encode(der);
-    let mut wrapped = String::new();
-    for chunk in encoded.as_bytes().chunks(64) {
-        wrapped.push_str(std::str::from_utf8(chunk).expect("base64 is utf8"));
-        wrapped.push('\n');
-    }
-    format!("-----BEGIN {label}-----\n{wrapped}-----END {label}-----")
-}
-
+#[cfg(test)]
 fn certificate_fingerprint_sha256(certificate_pem: &str) -> Result<String, ApiError> {
-    let der = pem_body_der(certificate_pem, "CERTIFICATE")?;
-    Ok(encode_hex(&Sha256::digest(der)))
-}
-
-fn pem_body_der(pem: &str, label: &str) -> Result<Vec<u8>, ApiError> {
-    let begin = format!("-----BEGIN {label}-----");
-    let end = format!("-----END {label}-----");
-    let body = pem
-        .lines()
-        .skip_while(|line| line.trim() != begin)
-        .skip(1)
-        .take_while(|line| line.trim() != end)
-        .map(str::trim)
-        .collect::<String>();
-    if body.is_empty() {
-        return Err(ApiError::BadRequest(format!(
-            "{label} PEM block is missing"
-        )));
-    }
-    BASE64
-        .decode(body)
-        .map_err(|_| ApiError::BadRequest(format!("{label} PEM block is not valid base64")))
-}
-
-fn encode_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn dev_private_key_pem(device_id: Id) -> String {
-    format!(
-        "-----BEGIN PRIVATE KEY-----\nEXCALIBUR-DEV-ONLY-PRIVATE-KEY-{device_id}\n-----END PRIVATE KEY-----"
-    )
+    pki::certificate_fingerprint_sha256(certificate_pem)
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1381,7 +1993,7 @@ pub struct CreateStreamRequest {
     pub fields: Vec<StreamFieldDto>,
 }
 
-#[utoipa::path(post, path = "/api/v1/streams", request_body = CreateStreamRequest, responses((status = 200)))]
+#[utoipa::path(post, path = "/api/v1/streams", request_body = CreateStreamRequest, responses((status = 200, body = StreamDefinitionResponse)))]
 async fn create_stream(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -1428,7 +2040,7 @@ async fn create_stream(
     Ok(Json(stream))
 }
 
-#[utoipa::path(get, path = "/api/v1/streams", params(ProjectQuery), responses((status = 200)))]
+#[utoipa::path(get, path = "/api/v1/streams", params(ProjectQuery), responses((status = 200, body = Vec<StreamDefinitionResponse>)))]
 async fn list_streams(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -1510,13 +2122,16 @@ async fn ingest_telemetry(
             let updates = decode_command_status_payload(request.payload)
                 .map_err(|error| ApiError::BadRequest(error.to_string()))?;
             for update in updates {
+                let action_state = parse_reported_action_state(&update.state).ok_or_else(|| {
+                    ApiError::BadRequest("unknown action status state".to_owned())
+                })?;
                 state
                     .store
                     .update_action_status(ActionStatusUpdate {
                         project_id,
                         action_id: update.action_id,
                         device_id,
-                        state: map_terminal_action_state(&update.state),
+                        state: action_state,
                         progress: update.progress,
                         errors: update.errors,
                         ts: Utc::now(),
@@ -1542,7 +2157,7 @@ pub struct TelemetryQuery {
     pub limit: Option<usize>,
 }
 
-#[utoipa::path(get, path = "/api/v1/telemetry", params(TelemetryQuery), responses((status = 200)))]
+#[utoipa::path(get, path = "/api/v1/telemetry", params(TelemetryQuery), responses((status = 200, body = Vec<TelemetryPointResponse>)))]
 async fn query_telemetry(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -1563,6 +2178,53 @@ async fn query_telemetry(
     ))
 }
 
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct TelemetryAggregateQuery {
+    #[param(value_type = String, format = Uuid)]
+    pub project_id: Id,
+    #[param(value_type = String, format = Uuid)]
+    pub device_id: Option<Id>,
+    pub stream: String,
+    pub field: Option<String>,
+    pub from: Option<chrono::DateTime<Utc>>,
+    pub to: Option<chrono::DateTime<Utc>>,
+    pub bucket_seconds: Option<i64>,
+    pub limit: Option<usize>,
+}
+
+#[utoipa::path(get, path = "/api/v1/telemetry/aggregate", params(TelemetryAggregateQuery), responses((status = 200, body = Vec<TelemetryAggregateBucketResponse>)))]
+async fn aggregate_telemetry(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(query): Query<TelemetryAggregateQuery>,
+) -> ApiResult<Vec<TelemetryAggregateBucket>> {
+    let actor = require_actor(&headers, &state).await?;
+    require_project_access(&state, &actor, query.project_id, "telemetry:read").await?;
+    if query.stream.trim().is_empty() {
+        return Err(ApiError::BadRequest("stream is required".to_owned()));
+    }
+    let to = query.to.unwrap_or_else(Utc::now);
+    let from = query.from.unwrap_or_else(|| to - Duration::hours(1));
+    if from >= to {
+        return Err(ApiError::BadRequest("from must be before to".to_owned()));
+    }
+    let bucket_seconds = query.bucket_seconds.unwrap_or(60).clamp(1, 86_400);
+    let rows = state
+        .store
+        .aggregate_telemetry(
+            query.project_id,
+            query.device_id,
+            &query.stream,
+            query.field.as_deref(),
+            from,
+            to,
+            bucket_seconds,
+            query.limit.unwrap_or(500).min(10_000),
+        )
+        .await?;
+    Ok(Json(rows))
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateActionRequest {
     #[schema(value_type = String, format = Uuid)]
@@ -1571,14 +2233,15 @@ pub struct CreateActionRequest {
     pub device_ids: Vec<Id>,
     pub name: String,
     pub payload: Value,
+    pub requires_approval: Option<bool>,
 }
 
-#[utoipa::path(post, path = "/api/v1/actions", request_body = CreateActionRequest, responses((status = 200)))]
+#[utoipa::path(post, path = "/api/v1/actions", request_body = CreateActionRequest, responses((status = 200, body = ActionResponse)))]
 async fn create_action(
     headers: HeaderMap,
     State(state): State<AppState>,
-    Json(request): Json<CreateActionRequest>,
-) -> ApiResult<Action> {
+    Json(mut request): Json<CreateActionRequest>,
+) -> ApiResult<ActionResponse> {
     let actor = require_actor(&headers, &state).await?;
     let project = require_project_role(
         &state,
@@ -1599,17 +2262,21 @@ async fn create_action(
             .get_device(request.project_id, *device_id)
             .await?;
     }
-    validate_device_action(&request.name, &request.payload)?;
-    let action = state
-        .store
-        .create_action(Action::new(
-            request.project_id,
-            request.device_ids,
-            request.name,
-            request.payload,
-            actor.audit_actor_id(),
-        ))
-        .await?;
+    let payload = std::mem::take(&mut request.payload);
+    request.payload =
+        validate_device_action(&state, request.project_id, &request.name, payload).await?;
+    let requires_approval = request.requires_approval.unwrap_or(false);
+    let mut action = Action::new(
+        request.project_id,
+        request.device_ids,
+        request.name,
+        request.payload,
+        actor.audit_actor_id(),
+    );
+    if requires_approval {
+        action.state = ActionState::WaitingApproval;
+    }
+    let action = state.store.create_action(action).await?;
     record_audit(
         &state,
         AuditLog::new(
@@ -1618,27 +2285,33 @@ async fn create_action(
             actor.audit_actor_id(),
             "action.create",
             format!("action:{}", action.id),
-            json!({ "name": action.name, "target_count": action.device_ids.len() }),
+            json!({ "name": action.name, "target_count": action.device_ids.len(), "requires_approval": requires_approval }),
         ),
     )
     .await;
-    Ok(Json(action))
+    Ok(Json(action.into()))
 }
 
-fn validate_device_action(name: &str, payload: &Value) -> Result<(), ApiError> {
+async fn validate_device_action(
+    state: &AppState,
+    project_id: Id,
+    name: &str,
+    payload: Value,
+) -> Result<Value, ApiError> {
     match name {
         "ota.install" => {
             let payload =
-                serde_json::from_value::<OtaInstallPayload>(payload.clone()).map_err(|error| {
+                serde_json::from_value::<OtaInstallPayload>(payload).map_err(|error| {
                     ApiError::BadRequest(format!("invalid ota.install payload: {error}"))
                 })?;
             payload
                 .validate()
-                .map_err(|error| ApiError::BadRequest(error.to_string()))
+                .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+            validate_ota_payload_against_firmware(state, project_id, payload).await
         }
         "diagnostics.collect" => {
             serde_json::from_value::<DiagnosticsCollectPayload>(payload.clone())
-                .map(|_| ())
+                .map(|_| payload)
                 .map_err(|error| {
                     ApiError::BadRequest(format!("invalid diagnostics.collect payload: {error}"))
                 })
@@ -1652,18 +2325,221 @@ fn validate_device_action(name: &str, payload: &Value) -> Result<(), ApiError> {
     }
 }
 
-#[utoipa::path(get, path = "/api/v1/actions", params(ProjectQuery), responses((status = 200)))]
+async fn validate_ota_payload_against_firmware(
+    state: &AppState,
+    project_id: Id,
+    mut payload: OtaInstallPayload,
+) -> Result<Value, ApiError> {
+    let artifact = state
+        .store
+        .list_firmware(project_id)
+        .await?
+        .into_iter()
+        .find(|artifact| artifact.id == payload.firmware_id && artifact.active)
+        .ok_or_else(|| ApiError::NotFound("firmware not found".to_owned()))?;
+    if artifact.verified_at.is_none() {
+        return Err(ApiError::BadRequest(
+            "firmware must be finalized before ota.install".to_owned(),
+        ));
+    }
+    let expected_prefix = firmware_object_key_prefix(project_id);
+    if !artifact.object_key.starts_with(&expected_prefix) {
+        return Err(ApiError::BadRequest(
+            "firmware object_key must stay under its project prefix".to_owned(),
+        ));
+    }
+    if payload.component != artifact.component
+        || payload.version != artifact.version
+        || payload.sha256 != artifact.sha256
+        || payload.signature != artifact.signature
+        || payload.size_bytes != artifact.size_bytes
+    {
+        return Err(ApiError::BadRequest(
+            "ota.install payload does not match firmware metadata".to_owned(),
+        ));
+    }
+    payload.signed_url = presigned_object_url(
+        &state.config.object_storage,
+        &artifact,
+        "GET",
+        Duration::minutes(15),
+    )?
+    .url;
+    serde_json::to_value(payload)
+        .map_err(|_| ApiError::Internal("failed to encode ota.install payload".to_owned()))
+}
+
+#[utoipa::path(get, path = "/api/v1/actions", params(ProjectQuery), responses((status = 200, body = Vec<ActionResponse>)))]
 async fn list_actions(
     headers: HeaderMap,
     State(state): State<AppState>,
     Query(query): Query<ProjectQuery>,
-) -> ApiResult<Vec<Action>> {
+) -> ApiResult<Vec<ActionResponse>> {
     let actor = require_actor(&headers, &state).await?;
     let project_id = query
         .project_id
         .ok_or_else(|| ApiError::BadRequest("project_id is required".to_owned()))?;
     require_project_access(&state, &actor, project_id, "actions:read").await?;
-    Ok(Json(state.store.list_actions(project_id).await?))
+    Ok(Json(
+        state
+            .store
+            .list_actions(project_id)
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+    ))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ActionTransitionRequest {
+    #[schema(value_type = String, format = Uuid)]
+    pub project_id: Id,
+    #[schema(value_type = Option<Vec<String>>)]
+    pub device_ids: Option<Vec<Id>>,
+    pub reason: Option<String>,
+}
+
+#[utoipa::path(post, path = "/api/v1/actions/{action_id}/approve", request_body = ActionTransitionRequest, params(("action_id" = String, Path)), responses((status = 200, body = ActionResponse)))]
+async fn approve_action(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(action_id): Path<Id>,
+    Json(request): Json<ActionTransitionRequest>,
+) -> ApiResult<ActionResponse> {
+    transition_action(
+        headers,
+        state,
+        action_id,
+        request,
+        ActionTransitionOptions {
+            audit_action: "action.approve",
+            allowed_source_states: vec![ActionState::WaitingApproval],
+            next_state: ActionState::Queued,
+            progress: Some(0),
+            errors: Some(Vec::new()),
+        },
+    )
+    .await
+}
+
+#[utoipa::path(post, path = "/api/v1/actions/{action_id}/retry", request_body = ActionTransitionRequest, params(("action_id" = String, Path)), responses((status = 200, body = ActionResponse)))]
+async fn retry_action(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(action_id): Path<Id>,
+    Json(request): Json<ActionTransitionRequest>,
+) -> ApiResult<ActionResponse> {
+    transition_action(
+        headers,
+        state,
+        action_id,
+        request,
+        ActionTransitionOptions {
+            audit_action: "action.retry",
+            allowed_source_states: vec![
+                ActionState::Failed,
+                ActionState::TimedOut,
+                ActionState::Cancelled,
+            ],
+            next_state: ActionState::Queued,
+            progress: Some(0),
+            errors: Some(Vec::new()),
+        },
+    )
+    .await
+}
+
+#[utoipa::path(post, path = "/api/v1/actions/{action_id}/cancel", request_body = ActionTransitionRequest, params(("action_id" = String, Path)), responses((status = 200, body = ActionResponse)))]
+async fn cancel_action(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(action_id): Path<Id>,
+    Json(request): Json<ActionTransitionRequest>,
+) -> ApiResult<ActionResponse> {
+    let reason = request
+        .reason
+        .as_ref()
+        .map(|reason| vec![reason.clone()])
+        .unwrap_or_default();
+    transition_action(
+        headers,
+        state,
+        action_id,
+        request,
+        ActionTransitionOptions {
+            audit_action: "action.cancel",
+            allowed_source_states: vec![
+                ActionState::Queued,
+                ActionState::WaitingApproval,
+                ActionState::Running,
+            ],
+            next_state: ActionState::Cancelled,
+            progress: None,
+            errors: Some(reason),
+        },
+    )
+    .await
+}
+
+struct ActionTransitionOptions {
+    audit_action: &'static str,
+    allowed_source_states: Vec<ActionState>,
+    next_state: ActionState,
+    progress: Option<u8>,
+    errors: Option<Vec<String>>,
+}
+
+async fn transition_action(
+    headers: HeaderMap,
+    state: AppState,
+    action_id: Id,
+    request: ActionTransitionRequest,
+    options: ActionTransitionOptions,
+) -> ApiResult<ActionResponse> {
+    let ActionTransitionOptions {
+        audit_action,
+        allowed_source_states,
+        next_state,
+        progress,
+        errors,
+    } = options;
+    let actor = require_actor(&headers, &state).await?;
+    let project = require_project_role(
+        &state,
+        &actor,
+        request.project_id,
+        Role::Operator,
+        "actions:write",
+    )
+    .await?;
+    let device_count = request.device_ids.as_ref().map(Vec::len);
+    let action = state
+        .store
+        .transition_action_targets(ActionTargetTransition {
+            project_id: request.project_id,
+            action_id,
+            device_ids: request.device_ids,
+            allowed_source_states,
+            next_state: next_state.clone(),
+            progress,
+            errors,
+            ts: Utc::now(),
+        })
+        .await?;
+    record_audit(
+        &state,
+        AuditLog::new(
+            project.org_id,
+            Some(project.id),
+            actor.audit_actor_id(),
+            audit_action,
+            format!("action:{action_id}"),
+            json!({ "state": format!("{next_state:?}"), "device_count": device_count }),
+        ),
+    )
+    .await;
+    Ok(Json(action.into()))
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1702,13 +2578,13 @@ impl From<ActionStateDto> for ActionState {
     }
 }
 
-#[utoipa::path(post, path = "/api/v1/actions/{action_id}/status", request_body = ActionStatusRequest, params(("action_id" = String, Path)), responses((status = 200)))]
+#[utoipa::path(post, path = "/api/v1/actions/{action_id}/status", request_body = ActionStatusRequest, params(("action_id" = String, Path)), responses((status = 200, body = ActionResponse)))]
 async fn update_action_status(
     headers: HeaderMap,
     State(state): State<AppState>,
     Path(action_id): Path<Id>,
     Json(request): Json<ActionStatusRequest>,
-) -> ApiResult<Action> {
+) -> ApiResult<ActionResponse> {
     let actor = require_actor(&headers, &state).await?;
     let project = require_project_role(
         &state,
@@ -1745,7 +2621,33 @@ async fn update_action_status(
         ),
     )
     .await;
-    Ok(Json(action))
+    Ok(Json(action.into()))
+}
+
+fn redacted_action_payload(mut payload: Value) -> Value {
+    redact_signed_url_fields(&mut payload);
+    payload
+}
+
+fn redact_signed_url_fields(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for key in ["signed_url", "upload_url"] {
+                if map.contains_key(key) {
+                    map.insert(key.to_owned(), Value::String("<redacted>".to_owned()));
+                }
+            }
+            for value in map.values_mut() {
+                redact_signed_url_fields(value);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                redact_signed_url_fields(value);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1756,10 +2658,18 @@ pub struct CreateFirmwareRequest {
     pub version: String,
     pub object_key: String,
     pub sha256: String,
+    pub content_type: Option<String>,
+    pub signature: Option<String>,
     pub size_bytes: i64,
 }
 
-#[utoipa::path(post, path = "/api/v1/firmware", request_body = CreateFirmwareRequest, responses((status = 200)))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct SignedObjectUrl {
+    pub url: String,
+    pub expires_at: chrono::DateTime<Utc>,
+}
+
+#[utoipa::path(post, path = "/api/v1/firmware", request_body = CreateFirmwareRequest, responses((status = 200, body = FirmwareArtifactResponse)))]
 async fn create_firmware(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -1774,6 +2684,7 @@ async fn create_firmware(
         "firmware:write",
     )
     .await?;
+    validate_firmware_object_key(request.project_id, &request.object_key)?;
     let artifact = state
         .store
         .create_firmware(FirmwareArtifact::new(
@@ -1782,6 +2693,10 @@ async fn create_firmware(
             request.version,
             request.object_key,
             request.sha256,
+            request
+                .content_type
+                .unwrap_or_else(|| "application/octet-stream".to_owned()),
+            request.signature,
             request.size_bytes,
         ))
         .await?;
@@ -1800,7 +2715,7 @@ async fn create_firmware(
     Ok(Json(artifact))
 }
 
-#[utoipa::path(get, path = "/api/v1/firmware", params(ProjectQuery), responses((status = 200)))]
+#[utoipa::path(get, path = "/api/v1/firmware", params(ProjectQuery), responses((status = 200, body = Vec<FirmwareArtifactResponse>)))]
 async fn list_firmware(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -1814,6 +2729,469 @@ async fn list_firmware(
     Ok(Json(state.store.list_firmware(project_id).await?))
 }
 
+#[utoipa::path(post, path = "/api/v1/firmware/{firmware_id}/upload-url", params(("firmware_id" = String, Path), ProjectQuery), responses((status = 200, body = SignedObjectUrl)))]
+async fn create_firmware_upload_url(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(firmware_id): Path<Id>,
+    Query(query): Query<ProjectQuery>,
+) -> ApiResult<SignedObjectUrl> {
+    let actor = require_actor(&headers, &state).await?;
+    let project_id = query
+        .project_id
+        .ok_or_else(|| ApiError::BadRequest("project_id is required".to_owned()))?;
+    let project =
+        require_project_role(&state, &actor, project_id, Role::Operator, "firmware:write").await?;
+    let artifact = firmware_artifact_for_project(&state, project_id, firmware_id).await?;
+    if artifact.verified_at.is_some() {
+        return Err(ApiError::BadRequest(
+            "finalized firmware artifacts are immutable; create a new artifact for replacement"
+                .to_owned(),
+        ));
+    }
+    validate_firmware_object_key(project_id, &artifact.object_key)?;
+    let signed_url = presigned_object_url(
+        &state.config.object_storage,
+        &artifact,
+        "PUT",
+        Duration::minutes(15),
+    )?;
+    record_audit(
+        &state,
+        AuditLog::new(
+            project.org_id,
+            Some(project.id),
+            actor.audit_actor_id(),
+            "firmware.upload_url.create",
+            format!("firmware:{firmware_id}"),
+            json!({ "object_key": artifact.object_key, "expires_at": signed_url.expires_at }),
+        ),
+    )
+    .await;
+    Ok(Json(signed_url))
+}
+
+#[utoipa::path(post, path = "/api/v1/firmware/{firmware_id}/download-url", params(("firmware_id" = String, Path), ProjectQuery), responses((status = 200, body = SignedObjectUrl)))]
+async fn create_firmware_download_url(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(firmware_id): Path<Id>,
+    Query(query): Query<ProjectQuery>,
+) -> ApiResult<SignedObjectUrl> {
+    let actor = require_actor(&headers, &state).await?;
+    let project_id = query
+        .project_id
+        .ok_or_else(|| ApiError::BadRequest("project_id is required".to_owned()))?;
+    let project =
+        require_project_role(&state, &actor, project_id, Role::Operator, "firmware:read").await?;
+    let artifact = firmware_artifact_for_project(&state, project_id, firmware_id).await?;
+    validate_firmware_object_key(project_id, &artifact.object_key)?;
+    let signed_url = presigned_object_url(
+        &state.config.object_storage,
+        &artifact,
+        "GET",
+        Duration::minutes(15),
+    )?;
+    record_audit(
+        &state,
+        AuditLog::new(
+            project.org_id,
+            Some(project.id),
+            actor.audit_actor_id(),
+            "firmware.download_url.create",
+            format!("firmware:{firmware_id}"),
+            json!({ "object_key": artifact.object_key, "expires_at": signed_url.expires_at }),
+        ),
+    )
+    .await;
+    Ok(Json(signed_url))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct FirmwareFinalizeRequest {
+    #[schema(value_type = String, format = Uuid)]
+    pub project_id: Id,
+    pub sha256: String,
+    pub signature: Option<String>,
+    pub size_bytes: i64,
+}
+
+#[utoipa::path(post, path = "/api/v1/firmware/{firmware_id}/finalize", request_body = FirmwareFinalizeRequest, params(("firmware_id" = String, Path)), responses((status = 200, body = FirmwareArtifactResponse)))]
+async fn finalize_firmware_upload(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(firmware_id): Path<Id>,
+    Json(request): Json<FirmwareFinalizeRequest>,
+) -> ApiResult<FirmwareArtifact> {
+    let actor = require_actor(&headers, &state).await?;
+    let project = require_project_role(
+        &state,
+        &actor,
+        request.project_id,
+        Role::Operator,
+        "firmware:write",
+    )
+    .await?;
+    if request.sha256.len() != 64 || !request.sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(ApiError::BadRequest(
+            "sha256 must be 64 hex characters".to_owned(),
+        ));
+    }
+    if request.size_bytes <= 0 {
+        return Err(ApiError::BadRequest(
+            "size_bytes must be positive".to_owned(),
+        ));
+    }
+    let artifact = state
+        .store
+        .finalize_firmware(
+            request.project_id,
+            firmware_id,
+            &request.sha256,
+            request.size_bytes,
+            request.signature.as_deref(),
+            Utc::now(),
+        )
+        .await?;
+    record_audit(
+        &state,
+        AuditLog::new(
+            project.org_id,
+            Some(project.id),
+            actor.audit_actor_id(),
+            "firmware.finalize",
+            format!("firmware:{firmware_id}"),
+            json!({ "component": artifact.component, "version": artifact.version, "size_bytes": artifact.size_bytes }),
+        ),
+    )
+    .await;
+    Ok(Json(artifact))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct FirmwareRolloutRequest {
+    #[schema(value_type = String, format = Uuid)]
+    pub project_id: Id,
+    #[schema(value_type = Option<Vec<String>>)]
+    pub device_ids: Option<Vec<Id>>,
+    pub cohort_percent: Option<u8>,
+    pub requires_approval: Option<bool>,
+    pub strategy: Option<String>,
+    pub rollback_strategy: Option<String>,
+}
+
+#[utoipa::path(post, path = "/api/v1/firmware/{firmware_id}/rollout", request_body = FirmwareRolloutRequest, params(("firmware_id" = String, Path)), responses((status = 200, body = FirmwareRolloutResponse)))]
+async fn create_firmware_rollout(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(firmware_id): Path<Id>,
+    Json(request): Json<FirmwareRolloutRequest>,
+) -> ApiResult<FirmwareRollout> {
+    let actor = require_actor(&headers, &state).await?;
+    let project = require_project_role(
+        &state,
+        &actor,
+        request.project_id,
+        Role::Operator,
+        "firmware:write",
+    )
+    .await?;
+    let artifact = firmware_artifact_for_project(&state, request.project_id, firmware_id).await?;
+    validate_firmware_object_key(request.project_id, &artifact.object_key)?;
+    if artifact.verified_at.is_none() {
+        return Err(ApiError::BadRequest(
+            "firmware must be finalized before rollout".to_owned(),
+        ));
+    }
+    let mut target_ids = match request.device_ids {
+        Some(device_ids) => device_ids,
+        None => {
+            let mut devices = state.store.list_devices(request.project_id).await?;
+            devices.sort_by_key(|device| (device.created_at, device.id));
+            let percent = request.cohort_percent.unwrap_or(100);
+            if percent == 0 || percent > 100 {
+                return Err(ApiError::BadRequest(
+                    "cohort_percent must be between 1 and 100".to_owned(),
+                ));
+            }
+            let selected = (devices.len() * percent as usize).div_ceil(100);
+            devices
+                .into_iter()
+                .take(selected.max(1))
+                .map(|device| device.id)
+                .collect()
+        }
+    };
+    target_ids.sort();
+    target_ids.dedup();
+    if target_ids.is_empty() {
+        return Err(ApiError::BadRequest(
+            "rollout target cohort must not be empty".to_owned(),
+        ));
+    }
+    for device_id in &target_ids {
+        state
+            .store
+            .get_device(request.project_id, *device_id)
+            .await?;
+    }
+    let payload = ota_payload_for_artifact(&state, &artifact)?;
+    let mut action = Action::new(
+        request.project_id,
+        target_ids.clone(),
+        "ota.install",
+        payload,
+        actor.audit_actor_id(),
+    );
+    let requires_approval = request.requires_approval.unwrap_or(false);
+    if requires_approval {
+        action.state = ActionState::WaitingApproval;
+    }
+    let action = state.store.create_action(action).await?;
+    let rollout = state
+        .store
+        .create_firmware_rollout(FirmwareRollout::new(NewFirmwareRollout {
+            project_id: request.project_id,
+            firmware_id,
+            action_id: action.id,
+            cohort_size: target_ids.len() as i64,
+            strategy: request.strategy.unwrap_or_else(|| "cohort".to_owned()),
+            rollback_strategy: request.rollback_strategy,
+            state: if requires_approval {
+                FirmwareRolloutState::WaitingApproval
+            } else {
+                FirmwareRolloutState::Running
+            },
+            created_by: actor.audit_actor_id(),
+        }))
+        .await?;
+    record_audit(
+        &state,
+        AuditLog::new(
+            project.org_id,
+            Some(project.id),
+            actor.audit_actor_id(),
+            "firmware.rollout.create",
+            format!("firmware_rollout:{}", rollout.id),
+            json!({ "firmware_id": firmware_id, "action_id": action.id, "target_count": target_ids.len(), "requires_approval": requires_approval }),
+        ),
+    )
+    .await;
+    Ok(Json(rollout))
+}
+
+#[utoipa::path(get, path = "/api/v1/firmware-rollouts", params(ProjectQuery), responses((status = 200, body = Vec<FirmwareRolloutResponse>)))]
+async fn list_firmware_rollouts(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(query): Query<ProjectQuery>,
+) -> ApiResult<Vec<FirmwareRollout>> {
+    let actor = require_actor(&headers, &state).await?;
+    let project_id = query
+        .project_id
+        .ok_or_else(|| ApiError::BadRequest("project_id is required".to_owned()))?;
+    require_project_access(&state, &actor, project_id, "firmware:read").await?;
+    Ok(Json(state.store.list_firmware_rollouts(project_id).await?))
+}
+
+async fn firmware_artifact_for_project(
+    state: &AppState,
+    project_id: Id,
+    firmware_id: Id,
+) -> Result<FirmwareArtifact, ApiError> {
+    state
+        .store
+        .list_firmware(project_id)
+        .await?
+        .into_iter()
+        .find(|artifact| artifact.id == firmware_id)
+        .ok_or_else(|| ApiError::NotFound("firmware not found".to_owned()))
+}
+
+fn ota_payload_for_artifact(
+    state: &AppState,
+    artifact: &FirmwareArtifact,
+) -> Result<Value, ApiError> {
+    let signed_url = presigned_object_url(
+        &state.config.object_storage,
+        artifact,
+        "GET",
+        Duration::minutes(15),
+    )?
+    .url;
+    let payload = OtaInstallPayload {
+        firmware_id: artifact.id,
+        component: artifact.component.clone(),
+        version: artifact.version.clone(),
+        signed_url,
+        sha256: artifact.sha256.clone(),
+        signature: artifact.signature.clone(),
+        size_bytes: artifact.size_bytes,
+    };
+    payload
+        .validate()
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    serde_json::to_value(payload)
+        .map_err(|_| ApiError::Internal("failed to encode ota.install payload".to_owned()))
+}
+
+fn firmware_object_key_prefix(project_id: Id) -> String {
+    format!("projects/{project_id}/firmware/")
+}
+
+fn validate_firmware_object_key(project_id: Id, object_key: &str) -> Result<(), ApiError> {
+    let expected_prefix = firmware_object_key_prefix(project_id);
+    if object_key.starts_with(&expected_prefix)
+        && !object_key[expected_prefix.len()..].trim().is_empty()
+        && !object_key.contains("//")
+    {
+        Ok(())
+    } else {
+        Err(ApiError::BadRequest(format!(
+            "object_key must start with {expected_prefix}"
+        )))
+    }
+}
+
+fn presigned_object_url(
+    config: &ObjectStorageConfig,
+    artifact: &FirmwareArtifact,
+    method: &str,
+    ttl: Duration,
+) -> Result<SignedObjectUrl, ApiError> {
+    presigned_object_key_url(config, &artifact.object_key, method, ttl)
+}
+
+fn presigned_object_key_url(
+    config: &ObjectStorageConfig,
+    object_key: &str,
+    method: &str,
+    ttl: Duration,
+) -> Result<SignedObjectUrl, ApiError> {
+    let expires_at = Utc::now() + ttl;
+    let expires = ttl.num_seconds().clamp(1, 604_800);
+    let endpoint = Url::parse(&config.public_endpoint)
+        .map_err(|_| ApiError::Internal("S3_PUBLIC_ENDPOINT is invalid".to_owned()))?;
+    let host = endpoint
+        .host_str()
+        .ok_or_else(|| ApiError::Internal("S3_PUBLIC_ENDPOINT is missing host".to_owned()))?;
+    let host_header = match endpoint.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_owned(),
+    };
+    let date = Utc::now();
+    let datestamp = date.format("%Y%m%d").to_string();
+    let amz_date = date.format("%Y%m%dT%H%M%SZ").to_string();
+    let credential_scope = format!("{}/{}/s3/aws4_request", datestamp, config.region);
+    let credential = format!("{}/{}", config.access_key_id, credential_scope);
+    let endpoint_path = endpoint.path().trim_end_matches('/');
+    let object_path = format!(
+        "{}/{}/{}",
+        endpoint_path,
+        percent_encode_path_segment(&config.bucket),
+        percent_encode_object_key(object_key)
+    );
+    let canonical_uri = if object_path.starts_with('/') {
+        object_path
+    } else {
+        format!("/{object_path}")
+    };
+    let mut query = HashMap::from([
+        ("X-Amz-Algorithm", "AWS4-HMAC-SHA256".to_owned()),
+        ("X-Amz-Credential", credential),
+        ("X-Amz-Date", amz_date),
+        ("X-Amz-Expires", expires.to_string()),
+        ("X-Amz-SignedHeaders", "host".to_owned()),
+    ]);
+    let canonical_query = canonical_query_string(&query);
+    let canonical_request = format!(
+        "{method}\n{canonical_uri}\n{canonical_query}\nhost:{host_header}\n\nhost\nUNSIGNED-PAYLOAD"
+    );
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{}\n{}\n{}",
+        query["X-Amz-Date"],
+        credential_scope,
+        encode_hex(&sha256_digest(canonical_request.as_bytes()))
+    );
+    let signature = aws_sigv4_signature(
+        config.secret_access_key.as_bytes(),
+        &datestamp,
+        &config.region,
+        string_to_sign.as_bytes(),
+    );
+    query.insert("X-Amz-Signature", signature);
+    let query = canonical_query_string(&query);
+    let url = format!(
+        "{}://{}{}?{}",
+        endpoint.scheme(),
+        host_header,
+        canonical_uri,
+        query
+    );
+    Ok(SignedObjectUrl { url, expires_at })
+}
+
+fn canonical_query_string(query: &HashMap<&'static str, String>) -> String {
+    let mut pairs = query
+        .iter()
+        .map(|(key, value)| {
+            (
+                percent_encode_path_segment(key),
+                percent_encode_path_segment(value),
+            )
+        })
+        .collect::<Vec<_>>();
+    pairs.sort();
+    pairs
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+fn sha256_digest(bytes: &[u8]) -> Vec<u8> {
+    Sha256::digest(bytes).to_vec()
+}
+
+fn hmac_sha256(key: &[u8], message: &[u8]) -> Vec<u8> {
+    let signing_key = hmac::Key::new(hmac::HMAC_SHA256, key);
+    hmac::sign(&signing_key, message).as_ref().to_vec()
+}
+
+fn aws_sigv4_signature(secret: &[u8], date: &str, region: &str, string_to_sign: &[u8]) -> String {
+    let mut seed = b"AWS4".to_vec();
+    seed.extend_from_slice(secret);
+    let date_key = hmac_sha256(&seed, date.as_bytes());
+    let region_key = hmac_sha256(&date_key, region.as_bytes());
+    let service_key = hmac_sha256(&region_key, b"s3");
+    let signing_key = hmac_sha256(&service_key, b"aws4_request");
+    encode_hex(&hmac_sha256(&signing_key, string_to_sign))
+}
+
+fn percent_encode_object_key(value: &str) -> String {
+    value
+        .split('/')
+        .map(percent_encode_path_segment)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn percent_encode_path_segment(value: &str) -> String {
+    value
+        .bytes()
+        .flat_map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                vec![byte as char]
+            }
+            _ => format!("%{byte:02X}").chars().collect(),
+        })
+        .collect()
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateDashboardRequest {
     #[schema(value_type = String, format = Uuid)]
@@ -1822,7 +3200,7 @@ pub struct CreateDashboardRequest {
     pub layout: Value,
 }
 
-#[utoipa::path(post, path = "/api/v1/dashboards", request_body = CreateDashboardRequest, responses((status = 200)))]
+#[utoipa::path(post, path = "/api/v1/dashboards", request_body = CreateDashboardRequest, responses((status = 200, body = DashboardResponse)))]
 async fn create_dashboard(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -1861,7 +3239,7 @@ async fn create_dashboard(
     Ok(Json(dashboard))
 }
 
-#[utoipa::path(get, path = "/api/v1/dashboards", params(ProjectQuery), responses((status = 200)))]
+#[utoipa::path(get, path = "/api/v1/dashboards", params(ProjectQuery), responses((status = 200, body = Vec<DashboardResponse>)))]
 async fn list_dashboards(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -1901,7 +3279,7 @@ impl From<AlertKindDto> for AlertKind {
     }
 }
 
-#[utoipa::path(post, path = "/api/v1/alerts", request_body = CreateAlertRequest, responses((status = 200)))]
+#[utoipa::path(post, path = "/api/v1/alerts", request_body = CreateAlertRequest, responses((status = 200, body = AlertRuleResponse)))]
 async fn create_alert(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -1942,7 +3320,7 @@ async fn create_alert(
     Ok(Json(alert))
 }
 
-#[utoipa::path(get, path = "/api/v1/alerts", params(ProjectQuery), responses((status = 200)))]
+#[utoipa::path(get, path = "/api/v1/alerts", params(ProjectQuery), responses((status = 200, body = Vec<AlertRuleResponse>)))]
 async fn list_alerts(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -1956,7 +3334,274 @@ async fn list_alerts(
     Ok(Json(state.store.list_alerts(project_id).await?))
 }
 
-#[utoipa::path(get, path = "/api/v1/audit", params(ProjectQuery), responses((status = 200)))]
+#[derive(Debug, Deserialize, ToSchema)]
+pub enum AlertEventStateDto {
+    Firing,
+    Resolved,
+}
+
+impl From<AlertEventStateDto> for AlertEventState {
+    fn from(value: AlertEventStateDto) -> Self {
+        match value {
+            AlertEventStateDto::Firing => AlertEventState::Firing,
+            AlertEventStateDto::Resolved => AlertEventState::Resolved,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct AlertEventQuery {
+    #[param(value_type = String, format = Uuid)]
+    pub project_id: Id,
+    pub state: Option<AlertEventStateDto>,
+}
+
+#[utoipa::path(get, path = "/api/v1/alert-events", params(AlertEventQuery), responses((status = 200, body = Vec<AlertEventResponse>)))]
+async fn list_alert_events(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(query): Query<AlertEventQuery>,
+) -> ApiResult<Vec<excalibur_domain::AlertEvent>> {
+    let actor = require_actor(&headers, &state).await?;
+    require_project_access(&state, &actor, query.project_id, "alerts:read").await?;
+    Ok(Json(
+        state
+            .store
+            .list_alert_events(query.project_id, query.state.map(Into::into))
+            .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateDiagnosticsSessionRequest {
+    #[schema(value_type = String, format = Uuid)]
+    pub project_id: Id,
+    #[schema(value_type = String, format = Uuid)]
+    pub device_id: Id,
+    #[serde(default)]
+    pub paths: Vec<String>,
+    #[serde(default)]
+    pub include_logs: bool,
+    #[serde(default)]
+    pub include_system_stats: bool,
+    pub upload_ttl_seconds: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DiagnosticsSessionCreateResult {
+    pub session: DiagnosticsSession,
+    pub upload_url: SignedObjectUrl,
+    pub action: ActionResponse,
+}
+
+#[utoipa::path(post, path = "/api/v1/diagnostics/sessions", request_body = CreateDiagnosticsSessionRequest, responses((status = 200, body = DiagnosticsSessionCreateResponse)))]
+async fn create_diagnostics_session(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<CreateDiagnosticsSessionRequest>,
+) -> ApiResult<DiagnosticsSessionCreateResult> {
+    let actor = require_actor(&headers, &state).await?;
+    let project = require_project_role(
+        &state,
+        &actor,
+        request.project_id,
+        Role::Operator,
+        "diagnostics:write",
+    )
+    .await?;
+    state
+        .store
+        .get_device(request.project_id, request.device_id)
+        .await?;
+    let mut session = DiagnosticsSession::new(
+        request.project_id,
+        request.device_id,
+        None,
+        diagnostics_object_key(request.project_id, request.device_id, Uuid::now_v7()),
+        actor.audit_actor_id(),
+    );
+    session.object_key = diagnostics_object_key(request.project_id, request.device_id, session.id);
+    let ttl = Duration::seconds(request.upload_ttl_seconds.unwrap_or(900).clamp(60, 3600));
+    let upload_url = presigned_object_key_url(
+        &state.config.object_storage,
+        &session.object_key,
+        "PUT",
+        ttl,
+    )?;
+    session.state = DiagnosticsSessionState::UploadPending;
+    session.upload_url_expires_at = Some(upload_url.expires_at);
+    let session = state.store.create_diagnostics_session(session).await?;
+    let payload = DiagnosticsCollectPayload {
+        session_id: session.id,
+        paths: request.paths,
+        include_logs: request.include_logs,
+        include_system_stats: request.include_system_stats,
+        upload_url: Some(upload_url.url.clone()),
+    };
+    let action = state
+        .store
+        .create_action(Action::new(
+            request.project_id,
+            vec![request.device_id],
+            "diagnostics.collect",
+            serde_json::to_value(payload).map_err(|_| {
+                ApiError::Internal("failed to encode diagnostics payload".to_owned())
+            })?,
+            actor.audit_actor_id(),
+        ))
+        .await?;
+    let mut session = session;
+    session.action_id = Some(action.id);
+    session.updated_at = Utc::now();
+    let session = state.store.update_diagnostics_session(session).await?;
+    record_audit(
+        &state,
+        AuditLog::new(
+            project.org_id,
+            Some(project.id),
+            actor.audit_actor_id(),
+            "diagnostics.session.create",
+            format!("diagnostics_session:{}", session.id),
+            json!({ "device_id": request.device_id, "action_id": action.id, "object_key": session.object_key, "upload_url_expires_at": upload_url.expires_at }),
+        ),
+    )
+    .await;
+    Ok(Json(DiagnosticsSessionCreateResult {
+        session,
+        upload_url,
+        action: action.into(),
+    }))
+}
+
+#[utoipa::path(get, path = "/api/v1/diagnostics/sessions", params(ProjectQuery), responses((status = 200, body = Vec<DiagnosticsSessionResponse>)))]
+async fn list_diagnostics_sessions(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(query): Query<ProjectQuery>,
+) -> ApiResult<Vec<DiagnosticsSession>> {
+    let actor = require_actor(&headers, &state).await?;
+    let project_id = query
+        .project_id
+        .ok_or_else(|| ApiError::BadRequest("project_id is required".to_owned()))?;
+    require_project_access(&state, &actor, project_id, "diagnostics:read").await?;
+    Ok(Json(
+        state.store.list_diagnostics_sessions(project_id).await?,
+    ))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct DiagnosticsFinalizeRequest {
+    #[schema(value_type = String, format = Uuid)]
+    pub project_id: Id,
+    pub size_bytes: i64,
+    pub sha256: String,
+}
+
+#[utoipa::path(post, path = "/api/v1/diagnostics/sessions/{session_id}/finalize", request_body = DiagnosticsFinalizeRequest, params(("session_id" = String, Path)), responses((status = 200, body = DiagnosticsSessionResponse)))]
+async fn finalize_diagnostics_session(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(session_id): Path<Id>,
+    Json(request): Json<DiagnosticsFinalizeRequest>,
+) -> ApiResult<DiagnosticsSession> {
+    let actor = require_actor(&headers, &state).await?;
+    let project = require_project_role(
+        &state,
+        &actor,
+        request.project_id,
+        Role::Operator,
+        "diagnostics:write",
+    )
+    .await?;
+    if request.size_bytes <= 0 {
+        return Err(ApiError::BadRequest(
+            "size_bytes must be positive".to_owned(),
+        ));
+    }
+    if request.sha256.len() != 64 || !request.sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(ApiError::BadRequest(
+            "sha256 must be 64 hex characters".to_owned(),
+        ));
+    }
+    let mut session = state
+        .store
+        .get_diagnostics_session(request.project_id, session_id)
+        .await?;
+    session.state = DiagnosticsSessionState::Uploaded;
+    session.size_bytes = Some(request.size_bytes);
+    session.sha256 = Some(request.sha256);
+    session.error = None;
+    session.updated_at = Utc::now();
+    let session = state.store.update_diagnostics_session(session).await?;
+    record_audit(
+        &state,
+        AuditLog::new(
+            project.org_id,
+            Some(project.id),
+            actor.audit_actor_id(),
+            "diagnostics.session.finalize",
+            format!("diagnostics_session:{session_id}"),
+            json!({ "size_bytes": request.size_bytes }),
+        ),
+    )
+    .await;
+    Ok(Json(session))
+}
+
+#[utoipa::path(post, path = "/api/v1/diagnostics/sessions/{session_id}/download-url", params(("session_id" = String, Path), ProjectQuery), responses((status = 200, body = SignedObjectUrl)))]
+async fn create_diagnostics_download_url(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(session_id): Path<Id>,
+    Query(query): Query<ProjectQuery>,
+) -> ApiResult<SignedObjectUrl> {
+    let actor = require_actor(&headers, &state).await?;
+    let project_id = query
+        .project_id
+        .ok_or_else(|| ApiError::BadRequest("project_id is required".to_owned()))?;
+    let project =
+        require_project_role(&state, &actor, project_id, Role::Viewer, "diagnostics:read").await?;
+    let mut session = state
+        .store
+        .get_diagnostics_session(project_id, session_id)
+        .await?;
+    if !matches!(
+        session.state,
+        DiagnosticsSessionState::Uploaded | DiagnosticsSessionState::Completed
+    ) {
+        return Err(ApiError::BadRequest(
+            "diagnostics object is not finalized".to_owned(),
+        ));
+    }
+    let signed_url = presigned_object_key_url(
+        &state.config.object_storage,
+        &session.object_key,
+        "GET",
+        Duration::minutes(15),
+    )?;
+    session.download_url_expires_at = Some(signed_url.expires_at);
+    session.updated_at = Utc::now();
+    let session = state.store.update_diagnostics_session(session).await?;
+    record_audit(
+        &state,
+        AuditLog::new(
+            project.org_id,
+            Some(project.id),
+            actor.audit_actor_id(),
+            "diagnostics.download_url.create",
+            format!("diagnostics_session:{session_id}"),
+            json!({ "object_key": session.object_key, "expires_at": signed_url.expires_at }),
+        ),
+    )
+    .await;
+    Ok(Json(signed_url))
+}
+
+fn diagnostics_object_key(project_id: Id, device_id: Id, session_id: Id) -> String {
+    format!("projects/{project_id}/diagnostics/{device_id}/{session_id}.tar.zst")
+}
+
+#[utoipa::path(get, path = "/api/v1/audit", params(ProjectQuery), responses((status = 200, body = Vec<AuditLogResponse>)))]
 async fn list_audit(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -2030,7 +3675,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_endpoint_works() {
-        let response = app()
+        let response = app_with_state(AppState::default())
             .oneshot(
                 Request::builder()
                     .uri("/health")
@@ -2045,7 +3690,7 @@ mod tests {
 
     #[tokio::test]
     async fn readiness_endpoint_checks_store() {
-        let response = app()
+        let response = app_with_state(AppState::default())
             .oneshot(
                 Request::builder()
                     .uri("/ready")
@@ -2060,7 +3705,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_short_password_registration() {
-        let response = app()
+        let response = app_with_state(AppState::default())
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -2084,7 +3729,7 @@ mod tests {
 
     #[tokio::test]
     async fn login_uses_generic_invalid_credentials_for_missing_user() {
-        let response = app()
+        let response = app_with_state(AppState::default())
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -2107,7 +3752,7 @@ mod tests {
 
     #[tokio::test]
     async fn protected_routes_require_bearer_token() {
-        let response = app()
+        let response = app_with_state(AppState::default())
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/orgs")
@@ -2876,6 +4521,7 @@ mod tests {
         assert!(!auth.production);
         assert_eq!(auth.project_id, project.id);
         assert_eq!(auth.device_id, device.id);
+        assert_eq!(auth.certificate_fingerprint_sha256.len(), 64);
         assert!(auth.authentication.device_private_key.is_some());
         assert!(auth.authentication.device_private_key_path.is_none());
 
@@ -2885,6 +4531,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(certificates.len(), 1);
+        assert_eq!(auth.certificate_id, certificates[0].id);
         assert_eq!(
             certificates[0].fingerprint_sha256,
             certificate_fingerprint_sha256(&auth.authentication.device_certificate).unwrap()
@@ -2927,6 +4574,49 @@ mod tests {
                 .count()
                 >= 2
         );
+    }
+
+    #[tokio::test]
+    async fn dev_auth_provisioning_can_be_disabled_by_config() {
+        let mut config = AppConfig::development();
+        config.enable_dev_auth = false;
+        let state = AppState::with_config(Store::memory(), config);
+        let user = state
+            .store
+            .create_user(User::new("prod-owner@example.com", "Prod Owner", "hash"))
+            .await
+            .unwrap();
+        let org = state
+            .store
+            .create_org(Org::new("Prod Org", "prod-org"), user.id)
+            .await
+            .unwrap();
+        let project = state
+            .store
+            .create_project(Project::new(org.id, "Factory", "factory"))
+            .await
+            .unwrap();
+        let device = state
+            .store
+            .create_device(Device::new(project.id, "press-1", json!({})))
+            .await
+            .unwrap();
+        seed_session(&state, "prod-owner-token", user.id).await;
+
+        let response = app_with_state(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/devices/{}/provision/dev-auth", device.id))
+                    .header("authorization", "Bearer prod-owner-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "project_id": project.id }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -2984,7 +4674,7 @@ mod tests {
                     .body(Body::from(
                         json!({
                             "project_id": project.id,
-                            "csr_pem": "-----BEGIN CERTIFICATE REQUEST-----\nZXhjYWxpYnVyLWNzcg==\n-----END CERTIFICATE REQUEST-----",
+                            "csr_pem": "-----BEGIN CERTIFICATE REQUEST-----\nMIG6MG4CAQAwOzESMBAGA1UECgwJZXhjYWxpYnVyMQ8wDQYDVQQLDAZkZXZpY2Ux\nFDASBgNVBAMMC3Rlc3QtZGV2aWNlMCowBQYDK2VwAyEA9eGUKj9rtDbURETItcWC\nvys0CpejKqCbqugamYw154GgADAFBgMrZXADQQDinQ1NOJG91MTuKNKvzIop75+1\n2SQtpjXzpYnESjCbeNmblnoLnQRlORFDj67pur5jmCYUTNLawefCAy5G/KgG\n-----END CERTIFICATE REQUEST-----",
                             "device_private_key_path": "/etc/excalibur/device.key"
                         })
                         .to_string(),
@@ -2997,6 +4687,7 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let config: DeviceConfig = serde_json::from_slice(&body).unwrap();
         assert!(config.production);
+        assert_eq!(config.certificate_fingerprint_sha256.len(), 64);
         assert_eq!(
             config.authentication.device_private_key_path.as_deref(),
             Some("/etc/excalibur/device.key")
@@ -3008,6 +4699,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(certificates.len(), 1);
+        assert_eq!(config.certificate_id, certificates[0].id);
         assert_eq!(
             certificates[0].fingerprint_sha256,
             certificate_fingerprint_sha256(&config.authentication.device_certificate).unwrap()
@@ -3153,6 +4845,158 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn action_transition_endpoints_cover_approval_retry_and_cancel_audit() {
+        let state = AppState::default();
+        let user = state
+            .store
+            .create_user(User::new("owner@example.com", "Owner", "hash"))
+            .await
+            .unwrap();
+        let org = state
+            .store
+            .create_org(Org::new("Acme", "acme"), user.id)
+            .await
+            .unwrap();
+        let project = state
+            .store
+            .create_project(Project::new(org.id, "Factory", "factory"))
+            .await
+            .unwrap();
+        let device = state
+            .store
+            .create_device(Device::new(project.id, "press-1", json!({})))
+            .await
+            .unwrap();
+        seed_session(&state, "owner-token", user.id).await;
+
+        let create_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/actions")
+                    .header("authorization", "Bearer owner-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "project_id": project.id,
+                            "device_ids": [device.id],
+                            "name": "diagnostics.collect",
+                            "payload": {
+                                "session_id": Uuid::now_v7(),
+                                "paths": ["/var/log/excalibur"]
+                            },
+                            "requires_approval": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_response.status(), StatusCode::OK);
+        let body = to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let action: Action = serde_json::from_slice(&body).unwrap();
+        assert_eq!(action.state, ActionState::WaitingApproval);
+
+        let approve_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/actions/{}/approve", action.id))
+                    .header("authorization", "Bearer owner-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "project_id": project.id }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(approve_response.status(), StatusCode::OK);
+        let body = to_bytes(approve_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let approved: Action = serde_json::from_slice(&body).unwrap();
+        assert_eq!(approved.state, ActionState::Queued);
+
+        let claimed_targets = state.store.claim_queued_action_targets(1).await.unwrap();
+        assert_eq!(claimed_targets.len(), 1);
+        assert_eq!(claimed_targets[0].action_id, action.id);
+        assert_eq!(claimed_targets[0].device_id, device.id);
+
+        state
+            .store
+            .update_action_status(ActionStatusUpdate {
+                project_id: project.id,
+                action_id: action.id,
+                device_id: device.id,
+                state: ActionState::Failed,
+                progress: 12,
+                errors: vec!["checksum mismatch".to_owned()],
+                ts: Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        let retry_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/actions/{}/retry", action.id))
+                    .header("authorization", "Bearer owner-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "project_id": project.id, "device_ids": [device.id] }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retry_response.status(), StatusCode::OK);
+        let body = to_bytes(retry_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let retried: Action = serde_json::from_slice(&body).unwrap();
+        assert_eq!(retried.state, ActionState::Queued);
+        assert!(retried.errors.is_empty());
+
+        let cancel_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/actions/{}/cancel", action.id))
+                    .header("authorization", "Bearer owner-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "project_id": project.id,
+                            "reason": "operator cancelled rollout"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cancel_response.status(), StatusCode::OK);
+        let body = to_bytes(cancel_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let cancelled: Action = serde_json::from_slice(&body).unwrap();
+        assert_eq!(cancelled.state, ActionState::Cancelled);
+        assert_eq!(cancelled.errors, vec!["operator cancelled rollout"]);
+
+        let audit = state
+            .store
+            .list_audit(org.id, Some(project.id))
+            .await
+            .unwrap();
+        assert!(audit.iter().any(|entry| entry.action == "action.approve"));
+        assert!(audit.iter().any(|entry| entry.action == "action.retry"));
+        assert!(audit.iter().any(|entry| entry.action == "action.cancel"));
+    }
+
+    #[tokio::test]
     async fn project_resource_writes_append_audit_entries() {
         let state = AppState::default();
         let user = state
@@ -3270,8 +5114,10 @@ mod tests {
                             "project_id": project.id,
                             "component": "main",
                             "version": "1.0.0",
-                            "object_key": "firmware/main/1.0.0.bin",
+                            "object_key": format!("projects/{}/firmware/main/1.0.0.bin", project.id),
                             "sha256": "a".repeat(64),
+                            "content_type": "application/octet-stream",
+                            "signature": "ed25519:test",
                             "size_bytes": 1024
                         })
                         .to_string(),
@@ -3281,6 +5127,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(firmware_response.status(), StatusCode::OK);
+        let body = to_bytes(firmware_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let firmware: FirmwareArtifact = serde_json::from_slice(&body).unwrap();
+        assert_eq!(firmware.content_type, "application/octet-stream");
+        assert_eq!(firmware.signature.as_deref(), Some("ed25519:test"));
+
+        let upload_url_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/v1/firmware/{}/upload-url?project_id={}",
+                        firmware.id, project.id
+                    ))
+                    .header("authorization", "Bearer owner-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(upload_url_response.status(), StatusCode::OK);
+        let body = to_bytes(upload_url_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let upload_url: SignedObjectUrl = serde_json::from_slice(&body).unwrap();
+        assert!(upload_url.url.contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"));
+        assert!(upload_url.url.contains("X-Amz-Expires=900"));
+        assert!(upload_url.url.contains("X-Amz-Signature="));
 
         let dashboard_response = app_with_state(state.clone())
             .oneshot(
@@ -3338,6 +5213,11 @@ mod tests {
                 .any(|entry| entry.action == "action.status_update")
         );
         assert!(audit.iter().any(|entry| entry.action == "firmware.create"));
+        assert!(
+            audit
+                .iter()
+                .any(|entry| entry.action == "firmware.upload_url.create")
+        );
         assert!(audit.iter().any(|entry| entry.action == "dashboard.create"));
         assert!(audit.iter().any(|entry| entry.action == "alert.create"));
     }
@@ -3406,6 +5286,136 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn action_list_redacts_signed_object_urls_from_payloads() {
+        let state = AppState::default();
+        let user = state
+            .store
+            .create_user(User::new(
+                "redact-actions@example.com",
+                "Redact Actions",
+                "hash",
+            ))
+            .await
+            .unwrap();
+        let org = state
+            .store
+            .create_org(Org::new("Redact Actions Org", "redact-actions"), user.id)
+            .await
+            .unwrap();
+        let project = state
+            .store
+            .create_project(Project::new(org.id, "Factory", "factory"))
+            .await
+            .unwrap();
+        let device = state
+            .store
+            .create_device(Device::new(project.id, "press-1", json!({})))
+            .await
+            .unwrap();
+        state
+            .store
+            .create_action(Action::new(
+                project.id,
+                vec![device.id],
+                "ota.install",
+                json!({
+                    "firmware_id": Uuid::now_v7(),
+                    "signed_url": "https://objects.example/private.bin?X-Amz-Signature=secret",
+                    "nested": { "upload_url": "https://objects.example/upload?X-Amz-Signature=secret" }
+                }),
+                Some(user.id),
+            ))
+            .await
+            .unwrap();
+        seed_session(&state, "redact-actions-token", user.id).await;
+
+        let response = app_with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/actions?project_id={}", project.id))
+                    .header("authorization", "Bearer redact-actions-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!body.contains("X-Amz-Signature=secret"));
+        assert!(body.contains("<redacted>"));
+    }
+
+    #[tokio::test]
+    async fn finalized_firmware_cannot_receive_new_upload_urls() {
+        let state = AppState::default();
+        let user = state
+            .store
+            .create_user(User::new(
+                "immutable-firmware@example.com",
+                "Immutable Firmware",
+                "hash",
+            ))
+            .await
+            .unwrap();
+        let org = state
+            .store
+            .create_org(Org::new("Immutable Firmware Org", "immutable-fw"), user.id)
+            .await
+            .unwrap();
+        let project = state
+            .store
+            .create_project(Project::new(org.id, "Factory", "factory"))
+            .await
+            .unwrap();
+        let firmware = state
+            .store
+            .create_firmware(FirmwareArtifact::new(
+                project.id,
+                "main",
+                "1.0.0",
+                format!("projects/{}/firmware/main/1.0.0.bin", project.id),
+                "a".repeat(64),
+                "application/octet-stream",
+                Some("ed25519:test".to_owned()),
+                1024,
+            ))
+            .await
+            .unwrap();
+        state
+            .store
+            .finalize_firmware(
+                project.id,
+                firmware.id,
+                &"a".repeat(64),
+                1024,
+                Some("ed25519:test"),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        seed_session(&state, "immutable-firmware-token", user.id).await;
+
+        let response = app_with_state(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/v1/firmware/{}/upload-url?project_id={}",
+                        firmware.id, project.id
+                    ))
+                    .header("authorization", "Bearer immutable-firmware-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -3480,5 +5490,426 @@ mod tests {
             .unwrap();
 
         assert_eq!(write_response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn viewer_members_cannot_create_firmware_upload_urls() {
+        let state = AppState::default();
+        let owner = state
+            .store
+            .create_user(User::new(
+                "firmware-owner@example.com",
+                "Firmware Owner",
+                "hash",
+            ))
+            .await
+            .unwrap();
+        let viewer = state
+            .store
+            .create_user(User::new(
+                "firmware-viewer@example.com",
+                "Firmware Viewer",
+                "hash",
+            ))
+            .await
+            .unwrap();
+        let org = state
+            .store
+            .create_org(Org::new("Firmware Org", "firmware-org"), owner.id)
+            .await
+            .unwrap();
+        let project = state
+            .store
+            .create_project(Project::new(org.id, "Factory", "factory"))
+            .await
+            .unwrap();
+        state
+            .store
+            .add_membership(excalibur_domain::Membership::new(
+                org.id,
+                viewer.id,
+                Role::Viewer,
+            ))
+            .await
+            .unwrap();
+        let artifact = state
+            .store
+            .create_firmware(FirmwareArtifact::new(
+                project.id,
+                "main",
+                "1.0.0",
+                format!("projects/{}/firmware/main/1.0.0.bin", project.id),
+                "a".repeat(64),
+                "application/octet-stream",
+                Some("ed25519:test".to_owned()),
+                1024,
+            ))
+            .await
+            .unwrap();
+        seed_session(&state, "firmware-viewer-token", viewer.id).await;
+
+        let response = app_with_state(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/v1/firmware/{}/upload-url?project_id={}",
+                        artifact.id, project.id
+                    ))
+                    .header("authorization", "Bearer firmware-viewer-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_exposes_prometheus_text() {
+        let response = app_with_state(AppState::default())
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("excalibur_api_uptime_seconds"));
+        assert!(body.contains("excalibur_api_auth_rate_limit_keys"));
+    }
+
+    #[tokio::test]
+    async fn auth_rate_limit_rejects_repeated_login_attempts() {
+        let mut config = AppConfig::development();
+        config.auth_rate_limit_max_attempts = 1;
+        config.auth_rate_limit_window_seconds = 60;
+        let state = AppState::with_config(Store::memory(), config);
+
+        let first = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .header("x-forwarded-for", "203.0.113.10")
+                    .body(Body::from(
+                        json!({
+                            "email": "limited@example.com",
+                            "password": "correct horse battery staple"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::UNAUTHORIZED);
+
+        let second = app_with_state(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .header("x-forwarded-for", "203.0.113.10")
+                    .body(Body::from(
+                        json!({
+                            "email": "limited@example.com",
+                            "password": "correct horse battery staple"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn telemetry_aggregate_endpoint_returns_buckets() {
+        let state = AppState::default();
+        let user = state
+            .store
+            .create_user(User::new(
+                "aggregate-api@example.com",
+                "Aggregate API",
+                "hash",
+            ))
+            .await
+            .unwrap();
+        let org = state
+            .store
+            .create_org(Org::new("Aggregate API Org", "aggregate-api"), user.id)
+            .await
+            .unwrap();
+        let project = state
+            .store
+            .create_project(Project::new(org.id, "Factory", "factory"))
+            .await
+            .unwrap();
+        let device = state
+            .store
+            .create_device(Device::new(project.id, "press-1", json!({})))
+            .await
+            .unwrap();
+        seed_session(&state, "aggregate-api-token", user.id).await;
+        let base = chrono::DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        state
+            .store
+            .write_telemetry(vec![TelemetryPoint {
+                project_id: project.id,
+                device_id: device.id,
+                stream: "temperature".to_owned(),
+                sequence: 1,
+                ts: base,
+                payload: json!({"value": 42.0}),
+                ingested_at: Utc::now(),
+            }])
+            .await
+            .unwrap();
+
+        let response = app_with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/telemetry/aggregate?project_id={}&device_id={}&stream=temperature&field=value&from={}&to={}&bucket_seconds=60",
+                        project.id,
+                        device.id,
+                        (base - Duration::seconds(1))
+                            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                        (base + Duration::seconds(60))
+                            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    ))
+                    .header("authorization", "Bearer aggregate-api-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let buckets: Vec<TelemetryAggregateBucket> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0].last, Some(42.0));
+    }
+
+    #[tokio::test]
+    async fn diagnostics_session_flow_generates_urls_and_audit() {
+        let state = AppState::default();
+        let user = state
+            .store
+            .create_user(User::new(
+                "diagnostics-api@example.com",
+                "Diagnostics API",
+                "hash",
+            ))
+            .await
+            .unwrap();
+        let org = state
+            .store
+            .create_org(Org::new("Diagnostics API Org", "diagnostics-api"), user.id)
+            .await
+            .unwrap();
+        let project = state
+            .store
+            .create_project(Project::new(org.id, "Factory", "factory"))
+            .await
+            .unwrap();
+        let device = state
+            .store
+            .create_device(Device::new(project.id, "press-1", json!({})))
+            .await
+            .unwrap();
+        seed_session(&state, "diagnostics-api-token", user.id).await;
+
+        let create = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/diagnostics/sessions")
+                    .header("authorization", "Bearer diagnostics-api-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "project_id": project.id,
+                            "device_id": device.id,
+                            "paths": ["/var/log"],
+                            "include_logs": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::OK);
+        let body = to_bytes(create.into_body(), usize::MAX).await.unwrap();
+        let created: DiagnosticsSessionCreateResult = serde_json::from_slice(&body).unwrap();
+        assert!(created.upload_url.url.contains("X-Amz-Signature="));
+        assert_eq!(
+            created.session.action_id.map(|id| id.to_string()),
+            Some(created.action.id)
+        );
+
+        let finalize = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/v1/diagnostics/sessions/{}/finalize",
+                        created.session.id
+                    ))
+                    .header("authorization", "Bearer diagnostics-api-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "project_id": project.id,
+                            "size_bytes": 2048,
+                            "sha256": "c".repeat(64)
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(finalize.status(), StatusCode::OK);
+
+        let download = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/v1/diagnostics/sessions/{}/download-url?project_id={}",
+                        created.session.id, project.id
+                    ))
+                    .header("authorization", "Bearer diagnostics-api-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(download.status(), StatusCode::OK);
+        let audit = state
+            .store
+            .list_audit(org.id, Some(project.id))
+            .await
+            .unwrap();
+        assert!(
+            audit
+                .iter()
+                .any(|entry| entry.action == "diagnostics.session.create")
+        );
+        assert!(
+            audit
+                .iter()
+                .any(|entry| entry.action == "diagnostics.session.finalize")
+        );
+        assert!(
+            audit
+                .iter()
+                .any(|entry| entry.action == "diagnostics.download_url.create")
+        );
+    }
+
+    #[tokio::test]
+    async fn firmware_finalize_and_rollout_endpoint_creates_action() {
+        let state = AppState::default();
+        let user = state
+            .store
+            .create_user(User::new("rollout-api@example.com", "Rollout API", "hash"))
+            .await
+            .unwrap();
+        let org = state
+            .store
+            .create_org(Org::new("Rollout API Org", "rollout-api"), user.id)
+            .await
+            .unwrap();
+        let project = state
+            .store
+            .create_project(Project::new(org.id, "Factory", "factory"))
+            .await
+            .unwrap();
+        let device = state
+            .store
+            .create_device(Device::new(project.id, "press-1", json!({})))
+            .await
+            .unwrap();
+        let firmware = state
+            .store
+            .create_firmware(FirmwareArtifact::new(
+                project.id,
+                "main",
+                "1.0.0",
+                format!("projects/{}/firmware/main.bin", project.id),
+                "a".repeat(64),
+                "application/octet-stream",
+                Some("ed25519:test".to_owned()),
+                1024,
+            ))
+            .await
+            .unwrap();
+        seed_session(&state, "rollout-api-token", user.id).await;
+
+        let finalize = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/firmware/{}/finalize", firmware.id))
+                    .header("authorization", "Bearer rollout-api-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "project_id": project.id,
+                            "sha256": "a".repeat(64),
+                            "signature": "ed25519:test",
+                            "size_bytes": 1024
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(finalize.status(), StatusCode::OK);
+
+        let rollout = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/firmware/{}/rollout", firmware.id))
+                    .header("authorization", "Bearer rollout-api-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "project_id": project.id,
+                            "device_ids": [device.id],
+                            "requires_approval": true,
+                            "rollback_strategy": "previous_version"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rollout.status(), StatusCode::OK);
+        let body = to_bytes(rollout.into_body(), usize::MAX).await.unwrap();
+        let rollout: FirmwareRollout = serde_json::from_slice(&body).unwrap();
+        assert_eq!(rollout.cohort_size, 1);
+        assert_eq!(rollout.state, FirmwareRolloutState::WaitingApproval);
+        let actions = state.store.list_actions(project.id).await.unwrap();
+        assert!(actions.iter().any(|action| {
+            action.id == rollout.action_id && action.state == ActionState::WaitingApproval
+        }));
     }
 }

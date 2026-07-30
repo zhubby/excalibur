@@ -39,21 +39,21 @@ flowchart LR
 2. `device-agent` 使用 mTLS 连接 MQTT broker。
 3. 设备向 `v1/p/{project_id}/d/{device_id}/telemetry/{stream}` 发布 JSON array。
 4. MQTT runtime 调用 `mqtt-ingest` ingest path；本地 runtime 会按 topic 查 device，生产 hook 还必须确认 topic project/device 与证书身份一致。
-5. ingest 解码 payload，触发 heartbeat，批量写入 TimescaleDB hypertable，必要时写入 NATS JetStream。
-6. Dashboard query 从 TimescaleDB 查询 raw rows、continuous aggregate 或 cache。
+5. ingest 解码 payload，触发 heartbeat；telemetry 可先写入 NATS JetStream，由 worker durable consumer batch 写入 TimescaleDB hypertable。
+6. Dashboard query 可通过 `/api/v1/telemetry/aggregate` 查询 time range bucket；后续高吞吐场景再补 continuous aggregate 或 cache。
 
-当前仓库已实现第 3 到第 5 步中的本地 rumqttd listener、topic parser、payload decoder、ACL、内存 store 写入和 SQL repository 写入；生产 mTLS broker hook、NATS buffer 和高吞吐 COPY writer 仍待生产化。
+当前仓库已实现第 3 到第 5 步中的本地 rumqttd listener、TLS listener 配置、peer certificate fingerprint 传递、topic parser、payload decoder、连接身份绑定 ACL、JetStream buffer、worker batch writer、内存 store 写入和 SQL repository 写入；高吞吐 COPY writer 仍待生产化。
 
 ## 命令路径
 
 1. 操作员在 Console 创建 action，例如 `ota.install`。
 2. API 校验 payload，创建 action 记录，写 audit。
-3. dispatcher/worker 读取 queued action，构造 command payload。
-4. dispatcher 发布到 `v1/p/{project_id}/d/{device_id}/commands`。
+3. dispatcher/worker 读取 queued action target，构造 command envelope。
+4. worker 发布到 NATS command bus，mqtt-ingest command bridge 转发到 `v1/p/{project_id}/d/{device_id}/commands`。
 5. `device-agent` 执行 action，向 `commands/status` 发送状态数组。
 6. ingest 更新 action target 和 aggregate action 状态，并通过 SSE 推送进度。
 
-当前仓库已实现 API action 创建、payload 校验、agent command shape 和 status ingest；dispatcher 发布与 action target 持久表联动仍待实现。
+当前仓库已实现 API action 创建、payload 校验、approval/retry/cancel/timeout 状态转换、agent command shape、worker dispatcher、MQTT command bridge 和 status ingest。
 
 ## 数据所有权
 

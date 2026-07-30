@@ -75,15 +75,17 @@ Agent downloader 支持：
 - 下载进度 status。
 - 下载完成后把 action 交给 installer 或 app route。
 
+当前后端已支持：
+
+- 对象存储 upload finalize/verify API。
+- rollout cohort 和审批入口。
+- action target 持久状态、approval/retry/cancel API、worker timeout sweeper。
+
 生产 OTA 还需要：
 
-- 固件上传 API。
-- S3 signed URL 生成。
-- artifact signature 校验。
-- rollout cohort 和审批。
-- per-target action 状态。
-- timeout/retry/cancel 策略。
-- 回滚策略和安全启动链路。
+- artifact signature 的服务端信任链校验。
+- 完整自动回滚策略。
+- 安全启动链路。
 
 ## Diagnostics: `diagnostics.collect`
 
@@ -99,13 +101,16 @@ Payload：
 }
 ```
 
-生产目标：
+当前后端已支持：
 
 - API 创建 diagnostics session。
-- Worker 生成短时 upload URL。
+- API 生成短时 upload/download URL。
+- API 记录 session state、object checksum/size 和 audit。
+
+生产目标：
+
 - Agent 打包受允许路径。
 - Agent 上传文件到 S3-compatible storage。
-- API 记录 session state 和 audit。
 - Console 展示下载链接和过期时间。
 
 ## Remote shell: `remote_shell.open`

@@ -141,6 +141,7 @@ API key 用于自动化和服务端集成。当前管理接口仍要求用户 se
 | `GET` | `/api/v1/streams?project_id=...` | Viewer | 列出 stream definitions。 |
 | `POST` | `/api/v1/streams` | Operator | 创建 stream definition。 |
 | `GET` | `/api/v1/telemetry?project_id=...&device_id=...&stream=...&limit=100` | Viewer | 查询遥测，limit 最大 1000。 |
+| `GET` | `/api/v1/telemetry/aggregate?project_id=...&stream=...&field=...&bucket_seconds=60` | Viewer | Dashboard time-range bucket 聚合查询。 |
 | `POST` | `/api/v1/telemetry` | Operator | 开发用 HTTP ingest，接受 MQTT topic 和 payload。 |
 
 `CreateStreamRequest`：
@@ -165,10 +166,20 @@ API key 用于自动化和服务端集成。当前管理接口仍要求用户 se
 | `POST` | `/api/v1/actions/{action_id}/status` | Operator | 开发/控制面状态更新入口。 |
 | `GET` | `/api/v1/firmware?project_id=...` | Viewer | 列出 firmware artifacts。 |
 | `POST` | `/api/v1/firmware` | Operator | 创建 firmware metadata。 |
+| `POST` | `/api/v1/firmware/{firmware_id}/upload-url` | Operator | 生成短 TTL upload signed URL。 |
+| `POST` | `/api/v1/firmware/{firmware_id}/download-url` | Viewer | 生成短 TTL download signed URL。 |
+| `POST` | `/api/v1/firmware/{firmware_id}/finalize` | Operator | 校验 size/checksum/signature 并标记 artifact verified。 |
+| `POST` | `/api/v1/firmware/{firmware_id}/rollout` | Operator | 按 device_ids 或 cohort 创建 OTA rollout 和 action。 |
+| `GET` | `/api/v1/firmware-rollouts?project_id=...` | Viewer | 列出 firmware rollout metadata。 |
 | `GET` | `/api/v1/dashboards?project_id=...` | Viewer | 列出 dashboards。 |
 | `POST` | `/api/v1/dashboards` | Operator | 创建 dashboard。 |
 | `GET` | `/api/v1/alerts?project_id=...` | Viewer | 列出 alert rules。 |
 | `POST` | `/api/v1/alerts` | Operator | 创建 alert rule。 |
+| `GET` | `/api/v1/alert-events?project_id=...&state=Firing` | Viewer | 查询 alert firing/resolved events。 |
+| `GET` | `/api/v1/diagnostics/sessions?project_id=...` | Viewer | 列出 diagnostics sessions。 |
+| `POST` | `/api/v1/diagnostics/sessions` | Operator | 创建 diagnostics session、upload URL 和 action。 |
+| `POST` | `/api/v1/diagnostics/sessions/{session_id}/finalize` | Operator | 写入 diagnostics object checksum/size。 |
+| `POST` | `/api/v1/diagnostics/sessions/{session_id}/download-url` | Viewer | 生成 diagnostics download signed URL。 |
 | `GET` | `/api/v1/audit?org_id=...&project_id=...` | Viewer | 查询 audit logs。 |
 
 支持的 action 名称：

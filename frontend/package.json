@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
+    "generate:api": "bun scripts/generate-api-client.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
@@ -28,4 +29,3 @@
     "vitest": "2.1.8"
   }
 }
-
