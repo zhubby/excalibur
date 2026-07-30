@@ -23,16 +23,18 @@ org -> project -> device
 
 - `POST /api/v1/auth/register` 使用 Argon2id 生成密码哈希，密码长度至少 12。
 - `POST /api/v1/auth/login` 使用 Argon2id 校验密码，并用 dummy hash 避免明显用户枚举。
-- 返回值是 Bearer token，存储在进程内 session map。
+- 返回值包含 Bearer access token、refresh token 和过期时间。`memory` 模式把 session 存在进程内，`timescale` 模式只在 SQL 保存 access/refresh token hash。
+- `POST /api/v1/auth/refresh` 使用 refresh token rotation，并记录已使用 refresh token hash 用于 reuse detection。
+- `POST /api/v1/auth/logout` 撤销当前 session。
+- API key 明文只在创建时返回一次，SQL/memory store 只保存 key hash、scope、expires/revoke/last_used 元数据。
 
 生产目标：
 
 - HttpOnly secure cookie session。
-- Refresh token rotation 和 reuse detection。
 - 邮箱验证。
 - 邀请和 membership 管理。
-- API key hash 存储，不保存明文 key。
-- Session/API key scoped audit。
+- API key scope enforcement 接入自动化/ingest 入口。
+- Session refresh、login failure 和异常登录 audit。
 
 ## RBAC 角色
 
@@ -74,10 +76,12 @@ org -> project -> device
 - `device.csr_sign`
 - `device.dev_auth_download`
 - `device.certificate_revoke`
+- `api_key.create`
+- `api_key.revoke`
 
 生产应继续覆盖：
 
-- 登录、登出、session refresh、API key 创建/撤销。
+- 登录、登出、session refresh。
 - 邀请、角色变更、成员移除。
 - OTA 创建、审批、取消。
 - diagnostics session 创建、文件下载。

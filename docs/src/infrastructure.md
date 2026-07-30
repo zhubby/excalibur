@@ -103,15 +103,19 @@ helm lint infra/helm/excalibur
 Helm chart 的 migration job 使用 `postgres:16-alpine` 执行版本化 SQL。Job 会：
 
 - 创建 `schema_migrations`。
-- 对已有 001 初始库做 baseline，避免 upgrade 时重跑 `001_initial.sql`。
-- 按文件名顺序执行 `/migrations/*.sql`。
-- 对单个 migration 使用 `ON_ERROR_STOP` 和 `--single-transaction`。
+- 创建 `schema_migration_events`，记录 `applying`、`applied`、`failed`。
+- 对已有完整 001 初始库做 race-safe baseline；如果检测到只存在部分旧表，会失败并提示缺失对象，避免 upgrade 时误跳过 `001_initial.sql`。
+- 按文件名顺序执行 `/migrations/*.sql`，并用 `pg_advisory_lock(hashtext('excalibur_schema_migrations'))` 串行化。
+- 对单个 migration 使用 `ON_ERROR_STOP` 和显式 `BEGIN`/`COMMIT`；失败会写 `failed` 事件并让 Helm retry/backoff。
+- 002 upgrade migration 会在加唯一索引和复合外键前输出冲突数据样例，方便先修旧数据再重试。
+- 对已有大量 telemetry 的生产库，002 的 telemetry index 调整和 dedupe 回填应按维护窗口或拆分 online backfill 执行。
+- 通过 `migrations.activeDeadlineSeconds` 给 hook 设置最大运行时长，避免锁等待或长 migration 无限阻塞 release。
 
 生产环境仍需要：
 
-- 失败回滚/暂停策略。
 - 与应用 rollout 顺序绑定。
 - 对 Timescale policy 变更做单独验证。
+- 定期演练 migration 失败恢复流程。
 
 ## Kubernetes 生产建议
 

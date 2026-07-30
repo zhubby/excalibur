@@ -3,9 +3,11 @@ mod mappers;
 
 use std::collections::{HashMap, HashSet};
 
+use chrono::Utc;
 use excalibur_domain::{
-    Action, ActionStatusUpdate, AlertRule, AuditLog, Dashboard, Device, DeviceCertificate,
+    Action, ActionStatusUpdate, AlertRule, ApiKey, AuditLog, Dashboard, Device, DeviceCertificate,
     FirmwareArtifact, Id, Membership, Org, Project, Role, StreamDefinition, TelemetryPoint, User,
+    UserSession,
 };
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, QueryBuilder, Row, postgres::PgPoolOptions};
@@ -20,9 +22,9 @@ use crate::{
         },
         mappers::{
             action_state_to_db, alert_kind_to_db, certificate_status_to_db, device_status_to_db,
-            map_action_row, map_alert, map_audit, map_certificate, map_dashboard, map_device,
-            map_firmware, map_membership, map_org, map_project, map_stream, map_telemetry,
-            map_user, role_from_db, role_to_db,
+            map_action_row, map_alert, map_api_key, map_audit, map_certificate, map_dashboard,
+            map_device, map_firmware, map_membership, map_org, map_project, map_stream,
+            map_telemetry, map_user, map_user_session, role_from_db, role_to_db,
         },
     },
     telemetry::{TelemetryDedupeKey, telemetry_dedupe_key},
@@ -62,6 +64,9 @@ impl PgStore {
         sqlx::query(
             "SELECT
                 to_regclass('public.users') IS NOT NULL AS users,
+                to_regclass('public.user_sessions') IS NOT NULL AS user_sessions,
+                to_regclass('public.used_refresh_tokens') IS NOT NULL AS used_refresh_tokens,
+                to_regclass('public.api_keys') IS NOT NULL AS api_keys,
                 to_regclass('public.projects') IS NOT NULL AS projects,
                 to_regclass('public.devices') IS NOT NULL AS devices,
                 to_regclass('public.telemetry_points') IS NOT NULL AS telemetry_points,
@@ -108,6 +113,9 @@ impl PgStore {
         .and_then(|row| {
             let required_objects = [
                 "users",
+                "user_sessions",
+                "used_refresh_tokens",
+                "api_keys",
                 "projects",
                 "devices",
                 "telemetry_points",
@@ -184,6 +192,294 @@ impl PgStore {
             .map_err(|error| map_sqlx_error(error, "user"))?;
         row.map(|row| row.try_get("id").map_err(map_decode_error))
             .transpose()
+    }
+
+    pub async fn create_session(&self, session: UserSession) -> StoreResult<UserSession> {
+        self.ensure_user_exists(session.user_id).await?;
+        let row = sqlx::query(
+            "INSERT INTO user_sessions
+                (id, user_id, token_hash, refresh_token_hash, expires_at, refresh_expires_at, revoked_at, last_used_at, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             RETURNING id, user_id, token_hash, refresh_token_hash, expires_at, refresh_expires_at, revoked_at, last_used_at, created_at",
+        )
+        .bind(session.id)
+        .bind(session.user_id)
+        .bind(&session.token_hash)
+        .bind(&session.refresh_token_hash)
+        .bind(session.expires_at)
+        .bind(session.refresh_expires_at)
+        .bind(session.revoked_at)
+        .bind(session.last_used_at)
+        .bind(session.created_at)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "session"))?;
+        map_user_session(&row)
+    }
+
+    pub async fn get_active_session_by_token_hash(
+        &self,
+        token_hash: &str,
+    ) -> StoreResult<UserSession> {
+        let row = sqlx::query(
+            "WITH matched AS MATERIALIZED (
+               SELECT id, user_id, token_hash, refresh_token_hash, expires_at, refresh_expires_at, revoked_at, last_used_at, created_at
+                 FROM user_sessions
+                WHERE token_hash = $1
+                  AND revoked_at IS NULL
+                  AND expires_at > now()
+             ),
+             touched AS (
+               UPDATE user_sessions
+                  SET last_used_at = now()
+                WHERE id IN (SELECT id FROM matched)
+                  AND (last_used_at IS NULL OR last_used_at < now() - INTERVAL '5 minutes')
+                RETURNING id, user_id, token_hash, refresh_token_hash, expires_at, refresh_expires_at, revoked_at, last_used_at, created_at
+             )
+             SELECT id, user_id, token_hash, refresh_token_hash, expires_at, refresh_expires_at, revoked_at, last_used_at, created_at
+               FROM touched
+             UNION ALL
+             SELECT id, user_id, token_hash, refresh_token_hash, expires_at, refresh_expires_at, revoked_at, last_used_at, created_at
+               FROM matched
+              WHERE NOT EXISTS (SELECT 1 FROM touched)
+             LIMIT 1",
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "session"))?
+        .ok_or(StoreError::NotFound("session"))?;
+        map_user_session(&row)
+    }
+
+    pub async fn rotate_session_refresh_token(
+        &self,
+        refresh_token_hash: &str,
+        next_token_hash: String,
+        next_refresh_token_hash: String,
+        next_expires_at: chrono::DateTime<Utc>,
+        next_refresh_expires_at: chrono::DateTime<Utc>,
+    ) -> StoreResult<UserSession> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| map_sqlx_error(error, "session"))?;
+        if let Some(row) =
+            sqlx::query("SELECT session_id FROM used_refresh_tokens WHERE refresh_token_hash = $1")
+                .bind(refresh_token_hash)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|error| map_sqlx_error(error, "refresh token"))?
+        {
+            let session_id: Id = row.try_get("session_id").map_err(map_decode_error)?;
+            sqlx::query("UPDATE user_sessions SET revoked_at = now() WHERE id = $1")
+                .bind(session_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| map_sqlx_error(error, "session"))?;
+            tx.commit()
+                .await
+                .map_err(|error| map_sqlx_error(error, "session"))?;
+            return Err(StoreError::Conflict("refresh token reuse"));
+        }
+        let row = sqlx::query(
+            "SELECT id, user_id, token_hash, refresh_token_hash, expires_at, refresh_expires_at, revoked_at, last_used_at, created_at
+             FROM user_sessions
+             WHERE refresh_token_hash = $1
+               AND revoked_at IS NULL
+               AND refresh_expires_at > now()
+             FOR UPDATE",
+        )
+        .bind(refresh_token_hash)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| map_sqlx_error(error, "refresh token"))?;
+        let Some(row) = row else {
+            if let Some(row) = sqlx::query(
+                "SELECT session_id FROM used_refresh_tokens WHERE refresh_token_hash = $1",
+            )
+            .bind(refresh_token_hash)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|error| map_sqlx_error(error, "refresh token"))?
+            {
+                let session_id: Id = row.try_get("session_id").map_err(map_decode_error)?;
+                sqlx::query("UPDATE user_sessions SET revoked_at = now() WHERE id = $1")
+                    .bind(session_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|error| map_sqlx_error(error, "session"))?;
+                tx.commit()
+                    .await
+                    .map_err(|error| map_sqlx_error(error, "session"))?;
+                return Err(StoreError::Conflict("refresh token reuse"));
+            }
+            return Err(StoreError::NotFound("refresh token"));
+        };
+        let session = map_user_session(&row)?;
+        sqlx::query(
+            "INSERT INTO used_refresh_tokens (refresh_token_hash, session_id, used_at)
+             VALUES ($1, $2, now())",
+        )
+        .bind(&session.refresh_token_hash)
+        .bind(session.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| map_sqlx_error(error, "refresh token reuse"))?;
+        let row = sqlx::query(
+            "UPDATE user_sessions
+             SET token_hash = $2,
+                 refresh_token_hash = $3,
+                 expires_at = $4,
+                 refresh_expires_at = $5,
+                 last_used_at = now()
+             WHERE id = $1
+             RETURNING id, user_id, token_hash, refresh_token_hash, expires_at, refresh_expires_at, revoked_at, last_used_at, created_at",
+        )
+        .bind(session.id)
+        .bind(next_token_hash)
+        .bind(next_refresh_token_hash)
+        .bind(next_expires_at)
+        .bind(next_refresh_expires_at)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|error| map_sqlx_error(error, "session"))?;
+        let session = map_user_session(&row)?;
+        tx.commit()
+            .await
+            .map_err(|error| map_sqlx_error(error, "session"))?;
+        Ok(session)
+    }
+
+    pub async fn revoke_session_by_token_hash(&self, token_hash: &str) -> StoreResult<()> {
+        let result = sqlx::query(
+            "UPDATE user_sessions
+             SET revoked_at = now()
+             WHERE token_hash = $1 AND revoked_at IS NULL",
+        )
+        .bind(token_hash)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "session"))?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::NotFound("session"));
+        }
+        Ok(())
+    }
+
+    pub async fn create_api_key(&self, api_key: ApiKey) -> StoreResult<ApiKey> {
+        self.ensure_org_exists(api_key.org_id).await?;
+        if let Some(project_id) = api_key.project_id {
+            let project = self.get_project(project_id).await?;
+            if project.org_id != api_key.org_id {
+                return Err(StoreError::TenantScope);
+            }
+        }
+        if api_key.scopes.iter().any(|scope| scope.trim().is_empty()) {
+            return Err(StoreError::Conflict("api key scope"));
+        }
+        let row = sqlx::query(
+            "INSERT INTO api_keys
+                (id, org_id, project_id, name, key_hash, scopes, expires_at, revoked_at, last_used_at, created_by, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+             RETURNING id, org_id, project_id, name, key_hash, scopes, expires_at, revoked_at, last_used_at, created_by, created_at",
+        )
+        .bind(api_key.id)
+        .bind(api_key.org_id)
+        .bind(api_key.project_id)
+        .bind(&api_key.name)
+        .bind(&api_key.key_hash)
+        .bind(&api_key.scopes)
+        .bind(api_key.expires_at)
+        .bind(api_key.revoked_at)
+        .bind(api_key.last_used_at)
+        .bind(api_key.created_by)
+        .bind(api_key.created_at)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "api key"))?;
+        map_api_key(&row)
+    }
+
+    pub async fn get_active_api_key_by_hash(&self, key_hash: &str) -> StoreResult<ApiKey> {
+        let row = sqlx::query(
+            "WITH matched AS MATERIALIZED (
+               SELECT id, org_id, project_id, name, key_hash, scopes, expires_at, revoked_at, last_used_at, created_by, created_at
+                 FROM api_keys
+                WHERE key_hash = $1
+                  AND revoked_at IS NULL
+                  AND (expires_at IS NULL OR expires_at > now())
+             ),
+             touched AS (
+               UPDATE api_keys
+                  SET last_used_at = now()
+                WHERE id IN (SELECT id FROM matched)
+                  AND (last_used_at IS NULL OR last_used_at < now() - INTERVAL '5 minutes')
+                RETURNING id, org_id, project_id, name, key_hash, scopes, expires_at, revoked_at, last_used_at, created_by, created_at
+             )
+             SELECT id, org_id, project_id, name, key_hash, scopes, expires_at, revoked_at, last_used_at, created_by, created_at
+               FROM touched
+             UNION ALL
+             SELECT id, org_id, project_id, name, key_hash, scopes, expires_at, revoked_at, last_used_at, created_by, created_at
+               FROM matched
+              WHERE NOT EXISTS (SELECT 1 FROM touched)
+             LIMIT 1",
+        )
+        .bind(key_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "api key"))?
+        .ok_or(StoreError::NotFound("api key"))?;
+        map_api_key(&row)
+    }
+
+    pub async fn list_api_keys(
+        &self,
+        org_id: Id,
+        project_id: Option<Id>,
+    ) -> StoreResult<Vec<ApiKey>> {
+        self.ensure_org_exists(org_id).await?;
+        let rows = if let Some(project_id) = project_id {
+            sqlx::query(
+                "SELECT id, org_id, project_id, name, key_hash, scopes, expires_at, revoked_at, last_used_at, created_by, created_at
+                 FROM api_keys
+                 WHERE org_id = $1 AND project_id = $2
+                 ORDER BY created_at DESC, id",
+            )
+            .bind(org_id)
+            .bind(project_id)
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query(
+                "SELECT id, org_id, project_id, name, key_hash, scopes, expires_at, revoked_at, last_used_at, created_by, created_at
+                 FROM api_keys
+                 WHERE org_id = $1
+                 ORDER BY created_at DESC, id",
+            )
+            .bind(org_id)
+            .fetch_all(&self.pool)
+            .await
+        }
+        .map_err(|error| map_sqlx_error(error, "api key"))?;
+        rows.iter().map(map_api_key).collect()
+    }
+
+    pub async fn revoke_api_key(&self, org_id: Id, api_key_id: Id) -> StoreResult<ApiKey> {
+        let row = sqlx::query(
+            "UPDATE api_keys
+             SET revoked_at = now()
+             WHERE org_id = $1 AND id = $2
+             RETURNING id, org_id, project_id, name, key_hash, scopes, expires_at, revoked_at, last_used_at, created_by, created_at",
+        )
+        .bind(org_id)
+        .bind(api_key_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "api key"))?
+        .ok_or(StoreError::NotFound("api key"))?;
+        map_api_key(&row)
     }
 
     async fn ensure_user_exists(&self, user_id: Id) -> StoreResult<()> {
@@ -462,6 +758,35 @@ impl PgStore {
         .await
         .map_err(|error| map_sqlx_error(error, "certificate"))?;
         rows.iter().map(map_certificate).collect()
+    }
+
+    pub async fn get_active_device_by_certificate_fingerprint(
+        &self,
+        fingerprint_sha256: &str,
+    ) -> StoreResult<Device> {
+        let row = sqlx::query(
+            "SELECT d.id,
+                    d.project_id,
+                    d.name,
+                    d.status::text AS status,
+                    d.metadata,
+                    d.latest_shadow,
+                    d.last_seen_at,
+                    d.created_at
+             FROM device_certificates c
+             JOIN devices d ON d.project_id = c.project_id AND d.id = c.device_id
+             WHERE c.fingerprint_sha256 = $1
+               AND c.status = 'active'::certificate_status
+               AND c.not_before <= now()
+               AND c.not_after > now()
+               AND d.status <> 'disabled'::device_status",
+        )
+        .bind(fingerprint_sha256)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "certificate"))?
+        .ok_or(StoreError::NotFound("certificate"))?;
+        map_device(&row)
     }
 
     pub async fn revoke_device_certificate(

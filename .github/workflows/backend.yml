@@ -43,6 +43,14 @@ jobs:
       - name: Install PostgreSQL client
         run: sudo apt-get update && sudo apt-get install -y postgresql-client
 
+      - uses: azure/setup-helm@v4
+
+      - name: Verify Helm migrations
+        run: |
+          diff -ru backend/migrations infra/helm/excalibur/migrations
+          helm lint infra/helm/excalibur
+          helm template excalibur infra/helm/excalibur --show-only templates/migration-job.yaml >/tmp/excalibur-migration-job.yaml
+
       - name: Apply migrations
         run: |
           for migration in backend/migrations/*.sql; do

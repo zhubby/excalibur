@@ -21,13 +21,13 @@ Excalibur 的安全边界覆盖人、设备、租户、数据、操作和运维�
 
 - Argon2id 密码哈希。
 - 登录对不存在用户使用 dummy password hash。
-- 进程内 Bearer token session。
+- SQL-backed Bearer token session，数据库只保存 access token hash。
+- Refresh token rotation，旧 refresh token hash 会进入 reuse detection 表。
+- Session revoke/logout。
 
 生产要求：
 
 - HttpOnly、Secure、SameSite cookie。
-- Refresh token rotation。
-- Session revoke。
 - MFA 预留。
 - 邮箱验证和邀请。
 - Login rate limit。
@@ -61,14 +61,20 @@ Excalibur 的安全边界覆盖人、设备、租户、数据、操作和运维�
 
 ## API key
 
-API key 生产模型建议：
+当前实现：
 
 - 只在创建时返回明文。
 - 数据库存 hash，不存明文。
 - key 有 name、scope、expires_at、last_used_at。
 - 支持 org/project scope。
-- 支持只读、ingest、automation 等 granular permissions。
+- 支持 scopes 列表，由调用方按 `telemetry:write`、`automation:run` 等粒度扩展。
 - 创建和撤销写 audit。
+
+生产要求：
+
+- 在需要自动化认证的 API/MQTT ingress 上接入 API key scope enforcement。
+- API key request quota 和异常使用审计。
+- 长期 key rotation/reminder。
 
 ## Remote shell
 

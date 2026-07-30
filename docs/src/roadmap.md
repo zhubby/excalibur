@@ -4,21 +4,24 @@
 
 ## Milestone 1: 持久控制面
 
-状态：SQL repository 已实现，Helm chart 已有轻量 versioned migration runner；session 持久化和生产级 migration 运维流程仍待完成。
+状态：SQL repository 已实现；session/refresh token/API key 已迁到 SQL-backed store；Helm migration runner 已补 advisory lock、applied/failed audit 和失败恢复说明。
 
 剩余目标：
 
 - 保持所有 tenant scope 测试。
-- 硬化 migration runner 的回滚、锁、审计和失败恢复流程。
-- 将 session、refresh token、API key 存储迁移到 SQL。
+- 将 Console session 从 local token 过渡到 HttpOnly cookie。
+- 将 API key scope enforcement 接入自动化/ingest 入口。
 
 验收：
 
 - `STORAGE_BACKEND=timescale` 可启动。
 - backend tests 覆盖 memory；CI 设置 `EXCALIBUR_SQL_TEST_DATABASE_URL` 后强制覆盖 SQL contract。
 - org/project/device/action/audit 数据重启后保留。
+- session rotation、refresh token reuse detection、API key revoke/scope 在 memory + SQL contract 中覆盖。
 
 ## Milestone 2: 真实 PKI 与 MQTT runtime
+
+状态：设备证书 fingerprint 已从证书 PEM 派生，并提供 active fingerprint 到设备身份的 store lookup；真实 CA signing 和 rumqttd mTLS runtime 仍待完成。
 
 目标：
 

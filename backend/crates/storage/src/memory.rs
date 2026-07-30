@@ -5,9 +5,9 @@ use std::{
 
 use chrono::Utc;
 use excalibur_domain::{
-    Action, ActionState, ActionStatusUpdate, AlertRule, AuditLog, Dashboard, Device,
-    DeviceCertificate, DeviceStatus, FirmwareArtifact, Id, Membership, Org, Project, Role,
-    StreamDefinition, TelemetryPoint, User,
+    Action, ActionState, ActionStatusUpdate, AlertRule, ApiKey, AuditLog, CertificateStatus,
+    Dashboard, Device, DeviceCertificate, DeviceStatus, FirmwareArtifact, Id, Membership, Org,
+    Project, Role, StreamDefinition, TelemetryPoint, User, UserSession,
 };
 use serde_json::Value;
 use tokio::sync::RwLock;
@@ -22,6 +22,12 @@ use crate::{
 struct MemoryState {
     users: HashMap<Id, User>,
     users_by_email: HashMap<String, Id>,
+    sessions: HashMap<Id, UserSession>,
+    sessions_by_token_hash: HashMap<String, Id>,
+    sessions_by_refresh_hash: HashMap<String, Id>,
+    used_refresh_tokens: HashMap<String, Id>,
+    api_keys: HashMap<Id, ApiKey>,
+    api_keys_by_hash: HashMap<String, Id>,
     orgs: HashMap<Id, Org>,
     memberships: Vec<Membership>,
     projects: HashMap<Id, Project>,
@@ -121,6 +127,202 @@ impl MemoryStore {
             .get(id)
             .cloned()
             .ok_or(StoreError::NotFound("user"))
+    }
+
+    pub async fn create_session(&self, session: UserSession) -> StoreResult<UserSession> {
+        let mut state = self.state.write().await;
+        if !state.users.contains_key(&session.user_id) {
+            return Err(StoreError::NotFound("user"));
+        }
+        if state
+            .sessions_by_token_hash
+            .contains_key(&session.token_hash)
+            || state
+                .sessions_by_refresh_hash
+                .contains_key(&session.refresh_token_hash)
+        {
+            return Err(StoreError::Conflict("session"));
+        }
+        state
+            .sessions_by_token_hash
+            .insert(session.token_hash.clone(), session.id);
+        state
+            .sessions_by_refresh_hash
+            .insert(session.refresh_token_hash.clone(), session.id);
+        state.sessions.insert(session.id, session.clone());
+        Ok(session)
+    }
+
+    pub async fn get_active_session_by_token_hash(
+        &self,
+        token_hash: &str,
+    ) -> StoreResult<UserSession> {
+        let mut state = self.state.write().await;
+        let session_id = state
+            .sessions_by_token_hash
+            .get(token_hash)
+            .copied()
+            .ok_or(StoreError::NotFound("session"))?;
+        let session = state
+            .sessions
+            .get_mut(&session_id)
+            .ok_or(StoreError::NotFound("session"))?;
+        if session.revoked_at.is_some() || session.expires_at <= Utc::now() {
+            return Err(StoreError::NotFound("session"));
+        }
+        session.last_used_at = Some(Utc::now());
+        Ok(session.clone())
+    }
+
+    pub async fn rotate_session_refresh_token(
+        &self,
+        refresh_token_hash: &str,
+        next_token_hash: String,
+        next_refresh_token_hash: String,
+        next_expires_at: chrono::DateTime<Utc>,
+        next_refresh_expires_at: chrono::DateTime<Utc>,
+    ) -> StoreResult<UserSession> {
+        let mut state = self.state.write().await;
+        if let Some(session_id) = state.used_refresh_tokens.get(refresh_token_hash).copied() {
+            if let Some(session) = state.sessions.get_mut(&session_id) {
+                session.revoked_at = Some(Utc::now());
+            }
+            return Err(StoreError::Conflict("refresh token reuse"));
+        }
+        if state.sessions_by_token_hash.contains_key(&next_token_hash)
+            || state
+                .sessions_by_refresh_hash
+                .contains_key(&next_refresh_token_hash)
+        {
+            return Err(StoreError::Conflict("session"));
+        }
+        let session_id = state
+            .sessions_by_refresh_hash
+            .get(refresh_token_hash)
+            .copied()
+            .ok_or(StoreError::NotFound("refresh token"))?;
+        let (old_token_hash, old_refresh_hash) = {
+            let session = state
+                .sessions
+                .get(&session_id)
+                .ok_or(StoreError::NotFound("session"))?;
+            if session.revoked_at.is_some() || session.refresh_expires_at <= Utc::now() {
+                return Err(StoreError::NotFound("refresh token"));
+            }
+            (
+                session.token_hash.clone(),
+                session.refresh_token_hash.clone(),
+            )
+        };
+        state.sessions_by_token_hash.remove(&old_token_hash);
+        state.sessions_by_refresh_hash.remove(&old_refresh_hash);
+        state
+            .used_refresh_tokens
+            .insert(old_refresh_hash, session_id);
+        state
+            .sessions_by_token_hash
+            .insert(next_token_hash.clone(), session_id);
+        state
+            .sessions_by_refresh_hash
+            .insert(next_refresh_token_hash.clone(), session_id);
+        let session = state
+            .sessions
+            .get_mut(&session_id)
+            .ok_or(StoreError::NotFound("session"))?;
+        session.token_hash = next_token_hash;
+        session.refresh_token_hash = next_refresh_token_hash;
+        session.expires_at = next_expires_at;
+        session.refresh_expires_at = next_refresh_expires_at;
+        session.last_used_at = Some(Utc::now());
+        Ok(session.clone())
+    }
+
+    pub async fn revoke_session_by_token_hash(&self, token_hash: &str) -> StoreResult<()> {
+        let mut state = self.state.write().await;
+        let session_id = state
+            .sessions_by_token_hash
+            .get(token_hash)
+            .copied()
+            .ok_or(StoreError::NotFound("session"))?;
+        let session = state
+            .sessions
+            .get_mut(&session_id)
+            .ok_or(StoreError::NotFound("session"))?;
+        session.revoked_at = Some(Utc::now());
+        Ok(())
+    }
+
+    pub async fn create_api_key(&self, api_key: ApiKey) -> StoreResult<ApiKey> {
+        let mut state = self.state.write().await;
+        if !state.orgs.contains_key(&api_key.org_id) {
+            return Err(StoreError::NotFound("org"));
+        }
+        if let Some(project_id) = api_key.project_id {
+            let project = state
+                .projects
+                .get(&project_id)
+                .ok_or(StoreError::NotFound("project"))?;
+            if project.org_id != api_key.org_id {
+                return Err(StoreError::TenantScope);
+            }
+        }
+        if api_key.scopes.iter().any(|scope| scope.trim().is_empty()) {
+            return Err(StoreError::Conflict("api key scope"));
+        }
+        if state.api_keys_by_hash.contains_key(&api_key.key_hash) {
+            return Err(StoreError::Conflict("api key"));
+        }
+        state
+            .api_keys_by_hash
+            .insert(api_key.key_hash.clone(), api_key.id);
+        state.api_keys.insert(api_key.id, api_key.clone());
+        Ok(api_key)
+    }
+
+    pub async fn get_active_api_key_by_hash(&self, key_hash: &str) -> StoreResult<ApiKey> {
+        let mut state = self.state.write().await;
+        let key_id = state
+            .api_keys_by_hash
+            .get(key_hash)
+            .copied()
+            .ok_or(StoreError::NotFound("api key"))?;
+        let api_key = state
+            .api_keys
+            .get_mut(&key_id)
+            .ok_or(StoreError::NotFound("api key"))?;
+        if api_key.revoked_at.is_some()
+            || api_key
+                .expires_at
+                .is_some_and(|expires_at| expires_at <= Utc::now())
+        {
+            return Err(StoreError::NotFound("api key"));
+        }
+        api_key.last_used_at = Some(Utc::now());
+        Ok(api_key.clone())
+    }
+
+    pub async fn list_api_keys(&self, org_id: Id, project_id: Option<Id>) -> Vec<ApiKey> {
+        let state = self.state.read().await;
+        state
+            .api_keys
+            .values()
+            .filter(|api_key| api_key.org_id == org_id)
+            .filter(|api_key| project_id.is_none_or(|id| api_key.project_id == Some(id)))
+            .cloned()
+            .collect()
+    }
+
+    pub async fn revoke_api_key(&self, org_id: Id, api_key_id: Id) -> StoreResult<ApiKey> {
+        let mut state = self.state.write().await;
+        let api_key = state
+            .api_keys
+            .get_mut(&api_key_id)
+            .ok_or(StoreError::NotFound("api key"))?;
+        if api_key.org_id != org_id {
+            return Err(StoreError::NotFound("api key"));
+        }
+        api_key.revoked_at = Some(Utc::now());
+        Ok(api_key.clone())
     }
 
     pub async fn create_org(&self, org: Org, owner_id: Id) -> StoreResult<Org> {
@@ -298,6 +500,34 @@ impl MemoryStore {
             })
             .cloned()
             .collect())
+    }
+
+    pub async fn get_active_device_by_certificate_fingerprint(
+        &self,
+        fingerprint_sha256: &str,
+    ) -> StoreResult<Device> {
+        let state = self.state.read().await;
+        let certificate = state
+            .certificates
+            .values()
+            .find(|certificate| certificate.fingerprint_sha256 == fingerprint_sha256)
+            .ok_or(StoreError::NotFound("certificate"))?;
+        if !matches!(certificate.status, CertificateStatus::Active)
+            || certificate.not_before > Utc::now()
+            || certificate.not_after <= Utc::now()
+        {
+            return Err(StoreError::NotFound("certificate"));
+        }
+        let device = state
+            .devices
+            .get(&certificate.device_id)
+            .ok_or(StoreError::NotFound("device"))?;
+        if device.project_id != certificate.project_id
+            || matches!(device.status, DeviceStatus::Disabled)
+        {
+            return Err(StoreError::NotFound("certificate"));
+        }
+        Ok(device.clone())
     }
 
     pub async fn revoke_device_certificate(

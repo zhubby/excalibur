@@ -9,6 +9,7 @@ metadata:
     "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
 spec:
   backoffLimit: {{ .Values.migrations.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.migrations.activeDeadlineSeconds }}
   template:
     metadata:
       labels:
@@ -21,29 +22,123 @@ spec:
           command: ["/bin/sh", "-ec"]
           args:
             - |
+              record_failed_migration() {
+                version="$1"
+                error="$2"
+                psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -v version="$version" -v error="$error" <<'SQL' || true
+              WITH updated AS (
+                UPDATE schema_migration_events
+                   SET status = 'failed',
+                       error = :'error',
+                       finished_at = now()
+                 WHERE id = (
+                   SELECT id
+                     FROM schema_migration_events
+                    WHERE version = :'version'
+                      AND status = 'applying'
+                    ORDER BY started_at DESC, id DESC
+                    LIMIT 1
+                 )
+                 RETURNING id
+              )
+              INSERT INTO schema_migration_events (version, status, error, finished_at)
+              SELECT :'version', 'failed', :'error', now()
+              WHERE NOT EXISTS (SELECT 1 FROM updated);
+              SQL
+              }
+
               psql "$DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
               CREATE TABLE IF NOT EXISTS schema_migrations (
                 version TEXT PRIMARY KEY,
                 applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
               );
-              INSERT INTO schema_migrations (version)
-              SELECT '001_initial.sql'
-              WHERE to_regclass('public.users') IS NOT NULL
-                AND NOT EXISTS (
-                  SELECT 1 FROM schema_migrations WHERE version = '001_initial.sql'
-                );
+              CREATE TABLE IF NOT EXISTS schema_migration_events (
+                id BIGSERIAL PRIMARY KEY,
+                version TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('applying', 'applied', 'failed')),
+                error TEXT,
+                started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                finished_at TIMESTAMPTZ
+              );
+              CREATE INDEX IF NOT EXISTS schema_migration_events_version_started_idx
+                ON schema_migration_events (version, started_at DESC, id DESC);
+              DO $$
+              DECLARE
+                missing_001_objects TEXT[];
+              BEGIN
+                IF to_regclass('public.users') IS NULL THEN
+                  RETURN;
+                END IF;
+
+                SELECT array_agg(required.object_name ORDER BY required.object_name)
+                  INTO missing_001_objects
+                  FROM (
+                    VALUES
+                      ('users'),
+                      ('orgs'),
+                      ('memberships'),
+                      ('projects'),
+                      ('devices'),
+                      ('device_certificates'),
+                      ('stream_definitions'),
+                      ('telemetry_points'),
+                      ('actions'),
+                      ('action_targets'),
+                      ('firmware_artifacts'),
+                      ('dashboards'),
+                      ('alert_rules'),
+                      ('audit_logs')
+                  ) AS required(object_name)
+                 WHERE to_regclass(format('public.%I', required.object_name)) IS NULL;
+
+                IF COALESCE(array_length(missing_001_objects, 1), 0) > 0 THEN
+                  RAISE EXCEPTION
+                    'Refusing to baseline 001_initial.sql because legacy schema is partial; missing objects: %',
+                    array_to_string(missing_001_objects, ', ');
+                END IF;
+
+                INSERT INTO schema_migrations (version)
+                VALUES ('001_initial.sql')
+                ON CONFLICT (version) DO NOTHING;
+              END $$;
               SQL
 
               for migration in /migrations/*.sql; do
+                [ -e "$migration" ] || continue
                 version="$(basename "$migration")"
-                if [ "$(psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -Atc "SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = '$version')")" = "t" ]; then
-                  echo "Skipping already applied migration $version"
-                  continue
-                fi
+                migration_script="/tmp/run-$version"
+                cat > "$migration_script" <<SQL
+              SELECT pg_advisory_lock(hashtext('excalibur_schema_migrations'));
+              SELECT CASE
+                       WHEN EXISTS (SELECT 1 FROM schema_migrations WHERE version = '$version')
+                       THEN 'false'
+                       ELSE 'true'
+                     END AS needs_apply
+              \gset
+              \if :needs_apply
+              \echo Applying migration $version
+              INSERT INTO schema_migration_events (version, status)
+              VALUES ('$version', 'applying')
+              RETURNING id AS migration_event_id
+              \gset
+              BEGIN;
+              \i $migration
+              INSERT INTO schema_migrations (version) VALUES ('$version');
+              UPDATE schema_migration_events
+                 SET status = 'applied',
+                     finished_at = now()
+               WHERE id = :migration_event_id;
+              COMMIT;
+              \else
+              \echo Skipping already applied migration $version
+              \endif
+              SELECT pg_advisory_unlock(hashtext('excalibur_schema_migrations'));
+              SQL
 
-                echo "Applying migration $version"
-                psql "$DATABASE_URL" -v ON_ERROR_STOP=1 --single-transaction -f "$migration"
-                psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "INSERT INTO schema_migrations (version) VALUES ('$version')"
+                if ! psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$migration_script"; then
+                  record_failed_migration "$version" "migration runner failed while applying $version; fix the schema or SQL file, then rerun the Helm upgrade"
+                  exit 1
+                fi
               done
           env:
             - name: DATABASE_URL

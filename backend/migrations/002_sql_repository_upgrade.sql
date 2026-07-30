@@ -1,3 +1,46 @@
+DO $$
+DECLARE
+  duplicate_email_groups BIGINT;
+  duplicate_email_samples TEXT;
+  cross_org_audit_rows BIGINT;
+  cross_org_audit_samples TEXT;
+BEGIN
+  SELECT count(*), string_agg(email_key, ', ' ORDER BY email_key)
+    INTO duplicate_email_groups, duplicate_email_samples
+    FROM (
+      SELECT lower(email) AS email_key
+      FROM users
+      GROUP BY lower(email)
+      HAVING count(*) > 1
+      LIMIT 5
+    ) duplicates;
+
+  IF COALESCE(duplicate_email_groups, 0) > 0 THEN
+    RAISE EXCEPTION
+      'Cannot apply 002_sql_repository_upgrade.sql: users contains case-insensitive duplicate emails; sample lower(email) values: %',
+      duplicate_email_samples;
+  END IF;
+
+  SELECT count(*), string_agg(id::TEXT, ', ' ORDER BY id::TEXT)
+    INTO cross_org_audit_rows, cross_org_audit_samples
+    FROM (
+      SELECT audit_logs.id
+      FROM audit_logs
+      LEFT JOIN projects
+        ON projects.id = audit_logs.project_id
+       AND projects.org_id = audit_logs.org_id
+      WHERE audit_logs.project_id IS NOT NULL
+        AND projects.id IS NULL
+      LIMIT 5
+    ) mismatches;
+
+  IF COALESCE(cross_org_audit_rows, 0) > 0 THEN
+    RAISE EXCEPTION
+      'Cannot apply 002_sql_repository_upgrade.sql: audit_logs contains rows whose project_id is outside org_id; sample audit log ids: %',
+      cross_org_audit_samples;
+  END IF;
+END $$;
+
 CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_unique_idx ON users (lower(email));
 
 DO $$

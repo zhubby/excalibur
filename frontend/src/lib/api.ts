@@ -3,7 +3,14 @@ export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue
 
 export type AuthResponse = {
   token: string;
+  refresh_token: string;
+  expires_at: string;
+  refresh_expires_at: string;
   user_id: string;
+};
+
+export type LogoutResponse = {
+  status: string;
 };
 
 export type Org = {
@@ -128,6 +135,20 @@ export type AuditLog = {
   created_at: string;
 };
 
+export type ApiKey = {
+  id: string;
+  org_id: string;
+  project_id: string | null;
+  name: string;
+  scopes: string[];
+  expires_at: string | null;
+  revoked_at: string | null;
+  last_used_at: string | null;
+  created_by: string | null;
+  created_at: string;
+  key?: string;
+};
+
 export type ApiClientOptions = {
   baseUrl?: string;
   token?: string | null;
@@ -143,6 +164,18 @@ export type RegisterRequest = {
 export type LoginRequest = {
   email: string;
   password: string;
+};
+
+export type RefreshRequest = {
+  refresh_token: string;
+};
+
+export type CreateApiKeyRequest = {
+  org_id: string;
+  project_id?: string | null;
+  name: string;
+  scopes: string[];
+  expires_at?: string | null;
 };
 
 export class ExcaliburApiError extends Error {
@@ -232,6 +265,20 @@ export function createExcaliburApi(options: ApiClientOptions = {}) {
       request<AuthResponse>("/api/v1/auth/register", { method: "POST", bodyJson: body }),
     login: (body: LoginRequest) =>
       request<AuthResponse>("/api/v1/auth/login", { method: "POST", bodyJson: body }),
+    refreshSession: (body: RefreshRequest) =>
+      request<AuthResponse>("/api/v1/auth/refresh", { method: "POST", bodyJson: body }),
+    logout: () => request<LogoutResponse>("/api/v1/auth/logout", { method: "POST" }),
+    listApiKeys: (orgId: string, projectId?: string) =>
+      request<ApiKey[]>("/api/v1/api-keys", {
+        query: { org_id: orgId, project_id: projectId },
+      }),
+    createApiKey: (body: CreateApiKeyRequest) =>
+      request<ApiKey>("/api/v1/api-keys", { method: "POST", bodyJson: body }),
+    revokeApiKey: (apiKeyId: string, orgId: string) =>
+      request<ApiKey>(`/api/v1/api-keys/${apiKeyId}/revoke`, {
+        method: "POST",
+        query: { org_id: orgId },
+      }),
     listOrgs: () => request<Org[]>("/api/v1/orgs"),
     createOrg: (body: { name: string; slug: string }) =>
       request<Org>("/api/v1/orgs", { method: "POST", bodyJson: body }),
