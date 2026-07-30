@@ -121,6 +121,8 @@ mdbook build docs
 - threshold alert window。
 - notification provider 成功/失败和 retry。
 
+当前已覆盖：memory store telemetry bucket aggregate、API aggregate endpoint、worker threshold/offline alert open/resolve/dedupe、alert notification attempt 计数。
+
 ## Frontend E2E 测试
 
 需要覆盖：
@@ -154,3 +156,5 @@ mdbook build docs
 - NATS JetStream consumer lag exporter。
 - Timescale query benchmark scripts。
 - Frontend synthetic dashboard load。
+
+当前提供 `scripts/api-load-smoke.sh` 作为 API ingest smoke/load-test 起点；10 万 MQTT mTLS 连接仍需 simulator 压测矩阵。

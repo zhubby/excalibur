@@ -9,16 +9,20 @@ Excalibur 使用一个 TimescaleDB 集群承载控制面 PostgreSQL 表和遥测
 - `backend/migrations/001_initial.sql`
 - `backend/migrations/002_sql_repository_upgrade.sql`
 - `backend/migrations/003_auth_control_plane.sql`
+- `backend/migrations/004_firmware_metadata.sql`
+- `backend/migrations/005_m5_m8_operability.sql`
 - `infra/helm/excalibur/migrations/001_initial.sql`
 - `infra/helm/excalibur/migrations/002_sql_repository_upgrade.sql`
 - `infra/helm/excalibur/migrations/003_auth_control_plane.sql`
+- `infra/helm/excalibur/migrations/004_firmware_metadata.sql`
+- `infra/helm/excalibur/migrations/005_m5_m8_operability.sql`
 
 它包含：
 
 - TimescaleDB extension。
 - `pgcrypto` extension。
-- enum 类型：`member_role`、`device_status`、`certificate_status`、`action_state`、`alert_kind`。
-- 控制面表：`users`、`orgs`、`memberships`、`projects`、`devices`、`device_certificates`、`stream_definitions`、`actions`、`action_targets`、`firmware_artifacts`、`dashboards`、`alert_rules`、`audit_logs`。
+- enum 类型：`member_role`、`device_status`、`certificate_status`、`action_state`、`alert_kind`、`alert_event_state`、`diagnostics_session_state`、`firmware_rollout_state`。
+- 控制面表：`users`、`orgs`、`memberships`、`projects`、`devices`、`device_certificates`、`stream_definitions`、`actions`、`action_targets`、`firmware_artifacts`、`firmware_rollouts`、`dashboards`、`alert_rules`、`alert_events`、`diagnostics_sessions`、`audit_logs`。
 - Auth 控制面表：`user_sessions`、`used_refresh_tokens`、`api_keys`。
 - 遥测表：`telemetry_points` hypertable。
 - 遥测去重表：`telemetry_sequence_dedup`，按 `(project_id, device_id, stream, sequence)` 保证重放幂等。
@@ -39,8 +43,11 @@ orgs
     actions
       action_targets
     firmware_artifacts
+      firmware_rollouts
     dashboards
     alert_rules
+      alert_events
+    diagnostics_sessions
     api_keys
   audit_logs
   api_keys
@@ -166,9 +173,10 @@ API 通过统一 `Store` enum 调用 repository 方法，`STORAGE_BACKEND=timesc
 - stream definitions。
 - telemetry_points 写入和查询。
 - actions 与 action_targets；父 action 状态和进度从所有 target 聚合，避免单个设备完成时把批量 action 误标为完成。
-- firmware_artifacts。
+- firmware_artifacts 与 firmware_rollouts。
 - dashboards。
-- alert_rules。
+- alert_rules 与 alert_events。
+- diagnostics_sessions。
 - audit_logs。
 
 SQL-backed 启动：
@@ -187,7 +195,7 @@ EXCALIBUR_SQL_TEST_DATABASE_URL=postgres://excalibur:excalibur@localhost:5432/ex
   cargo test -p excalibur-storage pg_store_contract_runs_when_database_url_is_set -- --nocapture
 ```
 
-未设置 `EXCALIBUR_SQL_TEST_DATABASE_URL` 时，本地测试会跳过 live SQL contract。设置该变量后，storage contract 会覆盖 SQL schema validation、tenant scope、session rotation/reuse detection、API key scope/revoke、active certificate fingerprint lookup、telemetry sequence 去重和多 target action 聚合；mqtt-ingest 也有同变量门控的 SQL-backed ingest contract。CI workflow 会启动 TimescaleDB 并设置该变量，因此 SQL contract 在 CI 中强制执行。
+未设置 `EXCALIBUR_SQL_TEST_DATABASE_URL` 时，本地测试会跳过 live SQL contract。设置该变量后，storage contract 会覆盖 SQL schema validation、tenant scope、session rotation/reuse detection、API key scope/revoke、active certificate fingerprint lookup、telemetry sequence 去重、多 target action 聚合、firmware finalize/rollout、alert event 和 diagnostics session；mqtt-ingest 也有同变量门控的 SQL-backed ingest contract。CI workflow 会启动 TimescaleDB 并设置该变量，因此 SQL contract 在 CI 中强制执行。
 
 ## 生产 repository 要求
 
@@ -203,10 +211,9 @@ SQL repository 必须满足：
 
 ## 查询形态
 
-Dashboard/query API 后续应支持：
+Dashboard/query API 当前支持 telemetry bucket aggregate；后续应继续支持：
 
 - raw rows：按 device、stream、time range 查询。
-- aggregate rows：按 interval downsample，例如 1m、5m、1h。
 - latest：按 device/stream 查最新值。
 - export：CSV/Parquet 文件写入对象存储。
 - pagination：基于 `(ts, sequence)` cursor。

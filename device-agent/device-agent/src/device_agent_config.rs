@@ -239,6 +239,7 @@ pub struct DeviceConfig {
     pub device_id: String,
     pub broker: String,
     pub port: u16,
+    pub certificate_fingerprint_sha256: Option<String>,
     pub authentication: Option<Authentication>,
 }
 

@@ -9,13 +9,13 @@ Excalibur 是一个 Bytebeam-like 的商业物联网 SaaS 平台 scaffold。它�
 | 领域 | 当前状态 |
 | --- | --- |
 | 控制面 API | `backend/apps/api` 可运行，支持 `STORAGE_BACKEND=memory` 和 `STORAGE_BACKEND=timescale`，提供 OpenAPI JSON。 |
-| 身份认证 | Argon2id 密码哈希、SQL-backed Bearer session、refresh token rotation/reuse detection 和 API key hash 存储已实现；HttpOnly cookie、邮箱验证和邀请仍待生产化。 |
+| 身份认证 | Argon2id 密码哈希、SQL-backed Bearer session、HttpOnly cookie、refresh token rotation/reuse detection 和 API key hash 存储已实现；邮箱验证和邀请仍待生产化。 |
 | 多租户 | `org -> project -> device` 模型已实现，API 和 store 显式按 org/project 校验作用域。 |
 | MQTT 协议 | `backend/crates/device-protocol` 定义 topic、payload、auth JSON 和校验逻辑。 |
-| MQTT ingest | `backend/apps/mqtt-ingest` 可启动本地 `rumqttd` broker，订阅 Excalibur topic 并写入 Store；生产 mTLS 连接身份 hook 仍待硬化。 |
+| MQTT ingest | `backend/apps/mqtt-ingest` 可启动本地 `rumqttd` broker，订阅 Excalibur topic，支持 TLS listener、peer cert fingerprint 身份、JetStream telemetry buffer 和 command bridge。 |
 | Device Agent | `device-agent/` 已从 uplink 产品化，改为 Excalibur 原生 topic、JSON command payload、OTA payload 和 CSR/dev auth JSON。 |
 | 存储 | TimescaleDB migration 和 SQL repository 均已接入；`timescale` 模式持久化控制面、telemetry、session/refresh token 和 API key，`memory` 模式仍是进程内开发实现。 |
-| 前端 | `frontend/` 是 Next.js App Router Console，已接入当前 REST API，支持注册/登录、默认 workspace bootstrap、设备 provisioning、telemetry ingest、actions、alerts、audit 和一键本地闭环 demo。 |
+| 前端 | `frontend/` 是 Next.js App Router Console，已接入当前 REST API 和 OpenAPI-generated DTO，支持注册/登录、默认 workspace bootstrap、设备 provisioning、telemetry ingest/aggregate、actions、OTA rollout、diagnostics session、alerts、audit 和一键本地闭环 demo。 |
 | 部署 | `docker-compose.yml` 和 `infra/helm/excalibur` 提供 TimescaleDB、NATS、RustFS、API、MQTT ingest、worker、frontend scaffold。 |
 
 ## 文档读法

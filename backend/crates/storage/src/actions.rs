@@ -29,11 +29,27 @@ pub(crate) fn aggregate_action_state(
 }
 
 pub fn map_terminal_action_state(state: &str) -> ActionState {
+    parse_reported_action_state(state).unwrap_or(ActionState::Running)
+}
+
+pub fn parse_reported_action_state(state: &str) -> Option<ActionState> {
     match state {
-        "Completed" | "completed" => ActionState::Completed,
-        "Failed" | "failed" => ActionState::Failed,
-        "Cancelled" | "cancelled" => ActionState::Cancelled,
-        "TimedOut" | "timed_out" => ActionState::TimedOut,
-        _ => ActionState::Running,
+        "Running" | "running" => Some(ActionState::Running),
+        "Completed" | "completed" => Some(ActionState::Completed),
+        "Failed" | "failed" => Some(ActionState::Failed),
+        "Cancelled" | "cancelled" => Some(ActionState::Cancelled),
+        "TimedOut" | "timed_out" | "timedOut" => Some(ActionState::TimedOut),
+        _ => None,
+    }
+}
+
+pub(crate) fn action_status_allowed_source_states(next_state: &ActionState) -> Vec<ActionState> {
+    match next_state {
+        ActionState::Running => vec![ActionState::Running],
+        ActionState::Completed => vec![ActionState::Running, ActionState::Completed],
+        ActionState::Failed => vec![ActionState::Running, ActionState::Failed],
+        ActionState::Cancelled => vec![ActionState::Running, ActionState::Cancelled],
+        ActionState::TimedOut => vec![ActionState::Running, ActionState::TimedOut],
+        ActionState::Queued | ActionState::WaitingApproval => Vec::new(),
     }
 }

@@ -99,7 +99,7 @@ MQTT_LISTEN=0.0.0.0:1883 \
   cargo run -p excalibur-mqtt-ingest
 ```
 
-它会启动 `rumqttd`，订阅 `v1/p/+/d/+/telemetry/+`、`v1/p/+/d/+/shadow` 和 `v1/p/+/d/+/commands/status`，并把符合 Excalibur 协议的 publish 写入 store。本地 listener 当前是开发用明文 MQTT；生产 mTLS `8883` 需要补齐 peer certificate fingerprint 到 device identity 的 rumqttd hook/fork。
+它会启动 `rumqttd`，订阅 `v1/p/+/d/+/telemetry/+`、`v1/p/+/d/+/shadow` 和 `v1/p/+/d/+/commands/status`，并把符合 Excalibur 协议的 publish 写入 store 或 JetStream。TLS listener 可通过 `MQTT_TLS_*` 启用；`MQTT_REQUIRE_CERT_FINGERPRINT_USERNAME=true` 时，agent 会把 auth JSON 中的 `certificate_fingerprint_sha256` 作为 MQTT username，runtime 会把该 fingerprint 解析成连接设备身份，并用连接身份校验 publish/subscribe topic。
 
 ## 前端 Console
 

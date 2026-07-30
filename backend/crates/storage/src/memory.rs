@@ -1,20 +1,22 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use excalibur_domain::{
-    Action, ActionState, ActionStatusUpdate, AlertRule, ApiKey, AuditLog, CertificateStatus,
-    Dashboard, Device, DeviceCertificate, DeviceStatus, FirmwareArtifact, Id, Membership, Org,
-    Project, Role, StreamDefinition, TelemetryPoint, User, UserSession,
+    Action, ActionDispatchTarget, ActionState, ActionStatusUpdate, ActionTargetStatusChange,
+    ActionTargetTransition, AlertEvent, AlertEventState, AlertRule, ApiKey, AuditLog,
+    CertificateStatus, Dashboard, Device, DeviceCertificate, DeviceStatus, DiagnosticsSession,
+    FirmwareArtifact, FirmwareRollout, Id, Membership, Org, Project, Role, StreamDefinition,
+    TelemetryAggregateBucket, TelemetryPoint, User, UserSession,
 };
 use serde_json::Value;
 use tokio::sync::RwLock;
 
 use crate::{
     StoreError, StoreResult,
-    actions::aggregate_action_state,
+    actions::{action_status_allowed_source_states, aggregate_action_state},
     telemetry::{TelemetryDedupeKey, telemetry_dedupe_key},
 };
 
@@ -39,8 +41,11 @@ struct MemoryState {
     actions: HashMap<Id, Action>,
     action_targets: HashMap<(Id, Id), ActionTargetRecord>,
     firmware: HashMap<Id, FirmwareArtifact>,
+    firmware_rollouts: HashMap<Id, FirmwareRollout>,
     alerts: HashMap<Id, AlertRule>,
+    alert_events: HashMap<Id, AlertEvent>,
     dashboards: HashMap<Id, Dashboard>,
+    diagnostics_sessions: HashMap<Id, DiagnosticsSession>,
     audit: Vec<AuditLog>,
 }
 
@@ -49,6 +54,7 @@ struct ActionTargetRecord {
     state: ActionState,
     progress: u8,
     errors: Vec<String>,
+    updated_at: DateTime<Utc>,
 }
 
 fn aggregate_action_targets<'a>(
@@ -656,6 +662,90 @@ impl MemoryStore {
         rows.into_iter().rev().take(limit).collect()
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn aggregate_telemetry(
+        &self,
+        project_id: Id,
+        device_id: Option<Id>,
+        stream: &str,
+        field: Option<&str>,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        bucket_seconds: i64,
+        limit: usize,
+    ) -> Vec<TelemetryAggregateBucket> {
+        #[derive(Debug, Clone)]
+        struct Accumulator {
+            count: i64,
+            numeric_count: i64,
+            sum: f64,
+            min: Option<f64>,
+            max: Option<f64>,
+            last: Option<f64>,
+            last_ts: Option<DateTime<Utc>>,
+        }
+
+        let bucket_seconds = bucket_seconds.max(1);
+        let state = self.state.read().await;
+        let mut buckets: BTreeMap<i64, Accumulator> = BTreeMap::new();
+        for point in state
+            .telemetry
+            .iter()
+            .filter(|point| point.project_id == project_id)
+            .filter(|point| device_id.is_none_or(|id| point.device_id == id))
+            .filter(|point| point.stream == stream)
+            .filter(|point| point.ts >= from && point.ts < to)
+        {
+            let bucket_epoch = point.ts.timestamp().div_euclid(bucket_seconds) * bucket_seconds;
+            let entry = buckets.entry(bucket_epoch).or_insert(Accumulator {
+                count: 0,
+                numeric_count: 0,
+                sum: 0.0,
+                min: None,
+                max: None,
+                last: None,
+                last_ts: None,
+            });
+            entry.count += 1;
+            let numeric = field
+                .and_then(|field| point.payload.get(field))
+                .and_then(serde_json::Value::as_f64);
+            if let Some(value) = numeric {
+                entry.numeric_count += 1;
+                entry.sum += value;
+                entry.min = Some(entry.min.map_or(value, |current| current.min(value)));
+                entry.max = Some(entry.max.map_or(value, |current| current.max(value)));
+                if entry.last_ts.is_none_or(|last_ts| point.ts >= last_ts) {
+                    entry.last = Some(value);
+                    entry.last_ts = Some(point.ts);
+                }
+            }
+        }
+
+        buckets
+            .into_iter()
+            .rev()
+            .take(limit)
+            .filter_map(|(bucket_epoch, accumulator)| {
+                let bucket_start = DateTime::<Utc>::from_timestamp(bucket_epoch, 0)?;
+                Some(TelemetryAggregateBucket {
+                    project_id,
+                    device_id,
+                    stream: stream.to_owned(),
+                    field: field.map(str::to_owned),
+                    bucket_start,
+                    bucket_seconds,
+                    count: accumulator.count,
+                    min: accumulator.min,
+                    max: accumulator.max,
+                    avg: (accumulator.numeric_count > 0)
+                        .then(|| accumulator.sum / accumulator.numeric_count as f64),
+                    last: accumulator.last,
+                })
+            })
+            .collect()
+    }
+
     pub async fn create_action(&self, action: Action) -> StoreResult<Action> {
         let mut state = self.state.write().await;
         if !state.projects.contains_key(&action.project_id) {
@@ -681,6 +771,7 @@ impl MemoryStore {
                     state: action.state.clone(),
                     progress: action.progress,
                     errors: action.errors.clone(),
+                    updated_at: action.updated_at,
                 },
             );
         }
@@ -722,9 +813,16 @@ impl MemoryStore {
             .action_targets
             .get_mut(&(update.action_id, update.device_id))
             .ok_or(StoreError::NotFound("action target"))?;
-        target.state = update.state;
-        target.progress = update.progress.min(100);
-        target.errors = update.errors;
+        let allowed_source_states = action_status_allowed_source_states(&update.state);
+        if allowed_source_states
+            .iter()
+            .any(|state| state == &target.state)
+        {
+            target.state = update.state;
+            target.progress = update.progress.min(100);
+            target.errors = update.errors;
+            target.updated_at = update.ts;
+        }
         let (state_value, progress, errors) = aggregate_action_targets(
             state
                 .action_targets
@@ -741,6 +839,217 @@ impl MemoryStore {
         action.errors = errors;
         action.updated_at = update.ts;
         Ok(action.clone())
+    }
+
+    pub async fn claim_queued_action_targets(
+        &self,
+        limit: usize,
+    ) -> StoreResult<Vec<ActionDispatchTarget>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut state = self.state.write().await;
+        let mut keys = state
+            .action_targets
+            .iter()
+            .filter(|(_, target)| target.state == ActionState::Queued)
+            .map(|(key, target)| (target.updated_at, *key))
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys.truncate(limit);
+
+        let now = Utc::now();
+        let mut dispatch_targets = Vec::with_capacity(keys.len());
+        let mut affected_actions = HashSet::new();
+        for (_, (action_id, device_id)) in keys {
+            let Some(action) = state.actions.get(&action_id).cloned() else {
+                continue;
+            };
+            let Some(target) = state.action_targets.get_mut(&(action_id, device_id)) else {
+                continue;
+            };
+            if target.state != ActionState::Queued {
+                continue;
+            }
+            target.state = ActionState::Running;
+            target.progress = 0;
+            target.errors.clear();
+            target.updated_at = now;
+            affected_actions.insert(action_id);
+            dispatch_targets.push(ActionDispatchTarget {
+                project_id: action.project_id,
+                action_id,
+                device_id,
+                name: action.name,
+                payload: action.payload,
+            });
+        }
+
+        for action_id in affected_actions {
+            let (state_value, progress, errors) = aggregate_action_targets(
+                state
+                    .action_targets
+                    .iter()
+                    .filter(|((candidate_action_id, _), _)| *candidate_action_id == action_id)
+                    .map(|(_, target)| target),
+            );
+            if let Some(action) = state.actions.get_mut(&action_id) {
+                action.state = state_value;
+                action.progress = progress;
+                action.errors = errors;
+                action.updated_at = now;
+            }
+        }
+
+        Ok(dispatch_targets)
+    }
+
+    pub async fn transition_action_targets(
+        &self,
+        transition: ActionTargetTransition,
+    ) -> StoreResult<Action> {
+        let mut state = self.state.write().await;
+        let action = state
+            .actions
+            .get(&transition.action_id)
+            .cloned()
+            .ok_or(StoreError::NotFound("action"))?;
+        if action.project_id != transition.project_id {
+            return Err(StoreError::NotFound("action"));
+        }
+
+        let target_device_ids = transition
+            .device_ids
+            .clone()
+            .unwrap_or_else(|| action.device_ids.clone());
+        if target_device_ids.is_empty() {
+            return Err(StoreError::NotFound("action target"));
+        }
+
+        let mut seen_targets = HashSet::new();
+        for device_id in &target_device_ids {
+            if !seen_targets.insert(*device_id) {
+                return Err(StoreError::Conflict("action target"));
+            }
+            let device = state
+                .devices
+                .get(device_id)
+                .ok_or(StoreError::NotFound("device"))?;
+            if device.project_id != transition.project_id {
+                return Err(StoreError::TenantScope);
+            }
+            if !action.device_ids.contains(device_id) {
+                return Err(StoreError::NotFound("action target"));
+            }
+        }
+
+        let mut changed = 0usize;
+        for device_id in &target_device_ids {
+            let target = state
+                .action_targets
+                .get_mut(&(transition.action_id, *device_id))
+                .ok_or(StoreError::NotFound("action target"))?;
+            if transition
+                .allowed_source_states
+                .iter()
+                .any(|state| state == &target.state)
+            {
+                target.state = transition.next_state.clone();
+                if let Some(progress) = transition.progress {
+                    target.progress = progress.min(100);
+                }
+                if let Some(errors) = &transition.errors {
+                    target.errors = errors.clone();
+                }
+                target.updated_at = transition.ts;
+                changed += 1;
+            }
+        }
+        if changed == 0 {
+            return Err(StoreError::Conflict("action transition"));
+        }
+
+        let (state_value, progress, errors) = aggregate_action_targets(
+            state
+                .action_targets
+                .iter()
+                .filter(|((action_id, _), _)| *action_id == transition.action_id)
+                .map(|(_, target)| target),
+        );
+        let action = state
+            .actions
+            .get_mut(&transition.action_id)
+            .ok_or(StoreError::NotFound("action"))?;
+        action.state = state_value;
+        action.progress = progress;
+        action.errors = errors;
+        action.updated_at = transition.ts;
+        Ok(action.clone())
+    }
+
+    pub async fn timeout_running_action_targets(
+        &self,
+        older_than: DateTime<Utc>,
+        limit: usize,
+        ts: DateTime<Utc>,
+    ) -> StoreResult<Vec<ActionTargetStatusChange>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut state = self.state.write().await;
+        let mut keys = state
+            .action_targets
+            .iter()
+            .filter(|(_, target)| {
+                target.state == ActionState::Running && target.updated_at < older_than
+            })
+            .map(|((action_id, device_id), target)| (target.updated_at, *action_id, *device_id))
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys.truncate(limit);
+
+        let mut changes = Vec::with_capacity(keys.len());
+        let mut affected_actions = HashSet::new();
+        for (_, action_id, device_id) in keys {
+            let Some(action) = state.actions.get(&action_id).cloned() else {
+                continue;
+            };
+            let Some(target) = state.action_targets.get_mut(&(action_id, device_id)) else {
+                continue;
+            };
+            if target.state != ActionState::Running || target.updated_at >= older_than {
+                continue;
+            }
+            target.state = ActionState::TimedOut;
+            target.errors = vec!["action timed out".to_owned()];
+            target.updated_at = ts;
+            affected_actions.insert(action_id);
+            changes.push(ActionTargetStatusChange {
+                project_id: action.project_id,
+                action_id,
+                device_id,
+                state: ActionState::TimedOut,
+            });
+        }
+
+        for action_id in affected_actions {
+            let (state_value, progress, errors) = aggregate_action_targets(
+                state
+                    .action_targets
+                    .iter()
+                    .filter(|((candidate_action_id, _), _)| *candidate_action_id == action_id)
+                    .map(|(_, target)| target),
+            );
+            if let Some(action) = state.actions.get_mut(&action_id) {
+                action.state = state_value;
+                action.progress = progress;
+                action.errors = errors;
+                action.updated_at = ts;
+            }
+        }
+
+        Ok(changes)
     }
 
     pub async fn create_firmware(
@@ -762,12 +1071,77 @@ impl MemoryStore {
         Ok(artifact)
     }
 
+    pub async fn finalize_firmware(
+        &self,
+        project_id: Id,
+        firmware_id: Id,
+        sha256: &str,
+        size_bytes: i64,
+        signature: Option<&str>,
+        ts: DateTime<Utc>,
+    ) -> StoreResult<FirmwareArtifact> {
+        let mut state = self.state.write().await;
+        let artifact = state
+            .firmware
+            .get_mut(&firmware_id)
+            .ok_or(StoreError::NotFound("firmware"))?;
+        if artifact.project_id != project_id {
+            return Err(StoreError::NotFound("firmware"));
+        }
+        if artifact.sha256 != sha256
+            || artifact.size_bytes != size_bytes
+            || artifact.signature.as_deref() != signature
+        {
+            return Err(StoreError::Conflict("firmware verification"));
+        }
+        artifact.uploaded_at = Some(ts);
+        artifact.verified_at = Some(ts);
+        artifact.active = true;
+        Ok(artifact.clone())
+    }
+
     pub async fn list_firmware(&self, project_id: Id) -> Vec<FirmwareArtifact> {
         let state = self.state.read().await;
         state
             .firmware
             .values()
             .filter(|artifact| artifact.project_id == project_id)
+            .cloned()
+            .collect()
+    }
+
+    pub async fn create_firmware_rollout(
+        &self,
+        rollout: FirmwareRollout,
+    ) -> StoreResult<FirmwareRollout> {
+        let mut state = self.state.write().await;
+        let artifact = state
+            .firmware
+            .get(&rollout.firmware_id)
+            .ok_or(StoreError::NotFound("firmware"))?;
+        if artifact.project_id != rollout.project_id {
+            return Err(StoreError::NotFound("firmware"));
+        }
+        let action = state
+            .actions
+            .get(&rollout.action_id)
+            .ok_or(StoreError::NotFound("action"))?;
+        if action.project_id != rollout.project_id {
+            return Err(StoreError::NotFound("action"));
+        }
+        if rollout.cohort_size <= 0 {
+            return Err(StoreError::Conflict("firmware rollout"));
+        }
+        state.firmware_rollouts.insert(rollout.id, rollout.clone());
+        Ok(rollout)
+    }
+
+    pub async fn list_firmware_rollouts(&self, project_id: Id) -> Vec<FirmwareRollout> {
+        let state = self.state.read().await;
+        state
+            .firmware_rollouts
+            .values()
+            .filter(|rollout| rollout.project_id == project_id)
             .cloned()
             .collect()
     }
@@ -791,6 +1165,137 @@ impl MemoryStore {
             .collect()
     }
 
+    pub async fn list_enabled_alerts(&self) -> Vec<AlertRule> {
+        let state = self.state.read().await;
+        state
+            .alerts
+            .values()
+            .filter(|alert| alert.enabled)
+            .cloned()
+            .collect()
+    }
+
+    pub async fn upsert_firing_alert_event(&self, event: AlertEvent) -> StoreResult<AlertEvent> {
+        let mut state = self.state.write().await;
+        if !state.projects.contains_key(&event.project_id) {
+            return Err(StoreError::NotFound("project"));
+        }
+        let alert = state
+            .alerts
+            .get(&event.alert_rule_id)
+            .ok_or(StoreError::NotFound("alert"))?;
+        if alert.project_id != event.project_id {
+            return Err(StoreError::NotFound("alert"));
+        }
+        if let Some(device_id) = event.device_id {
+            let device = state
+                .devices
+                .get(&device_id)
+                .ok_or(StoreError::NotFound("device"))?;
+            if device.project_id != event.project_id {
+                return Err(StoreError::NotFound("device"));
+            }
+        }
+
+        let existing_id = state
+            .alert_events
+            .iter()
+            .find(|(_, existing)| {
+                existing.project_id == event.project_id
+                    && existing.alert_rule_id == event.alert_rule_id
+                    && existing.dedupe_key == event.dedupe_key
+                    && existing.resolved_at.is_none()
+            })
+            .map(|(id, _)| *id);
+        if let Some(existing_id) = existing_id {
+            let existing = state
+                .alert_events
+                .get_mut(&existing_id)
+                .ok_or(StoreError::NotFound("alert event"))?;
+            existing.state = AlertEventState::Firing;
+            existing.message = event.message;
+            existing.observed_value = event.observed_value;
+            existing.threshold = event.threshold;
+            existing.last_seen_at = event.last_seen_at;
+            existing.last_notification_error = None;
+            Ok(existing.clone())
+        } else {
+            state.alert_events.insert(event.id, event.clone());
+            Ok(event)
+        }
+    }
+
+    pub async fn resolve_alert_event(
+        &self,
+        project_id: Id,
+        alert_rule_id: Id,
+        dedupe_key: &str,
+        ts: DateTime<Utc>,
+    ) -> StoreResult<Option<AlertEvent>> {
+        let mut state = self.state.write().await;
+        let existing_id = state
+            .alert_events
+            .iter()
+            .find(|(_, existing)| {
+                existing.project_id == project_id
+                    && existing.alert_rule_id == alert_rule_id
+                    && existing.dedupe_key == dedupe_key
+                    && existing.resolved_at.is_none()
+            })
+            .map(|(id, _)| *id);
+        let Some(existing_id) = existing_id else {
+            return Ok(None);
+        };
+        let existing = state
+            .alert_events
+            .get_mut(&existing_id)
+            .ok_or(StoreError::NotFound("alert event"))?;
+        existing.state = AlertEventState::Resolved;
+        existing.resolved_at = Some(ts);
+        existing.last_seen_at = ts;
+        Ok(Some(existing.clone()))
+    }
+
+    pub async fn list_alert_events(
+        &self,
+        project_id: Id,
+        state_filter: Option<AlertEventState>,
+    ) -> Vec<AlertEvent> {
+        let state = self.state.read().await;
+        state
+            .alert_events
+            .values()
+            .filter(|event| event.project_id == project_id)
+            .filter(|event| {
+                state_filter
+                    .as_ref()
+                    .is_none_or(|expected| &event.state == expected)
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub async fn record_alert_notification_attempt(
+        &self,
+        project_id: Id,
+        alert_event_id: Id,
+        error: Option<String>,
+        ts: DateTime<Utc>,
+    ) -> StoreResult<AlertEvent> {
+        let mut state = self.state.write().await;
+        let event = state
+            .alert_events
+            .get_mut(&alert_event_id)
+            .ok_or(StoreError::NotFound("alert event"))?;
+        if event.project_id != project_id {
+            return Err(StoreError::NotFound("alert event"));
+        }
+        event.notification_attempts += 1;
+        event.last_notification_error = error;
+        event.last_seen_at = event.last_seen_at.max(ts);
+        Ok(event.clone())
+    }
+
     pub async fn create_dashboard(&self, dashboard: Dashboard) -> StoreResult<Dashboard> {
         let mut state = self.state.write().await;
         if !state.projects.contains_key(&dashboard.project_id) {
@@ -806,6 +1311,75 @@ impl MemoryStore {
             .dashboards
             .values()
             .filter(|dashboard| dashboard.project_id == project_id)
+            .cloned()
+            .collect()
+    }
+
+    pub async fn create_diagnostics_session(
+        &self,
+        session: DiagnosticsSession,
+    ) -> StoreResult<DiagnosticsSession> {
+        let mut state = self.state.write().await;
+        let device = state
+            .devices
+            .get(&session.device_id)
+            .ok_or(StoreError::NotFound("device"))?;
+        if device.project_id != session.project_id {
+            return Err(StoreError::NotFound("device"));
+        }
+        if let Some(action_id) = session.action_id {
+            let action = state
+                .actions
+                .get(&action_id)
+                .ok_or(StoreError::NotFound("action"))?;
+            if action.project_id != session.project_id {
+                return Err(StoreError::NotFound("action"));
+            }
+        }
+        state
+            .diagnostics_sessions
+            .insert(session.id, session.clone());
+        Ok(session)
+    }
+
+    pub async fn update_diagnostics_session(
+        &self,
+        session: DiagnosticsSession,
+    ) -> StoreResult<DiagnosticsSession> {
+        let mut state = self.state.write().await;
+        let existing = state
+            .diagnostics_sessions
+            .get_mut(&session.id)
+            .ok_or(StoreError::NotFound("diagnostics session"))?;
+        if existing.project_id != session.project_id || existing.device_id != session.device_id {
+            return Err(StoreError::NotFound("diagnostics session"));
+        }
+        *existing = session.clone();
+        Ok(session)
+    }
+
+    pub async fn get_diagnostics_session(
+        &self,
+        project_id: Id,
+        session_id: Id,
+    ) -> StoreResult<DiagnosticsSession> {
+        let state = self.state.read().await;
+        let session = state
+            .diagnostics_sessions
+            .get(&session_id)
+            .ok_or(StoreError::NotFound("diagnostics session"))?;
+        if session.project_id != project_id {
+            return Err(StoreError::NotFound("diagnostics session"));
+        }
+        Ok(session.clone())
+    }
+
+    pub async fn list_diagnostics_sessions(&self, project_id: Id) -> Vec<DiagnosticsSession> {
+        let state = self.state.read().await;
+        state
+            .diagnostics_sessions
+            .values()
+            .filter(|session| session.project_id == project_id)
             .cloned()
             .collect()
     }

@@ -1,182 +1,88 @@
-export type JsonPrimitive = string | number | boolean | null;
-export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
+import type {
+  ActionResponse,
+  AlertKindDto,
+  AlertEventResponse,
+  AlertRuleResponse,
+  ApiKeyResponse,
+  AuditLogResponse,
+  AuthResponse,
+  CreateApiKeyRequest,
+  ActionStatusRequest,
+  ActionTransitionRequest,
+  CreateActionRequest,
+  CreateDiagnosticsSessionRequest,
+  CreateFirmwareRequest,
+  DashboardResponse,
+  DeviceConfigResponse,
+  DeviceResponse,
+  DiagnosticsFinalizeRequest,
+  DiagnosticsSessionCreateResponse,
+  DiagnosticsSessionResponse,
+  FirmwareArtifactResponse,
+  FirmwareFinalizeRequest,
+  FirmwareRolloutRequest,
+  FirmwareRolloutResponse,
+  JsonValue,
+  LoginRequest,
+  LogoutResponse,
+  OrgResponse,
+  ProjectResponse,
+  RefreshRequest,
+  RegisterRequest,
+  SignedObjectUrl,
+  StreamDefinitionResponse,
+  StreamFieldDto,
+  StreamFieldTypeDto,
+  TelemetryAggregateBucketResponse,
+  TelemetryPointResponse,
+} from "./generated/api-types";
 
-export type AuthResponse = {
-  token: string;
-  refresh_token: string;
-  expires_at: string;
-  refresh_expires_at: string;
-  user_id: string;
-};
+export type {
+  AuthResponse,
+  CreateApiKeyRequest,
+  ActionStatusRequest,
+  ActionTransitionRequest,
+  CreateActionRequest,
+  CreateDiagnosticsSessionRequest,
+  CreateFirmwareRequest,
+  DiagnosticsFinalizeRequest,
+  FirmwareFinalizeRequest,
+  FirmwareRolloutRequest,
+  JsonPrimitive,
+  JsonValue,
+  LoginRequest,
+  LogoutResponse,
+  RefreshRequest,
+  RegisterRequest,
+  SignedObjectUrl,
+} from "./generated/api-types";
 
-export type LogoutResponse = {
-  status: string;
-};
-
-export type Org = {
-  id: string;
-  name: string;
-  slug: string;
-  created_at: string;
-};
-
-export type Project = {
-  id: string;
-  org_id: string;
-  name: string;
-  slug: string;
-  created_at: string;
-};
-
-export type Device = {
-  id: string;
-  project_id: string;
-  name: string;
-  status: string;
-  metadata: JsonValue;
-  last_seen_at: string | null;
-  latest_shadow: JsonValue;
-  created_at: string;
-};
-
-export type DeviceConfig = {
-  broker: string;
-  port: number;
-  project_id: string;
-  device_id: string;
-  authentication: {
-    ca_certificate: string;
-    device_certificate: string;
-    device_private_key?: string;
-    device_private_key_path?: string;
-  };
-  provisioning_mode: "Csr" | "DevGeneratedKeypair";
-  production: boolean;
-};
-
-export type StreamFieldType = "String" | "Integer" | "Float" | "Boolean" | "Json";
-
-export type StreamField = {
-  name: string;
-  field_type: StreamFieldType;
-  required: boolean;
-};
-
-export type StreamDefinition = {
-  id: string;
-  project_id: string;
-  name: string;
-  fields: StreamField[];
-  created_at: string;
-};
-
-export type TelemetryPoint = {
-  project_id: string;
-  device_id: string;
-  stream: string;
-  sequence: number;
-  ts: string;
-  payload: JsonValue;
-  ingested_at: string;
-};
-
-export type Action = {
-  id: string;
-  project_id: string;
-  device_ids: string[];
-  name: string;
-  payload: JsonValue;
-  state: string;
-  progress: number;
-  errors: string[];
-  created_by: string | null;
-  created_at: string;
-  updated_at: string;
-};
-
-export type FirmwareArtifact = {
-  id: string;
-  project_id: string;
-  component: string;
-  version: string;
-  object_key: string;
-  sha256: string;
-  size_bytes: number;
-  active: boolean;
-  created_at: string;
-};
-
-export type AlertKind = "Offline" | "Threshold" | "WindowAggregation";
-
-export type AlertRule = {
-  id: string;
-  project_id: string;
-  name: string;
-  kind: string;
-  expression: JsonValue;
-  enabled: boolean;
-};
-
-export type Dashboard = {
-  id: string;
-  project_id: string;
-  name: string;
-  layout: JsonValue;
-};
-
-export type AuditLog = {
-  id: string;
-  org_id: string;
-  project_id: string | null;
-  actor_id: string | null;
-  action: string;
-  resource: string;
-  metadata: JsonValue;
-  created_at: string;
-};
-
-export type ApiKey = {
-  id: string;
-  org_id: string;
-  project_id: string | null;
-  name: string;
-  scopes: string[];
-  expires_at: string | null;
-  revoked_at: string | null;
-  last_used_at: string | null;
-  created_by: string | null;
-  created_at: string;
-  key?: string;
-};
+export type Action = ActionResponse;
+export type AlertEvent = AlertEventResponse;
+export type AlertKind = AlertKindDto;
+export type AlertRule = AlertRuleResponse;
+export type ApiKey = ApiKeyResponse;
+export type AuditLog = AuditLogResponse;
+export type Dashboard = DashboardResponse;
+export type Device = DeviceResponse;
+export type DeviceConfig = DeviceConfigResponse;
+export type DiagnosticsSession = DiagnosticsSessionResponse;
+export type DiagnosticsSessionCreate = DiagnosticsSessionCreateResponse;
+export type FirmwareArtifact = FirmwareArtifactResponse;
+export type FirmwareRollout = FirmwareRolloutResponse;
+export type Org = OrgResponse;
+export type Project = ProjectResponse;
+export type StreamDefinition = StreamDefinitionResponse;
+export type StreamField = StreamFieldDto;
+export type StreamFieldType = StreamFieldTypeDto;
+export type TelemetryAggregateBucket = TelemetryAggregateBucketResponse;
+export type TelemetryPoint = TelemetryPointResponse;
 
 export type ApiClientOptions = {
   baseUrl?: string;
   token?: string | null;
   credentials?: RequestCredentials;
   fetcher?: typeof fetch;
-};
-
-export type RegisterRequest = {
-  email: string;
-  password: string;
-  display_name: string;
-};
-
-export type LoginRequest = {
-  email: string;
-  password: string;
-};
-
-export type RefreshRequest = {
-  refresh_token: string;
-};
-
-export type CreateApiKeyRequest = {
-  org_id: string;
-  project_id?: string | null;
-  name: string;
-  scopes: string[];
-  expires_at?: string | null;
 };
 
 export class ExcaliburApiError extends Error {
@@ -324,38 +230,80 @@ export function createExcaliburApi(options: ApiClientOptions = {}) {
           limit: query.limit,
         },
       }),
+    aggregateTelemetry: (query: {
+      projectId: string;
+      deviceId?: string;
+      stream: string;
+      field?: string;
+      from?: string;
+      to?: string;
+      bucketSeconds?: number;
+      limit?: number;
+    }) =>
+      request<TelemetryAggregateBucket[]>("/api/v1/telemetry/aggregate", {
+        query: {
+          project_id: query.projectId,
+          device_id: query.deviceId,
+          stream: query.stream,
+          field: query.field,
+          from: query.from,
+          to: query.to,
+          bucket_seconds: query.bucketSeconds,
+          limit: query.limit,
+        },
+      }),
     listActions: (projectId: string) =>
       request<Action[]>("/api/v1/actions", { query: { project_id: projectId } }),
-    createAction: (body: {
-      project_id: string;
-      device_ids: string[];
-      name: string;
-      payload: JsonValue;
-    }) => request<Action>("/api/v1/actions", { method: "POST", bodyJson: body }),
-    updateActionStatus: (
-      actionId: string,
-      body: {
-        project_id: string;
-        device_id: string;
-        state: "Queued" | "WaitingApproval" | "Running" | "Completed" | "Failed" | "Cancelled" | "TimedOut";
-        progress: number;
-        errors: string[];
-      },
-    ) =>
+    createAction: (body: CreateActionRequest) =>
+      request<Action>("/api/v1/actions", { method: "POST", bodyJson: body }),
+    approveAction: (actionId: string, body: ActionTransitionRequest) =>
+      request<Action>(`/api/v1/actions/${actionId}/approve`, {
+        method: "POST",
+        bodyJson: body,
+      }),
+    retryAction: (actionId: string, body: ActionTransitionRequest) =>
+      request<Action>(`/api/v1/actions/${actionId}/retry`, {
+        method: "POST",
+        bodyJson: body,
+      }),
+    cancelAction: (actionId: string, body: ActionTransitionRequest) =>
+      request<Action>(`/api/v1/actions/${actionId}/cancel`, {
+        method: "POST",
+        bodyJson: body,
+      }),
+    updateActionStatus: (actionId: string, body: ActionStatusRequest) =>
       request<Action>(`/api/v1/actions/${actionId}/status`, {
         method: "POST",
         bodyJson: body,
       }),
     listFirmware: (projectId: string) =>
       request<FirmwareArtifact[]>("/api/v1/firmware", { query: { project_id: projectId } }),
-    createFirmware: (body: {
-      project_id: string;
-      component: string;
-      version: string;
-      object_key: string;
-      sha256: string;
-      size_bytes: number;
-    }) => request<FirmwareArtifact>("/api/v1/firmware", { method: "POST", bodyJson: body }),
+    createFirmware: (body: CreateFirmwareRequest) =>
+      request<FirmwareArtifact>("/api/v1/firmware", { method: "POST", bodyJson: body }),
+    createFirmwareUploadUrl: (firmwareId: string, projectId: string) =>
+      request<SignedObjectUrl>(`/api/v1/firmware/${firmwareId}/upload-url`, {
+        method: "POST",
+        query: { project_id: projectId },
+      }),
+    createFirmwareDownloadUrl: (firmwareId: string, projectId: string) =>
+      request<SignedObjectUrl>(`/api/v1/firmware/${firmwareId}/download-url`, {
+        method: "POST",
+        query: { project_id: projectId },
+      }),
+    finalizeFirmware: (firmwareId: string, body: FirmwareFinalizeRequest) =>
+      request<FirmwareArtifact>(`/api/v1/firmware/${firmwareId}/finalize`, {
+        method: "POST",
+        bodyJson: body,
+      }),
+    createFirmwareRollout: (firmwareId: string, body: FirmwareRolloutRequest) =>
+      request<FirmwareRollout>(`/api/v1/firmware/${firmwareId}/rollout`, {
+        method: "POST",
+        bodyJson: body,
+      }),
+    listFirmwareRollouts: (projectId: string) =>
+      request<FirmwareRollout[]>("/api/v1/firmware-rollouts", {
+        query: { project_id: projectId },
+      }),
     listDashboards: (projectId: string) =>
       request<Dashboard[]>("/api/v1/dashboards", { query: { project_id: projectId } }),
     createDashboard: (body: { project_id: string; name: string; layout: JsonValue }) =>
@@ -364,6 +312,29 @@ export function createExcaliburApi(options: ApiClientOptions = {}) {
       request<AlertRule[]>("/api/v1/alerts", { query: { project_id: projectId } }),
     createAlert: (body: { project_id: string; name: string; kind: AlertKind; expression: JsonValue }) =>
       request<AlertRule>("/api/v1/alerts", { method: "POST", bodyJson: body }),
+    listAlertEvents: (projectId: string, state?: "Firing" | "Resolved") =>
+      request<AlertEvent[]>("/api/v1/alert-events", {
+        query: { project_id: projectId, state },
+      }),
+    createDiagnosticsSession: (body: CreateDiagnosticsSessionRequest) =>
+      request<DiagnosticsSessionCreate>("/api/v1/diagnostics/sessions", {
+        method: "POST",
+        bodyJson: body,
+      }),
+    listDiagnosticsSessions: (projectId: string) =>
+      request<DiagnosticsSession[]>("/api/v1/diagnostics/sessions", {
+        query: { project_id: projectId },
+      }),
+    finalizeDiagnosticsSession: (sessionId: string, body: DiagnosticsFinalizeRequest) =>
+      request<DiagnosticsSession>(`/api/v1/diagnostics/sessions/${sessionId}/finalize`, {
+        method: "POST",
+        bodyJson: body,
+      }),
+    createDiagnosticsDownloadUrl: (sessionId: string, projectId: string) =>
+      request<SignedObjectUrl>(`/api/v1/diagnostics/sessions/${sessionId}/download-url`, {
+        method: "POST",
+        query: { project_id: projectId },
+      }),
     listAudit: (orgId: string, projectId?: string) =>
       request<AuditLog[]>("/api/v1/audit", {
         query: { org_id: orgId, project_id: projectId },

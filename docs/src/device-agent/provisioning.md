@@ -35,6 +35,9 @@ POST /api/v1/devices/{device_id}/provision/csr
   "port": 8883,
   "project_id": "018f4c5c-9b4d-7cc2-a62a-44590f671001",
   "device_id": "018f4c5c-9b4d-7cc2-a62a-44590f671101",
+  "certificate_id": "018f4c5c-9b4d-7cc2-a62a-44590f671201",
+  "certificate_fingerprint_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "certificate_not_after": "2027-07-30T08:30:00Z",
   "authentication": {
     "ca_certificate": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----",
     "device_certificate": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----",
@@ -48,7 +51,7 @@ POST /api/v1/devices/{device_id}/provision/csr
 5. 设备将 auth JSON 保存为 `/etc/excalibur/auth.json`。
 6. `device-agent` 启动并使用 mTLS 连接 broker。
 
-当前 API scaffold 只校验 CSR PEM 中包含 `BEGIN CERTIFICATE REQUEST` 并返回 dev placeholder cert。生产实现必须接入真实 CA、证书序列号、fingerprint、有效期和撤销机制。
+当前 API 会解析 CSR SubjectPublicKeyInfo，签发真实可解析 X.509 设备证书，计算 certificate fingerprint，并把 active certificate 记录持久化。生产必须通过 `EXCALIBUR_CA_PRIVATE_KEY_PEM` 或 Helm Secret 注入真实 CA key；只有显式设置 `EXCALIBUR_ALLOW_DEV_CA=true` 时才会使用内置 dev CA。
 
 ## Dev auth 路径
 
@@ -62,6 +65,7 @@ POST /api/v1/devices/{device_id}/provision/dev-auth
 
 ```json
 {
+  "certificate_fingerprint_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
   "authentication": {
     "ca_certificate": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----",
     "device_certificate": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----",

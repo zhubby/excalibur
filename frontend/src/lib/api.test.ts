@@ -227,9 +227,41 @@ describe("Excalibur API client", () => {
     });
     await api.listProjects("org-1");
     await api.provisionDevAuth("device-1", "project-1");
+    await api.createFirmware({
+      project_id: "project-1",
+      component: "main",
+      version: "1.0.0",
+      object_key: "projects/project-1/firmware/main.bin",
+      sha256: "a".repeat(64),
+      content_type: "application/octet-stream",
+      signature: "ed25519:test",
+      size_bytes: 1024,
+    });
+    await api.createFirmwareUploadUrl("firmware-1", "project-1");
+    await api.createFirmwareDownloadUrl("firmware-1", "project-1");
+    await api.finalizeFirmware("firmware-1", {
+      project_id: "project-1",
+      sha256: "a".repeat(64),
+      signature: "ed25519:test",
+      size_bytes: 1024,
+    });
+    await api.createFirmwareRollout("firmware-1", {
+      project_id: "project-1",
+      device_ids: ["device-1"],
+      requires_approval: true,
+      rollback_strategy: "previous_version",
+    });
+    await api.listFirmwareRollouts("project-1");
     await api.ingestTelemetry({
       topic: "v1/p/project-1/d/device-1/telemetry/device_agent_system_stats",
       payload: [{ sequence: 1, timestamp: "2026-07-29T00:00:00Z", cpu_percent: 42 }],
+    });
+    await api.aggregateTelemetry({
+      projectId: "project-1",
+      deviceId: "device-1",
+      stream: "device_agent_system_stats",
+      field: "cpu_percent",
+      bucketSeconds: 60,
     });
     await api.updateActionStatus("action-1", {
       project_id: "project-1",
@@ -238,12 +270,32 @@ describe("Excalibur API client", () => {
       progress: 100,
       errors: [],
     });
+    await api.approveAction("action-1", { project_id: "project-1" });
+    await api.retryAction("action-1", { project_id: "project-1", device_ids: ["device-1"] });
+    await api.cancelAction("action-1", {
+      project_id: "project-1",
+      reason: "operator cancelled rollout",
+    });
     await api.createAlert({
       project_id: "project-1",
       name: "offline > 10m",
       kind: "Offline",
       expression: { window: "10m" },
     });
+    await api.listAlertEvents("project-1", "Firing");
+    await api.createDiagnosticsSession({
+      project_id: "project-1",
+      device_id: "device-1",
+      paths: ["/var/log"],
+      include_logs: true,
+    });
+    await api.listDiagnosticsSessions("project-1");
+    await api.finalizeDiagnosticsSession("diagnostics-1", {
+      project_id: "project-1",
+      size_bytes: 2048,
+      sha256: "c".repeat(64),
+    });
+    await api.createDiagnosticsDownloadUrl("diagnostics-1", "project-1");
     await api.listAudit("org-1", "project-1");
 
     const calls = (fetcher.mock.calls as unknown as [string, RequestInit][]).map(([url, init]) => ({
@@ -266,15 +318,85 @@ describe("Excalibur API client", () => {
         body: JSON.stringify({ project_id: "project-1" }),
       },
       {
+        url: "http://api.example/api/v1/firmware",
+        method: "POST",
+        body: JSON.stringify({
+          project_id: "project-1",
+          component: "main",
+          version: "1.0.0",
+          object_key: "projects/project-1/firmware/main.bin",
+          sha256: "a".repeat(64),
+          content_type: "application/octet-stream",
+          signature: "ed25519:test",
+          size_bytes: 1024,
+        }),
+      },
+      {
+        url: "http://api.example/api/v1/firmware/firmware-1/upload-url?project_id=project-1",
+        method: "POST",
+      },
+      {
+        url: "http://api.example/api/v1/firmware/firmware-1/download-url?project_id=project-1",
+        method: "POST",
+      },
+      {
+        url: "http://api.example/api/v1/firmware/firmware-1/finalize",
+        method: "POST",
+      },
+      {
+        url: "http://api.example/api/v1/firmware/firmware-1/rollout",
+        method: "POST",
+      },
+      {
+        url: "http://api.example/api/v1/firmware-rollouts?project_id=project-1",
+        method: "GET",
+      },
+      {
         url: "http://api.example/api/v1/telemetry",
         method: "POST",
+      },
+      {
+        url: "http://api.example/api/v1/telemetry/aggregate?project_id=project-1&device_id=device-1&stream=device_agent_system_stats&field=cpu_percent&bucket_seconds=60",
+        method: "GET",
       },
       {
         url: "http://api.example/api/v1/actions/action-1/status",
         method: "POST",
       },
       {
+        url: "http://api.example/api/v1/actions/action-1/approve",
+        method: "POST",
+      },
+      {
+        url: "http://api.example/api/v1/actions/action-1/retry",
+        method: "POST",
+      },
+      {
+        url: "http://api.example/api/v1/actions/action-1/cancel",
+        method: "POST",
+      },
+      {
         url: "http://api.example/api/v1/alerts",
+        method: "POST",
+      },
+      {
+        url: "http://api.example/api/v1/alert-events?project_id=project-1&state=Firing",
+        method: "GET",
+      },
+      {
+        url: "http://api.example/api/v1/diagnostics/sessions",
+        method: "POST",
+      },
+      {
+        url: "http://api.example/api/v1/diagnostics/sessions?project_id=project-1",
+        method: "GET",
+      },
+      {
+        url: "http://api.example/api/v1/diagnostics/sessions/diagnostics-1/finalize",
+        method: "POST",
+      },
+      {
+        url: "http://api.example/api/v1/diagnostics/sessions/diagnostics-1/download-url?project_id=project-1",
         method: "POST",
       },
       {

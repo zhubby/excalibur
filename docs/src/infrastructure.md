@@ -60,13 +60,38 @@ docker compose up --build
 | `CORS_ALLOWED_ORIGINS` | api | 允许携带 cookie 调用 API 的 Console origins，逗号分隔；默认只包含本地开发端口。 |
 | `SESSION_COOKIE_SECURE` | api | 设为 `true`/`1` 时 auth cookies 带 `Secure`，生产 TLS 环境必须开启。 |
 | `NATS_URL` | api/mqtt-ingest/worker | NATS DSN。 |
-| `S3_ENDPOINT` | api/worker | S3-compatible endpoint，默认指向 RustFS `http://rustfs:9000`。 |
+| `S3_ENDPOINT` | api/worker | S3-compatible internal endpoint，默认指向 RustFS `http://rustfs:9000`。 |
+| `S3_PUBLIC_ENDPOINT` | api | 签发给 Console/agent 的 public S3 endpoint。 |
+| `S3_BUCKET` | api | firmware/diagnostics/export object bucket。 |
+| `S3_REGION` | api | S3 SigV4 region。 |
+| `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | api | S3 SigV4 signing credentials，生产必须来自 secret manager。 |
+| `API_AUTH_RATE_LIMIT_MAX_ATTEMPTS` | api | register/login 在窗口内允许的最大尝试次数。 |
+| `API_AUTH_RATE_LIMIT_WINDOW_SECONDS` | api | auth rate limit 窗口秒数。 |
+| `EXCALIBUR_CA_PRIVATE_KEY_PEM` | api | 设备证书签发 CA private key PEM；生产必须通过 Helm Secret/secret manager 注入。 |
+| `EXCALIBUR_ALLOW_DEV_CA` | api | 允许 API 使用内置 dev CA；仅本地开发设为 `true`。 |
+| `EXCALIBUR_ENABLE_DEV_AUTH` | api | 启用返回 inline private key 的 dev-auth provisioning；仅本地开发/批量实验设为 `true`。 |
 | `MQTT_LISTEN` | mqtt-ingest | rumqttd MQTT v4 bind address，默认 `0.0.0.0:1883`。 |
+| `MQTT_TELEMETRY_BUFFER` | mqtt-ingest | `auto`/`direct`/`nats`，有 NATS 时默认进入 JetStream buffer。 |
+| `MQTT_TELEMETRY_NATS_SUBJECT` | mqtt-ingest | telemetry envelope subject。 |
+| `MQTT_TELEMETRY_NATS_STREAM` | mqtt-ingest | telemetry JetStream stream name。 |
+| `MQTT_COMMAND_BRIDGE` | mqtt-ingest | `auto`/`disabled`/`nats`，把 worker command bus 转发到 MQTT broker。 |
+| `MQTT_COMMAND_NATS_SUBJECT` | mqtt-ingest | command bridge 订阅 subject。 |
+| `MQTT_REQUIRE_CERT_FINGERPRINT_USERNAME` | mqtt-ingest | 设为 `true` 时，用 certificate fingerprint 建立连接身份，并按连接身份校验 publish/subscribe topic。 |
+| `WORKER_TELEMETRY_NATS_SUBJECT` | worker | telemetry ingest source subject。 |
+| `WORKER_TELEMETRY_NATS_STREAM` | worker | telemetry durable consumer 所属 stream。 |
+| `WORKER_TELEMETRY_DELIVERY_SUBJECT` | worker | JetStream push consumer delivery subject。 |
+| `WORKER_TELEMETRY_DEAD_LETTER_SUBJECT` | worker | invalid telemetry envelope dead-letter subject。 |
+| `WORKER_ACTION_COMMAND_SUBJECT` | worker | action dispatcher 发布 command envelope 的 subject。 |
+| `WORKER_ACTION_TIMEOUT_SECONDS` | worker | running action target 超时时间。 |
+| `WORKER_ALERT_SCAN_INTERVAL_MS` | worker | alert rule 扫描间隔。 |
+| `WORKER_ALERT_DEFAULT_OFFLINE_AFTER_SECONDS` | worker | offline alert 未单独配置时的默认离线阈值。 |
+| `WORKER_ALERT_DEFAULT_WINDOW_SECONDS` | worker | threshold/window alert 默认查询窗口。 |
+| `WORKER_ALERT_NOTIFICATION_SUBJECT` | worker | alert notification stub 发布 subject。 |
 | `DEVICE_MQTT_BROKER` | api | provisioning auth JSON 返回给设备的 broker host。 |
 | `DEVICE_MQTT_PORT` | api | provisioning auth JSON 返回给设备的 broker port。 |
 | `NEXT_PUBLIC_API_BASE_URL` | frontend | Console 调用 API 的 base URL。 |
 
-生产必须把数据库密码、RustFS/S3 凭证、CA key、JWT/session secrets 放入 secret manager，而不是明文 values。
+生产必须把数据库密码、RustFS/S3 凭证、CA key、JWT/session secrets 放入 secret manager，而不是明文 values。`docker-compose.yml` 为本地开发显式启用 `EXCALIBUR_ALLOW_DEV_CA=true` 和 `EXCALIBUR_ENABLE_DEV_AUTH=true`；Helm 默认关闭这两个开关，未配置真实 CA Secret 时 API 会 fail closed。
 
 ## Helm chart
 
@@ -99,6 +124,18 @@ helm lint infra/helm/excalibur
 - Frontend replicas: 2。
 - Migrations enabled。
 - `STORAGE_BACKEND=timescale` 默认启用持久化 SQL repository；快速临时开发可改为 `memory`。
+
+生产部署需先创建 CA private key Secret，并在 values 中引用：
+
+```yaml
+api:
+  caPrivateKeySecret:
+    name: excalibur-ca
+    key: ca-private-key.pem
+env:
+  EXCALIBUR_ALLOW_DEV_CA: "false"
+  EXCALIBUR_ENABLE_DEV_AUTH: "false"
+```
 
 ## Migration job
 

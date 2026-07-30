@@ -66,6 +66,15 @@ services:
       DATABASE_URL: postgres://excalibur:excalibur@timescaledb:5432/excalibur
       NATS_URL: nats://nats:4222
       S3_ENDPOINT: http://rustfs:9000
+      S3_PUBLIC_ENDPOINT: http://localhost:9000
+      S3_BUCKET: excalibur
+      S3_REGION: us-east-1
+      S3_ACCESS_KEY_ID: excalibur
+      S3_SECRET_ACCESS_KEY: excalibur-secret
+      API_AUTH_RATE_LIMIT_MAX_ATTEMPTS: "20"
+      API_AUTH_RATE_LIMIT_WINDOW_SECONDS: "60"
+      EXCALIBUR_ALLOW_DEV_CA: "true"
+      EXCALIBUR_ENABLE_DEV_AUTH: "true"
       DEVICE_MQTT_BROKER: localhost
       DEVICE_MQTT_PORT: "1883"
     ports:
@@ -89,6 +98,13 @@ services:
       STORAGE_BACKEND: timescale
       DATABASE_URL: postgres://excalibur:excalibur@timescaledb:5432/excalibur
       NATS_URL: nats://nats:4222
+      MQTT_TELEMETRY_BUFFER: nats
+      MQTT_TELEMETRY_NATS_SUBJECT: excalibur.telemetry.ingest
+      MQTT_TELEMETRY_NATS_STREAM: EXCALIBUR_TELEMETRY
+      MQTT_COMMAND_BRIDGE: nats
+      MQTT_COMMAND_NATS_SUBJECT: excalibur.commands.dispatch
+      MQTT_REQUIRE_CERT_FINGERPRINT_USERNAME: "true"
+      MQTT_ALLOW_PLAINTEXT_FINGERPRINT_AUTH: "true"
     ports:
       - "1883:1883"
     depends_on:
@@ -104,8 +120,25 @@ services:
       args:
         BIN: excalibur-worker
     environment:
+      STORAGE_BACKEND: timescale
       DATABASE_URL: postgres://excalibur:excalibur@timescaledb:5432/excalibur
       NATS_URL: nats://nats:4222
+      WORKER_TELEMETRY_NATS_SUBJECT: excalibur.telemetry.ingest
+      WORKER_TELEMETRY_NATS_STREAM: EXCALIBUR_TELEMETRY
+      WORKER_TELEMETRY_DELIVERY_SUBJECT: excalibur.telemetry.deliver
+      WORKER_TELEMETRY_DEAD_LETTER_SUBJECT: excalibur.telemetry.dead_letter
+      WORKER_TELEMETRY_QUEUE_GROUP: excalibur-telemetry-workers
+      WORKER_TELEMETRY_BATCH_SIZE: "256"
+      WORKER_TELEMETRY_BATCH_WINDOW_MS: "1000"
+      WORKER_ACTION_COMMAND_SUBJECT: excalibur.commands.dispatch
+      WORKER_ACTION_CLAIM_LIMIT: "100"
+      WORKER_ACTION_DISPATCH_INTERVAL_MS: "1000"
+      WORKER_ACTION_TIMEOUT_SECONDS: "900"
+      WORKER_ACTION_TIMEOUT_SCAN_LIMIT: "100"
+      WORKER_ALERT_SCAN_INTERVAL_MS: "30000"
+      WORKER_ALERT_DEFAULT_OFFLINE_AFTER_SECONDS: "300"
+      WORKER_ALERT_DEFAULT_WINDOW_SECONDS: "300"
+      WORKER_ALERT_NOTIFICATION_SUBJECT: excalibur.alerts.notifications
     depends_on:
       timescaledb:
         condition: service_healthy

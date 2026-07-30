@@ -28,6 +28,30 @@ spec:
               value: {{ .Values.env.DATABASE_URL | quote }}
             - name: NATS_URL
               value: {{ .Values.env.NATS_URL | quote }}
+            - name: MQTT_TELEMETRY_BUFFER
+              value: {{ .Values.env.MQTT_TELEMETRY_BUFFER | quote }}
+            - name: MQTT_TELEMETRY_NATS_SUBJECT
+              value: {{ .Values.env.MQTT_TELEMETRY_NATS_SUBJECT | quote }}
+            - name: MQTT_TELEMETRY_NATS_STREAM
+              value: {{ .Values.env.MQTT_TELEMETRY_NATS_STREAM | quote }}
+            - name: MQTT_COMMAND_BRIDGE
+              value: {{ .Values.env.MQTT_COMMAND_BRIDGE | quote }}
+            - name: MQTT_COMMAND_NATS_SUBJECT
+              value: {{ .Values.env.MQTT_COMMAND_NATS_SUBJECT | quote }}
+            - name: MQTT_REQUIRE_CERT_FINGERPRINT_USERNAME
+              value: {{ .Values.env.MQTT_REQUIRE_CERT_FINGERPRINT_USERNAME | quote }}
+{{- if .Values.env.MQTT_ALLOW_PLAINTEXT_FINGERPRINT_AUTH }}
+            - name: MQTT_ALLOW_PLAINTEXT_FINGERPRINT_AUTH
+              value: {{ .Values.env.MQTT_ALLOW_PLAINTEXT_FINGERPRINT_AUTH | quote }}
+{{- end }}
+{{- if and .Values.env.MQTT_TLS_CA_CERT_PATH .Values.env.MQTT_TLS_SERVER_CERT_PATH .Values.env.MQTT_TLS_SERVER_KEY_PATH }}
+            - name: MQTT_TLS_CA_CERT_PATH
+              value: {{ .Values.env.MQTT_TLS_CA_CERT_PATH | quote }}
+            - name: MQTT_TLS_SERVER_CERT_PATH
+              value: {{ .Values.env.MQTT_TLS_SERVER_CERT_PATH | quote }}
+            - name: MQTT_TLS_SERVER_KEY_PATH
+              value: {{ .Values.env.MQTT_TLS_SERVER_KEY_PATH | quote }}
+{{- end }}
           livenessProbe:
             exec:
               command: ["/bin/sh", "-c", "test -x /usr/local/bin/excalibur && kill -0 1"]
@@ -67,10 +91,44 @@ spec:
           image: "{{ .Values.image.repository }}/worker:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           env:
+            - name: STORAGE_BACKEND
+              value: {{ .Values.env.STORAGE_BACKEND | quote }}
             - name: DATABASE_URL
               value: {{ .Values.env.DATABASE_URL | quote }}
             - name: NATS_URL
               value: {{ .Values.env.NATS_URL | quote }}
+            - name: WORKER_TELEMETRY_NATS_SUBJECT
+              value: {{ .Values.env.WORKER_TELEMETRY_NATS_SUBJECT | quote }}
+            - name: WORKER_TELEMETRY_NATS_STREAM
+              value: {{ .Values.env.WORKER_TELEMETRY_NATS_STREAM | quote }}
+            - name: WORKER_TELEMETRY_DELIVERY_SUBJECT
+              value: {{ .Values.env.WORKER_TELEMETRY_DELIVERY_SUBJECT | quote }}
+            - name: WORKER_TELEMETRY_DEAD_LETTER_SUBJECT
+              value: {{ .Values.env.WORKER_TELEMETRY_DEAD_LETTER_SUBJECT | quote }}
+            - name: WORKER_TELEMETRY_QUEUE_GROUP
+              value: {{ .Values.env.WORKER_TELEMETRY_QUEUE_GROUP | quote }}
+            - name: WORKER_TELEMETRY_BATCH_SIZE
+              value: {{ .Values.env.WORKER_TELEMETRY_BATCH_SIZE | quote }}
+            - name: WORKER_TELEMETRY_BATCH_WINDOW_MS
+              value: {{ .Values.env.WORKER_TELEMETRY_BATCH_WINDOW_MS | quote }}
+            - name: WORKER_ACTION_COMMAND_SUBJECT
+              value: {{ .Values.env.WORKER_ACTION_COMMAND_SUBJECT | quote }}
+            - name: WORKER_ACTION_CLAIM_LIMIT
+              value: {{ .Values.env.WORKER_ACTION_CLAIM_LIMIT | quote }}
+            - name: WORKER_ACTION_DISPATCH_INTERVAL_MS
+              value: {{ .Values.env.WORKER_ACTION_DISPATCH_INTERVAL_MS | quote }}
+            - name: WORKER_ACTION_TIMEOUT_SECONDS
+              value: {{ .Values.env.WORKER_ACTION_TIMEOUT_SECONDS | quote }}
+            - name: WORKER_ACTION_TIMEOUT_SCAN_LIMIT
+              value: {{ .Values.env.WORKER_ACTION_TIMEOUT_SCAN_LIMIT | quote }}
+            - name: WORKER_ALERT_SCAN_INTERVAL_MS
+              value: {{ .Values.env.WORKER_ALERT_SCAN_INTERVAL_MS | quote }}
+            - name: WORKER_ALERT_DEFAULT_OFFLINE_AFTER_SECONDS
+              value: {{ .Values.env.WORKER_ALERT_DEFAULT_OFFLINE_AFTER_SECONDS | quote }}
+            - name: WORKER_ALERT_DEFAULT_WINDOW_SECONDS
+              value: {{ .Values.env.WORKER_ALERT_DEFAULT_WINDOW_SECONDS | quote }}
+            - name: WORKER_ALERT_NOTIFICATION_SUBJECT
+              value: {{ .Values.env.WORKER_ALERT_NOTIFICATION_SUBJECT | quote }}
           livenessProbe:
             exec:
               command: ["/bin/sh", "-c", "test -x /usr/local/bin/excalibur && kill -0 1"]

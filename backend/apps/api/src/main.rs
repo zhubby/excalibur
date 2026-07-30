@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 
 use anyhow::{Context, bail};
-use excalibur_api::{AppState, app_with_state};
+use excalibur_api::{AppConfig, AppState, app_with_state};
 use excalibur_storage::{PgStore, Store};
 use tokio::net::TcpListener;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -37,7 +37,11 @@ async fn main() -> anyhow::Result<()> {
         .context("API_ADDR must be a socket address")?;
     let listener = TcpListener::bind(addr).await?;
     tracing::info!(%addr, "starting excalibur api");
-    axum::serve(listener, app_with_state(AppState::new(store))).await?;
+    axum::serve(
+        listener,
+        app_with_state(AppState::with_config(store, AppConfig::from_env()?)),
+    )
+    .await?;
     Ok(())
 }
 

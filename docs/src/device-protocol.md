@@ -127,6 +127,9 @@ Command 是单个 JSON object：
   "port": 8883,
   "project_id": "018f4c5c-9b4d-7cc2-a62a-44590f671001",
   "device_id": "018f4c5c-9b4d-7cc2-a62a-44590f671101",
+  "certificate_id": "018f4c5c-9b4d-7cc2-a62a-44590f671201",
+  "certificate_fingerprint_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "certificate_not_after": "2027-07-30T08:30:00Z",
   "authentication": {
     "ca_certificate": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----",
     "device_certificate": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----",
@@ -137,7 +140,7 @@ Command 是单个 JSON object：
 }
 ```
 
-`device-agent` 当前反序列化需要 `broker`、`port`、`project_id`、`device_id` 和可选 `authentication`。后端 `DeviceAgentAuthConfig` 还会返回 `provisioning_mode` 与 `production`，用于区分 CSR 生产路径和 dev-generated keypair 路径。
+`device-agent` 当前反序列化需要 `broker`、`port`、`project_id`、`device_id` 和可选 `authentication`。后端 `DeviceAgentAuthConfig` 还会返回 `certificate_id`、`certificate_fingerprint_sha256`、`certificate_not_after`、`provisioning_mode` 与 `production`，用于区分 CSR 生产路径和 dev-generated keypair 路径。rumqttd peer-cert hook 完成前，agent 会在该字段存在时把 `certificate_fingerprint_sha256` 设置为 MQTT username。
 
 ## 协议测试位置
 

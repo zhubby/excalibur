@@ -11,7 +11,7 @@ pub mod toasty_boundary;
 #[cfg(test)]
 mod tests;
 
-pub use actions::map_terminal_action_state;
+pub use actions::{map_terminal_action_state, parse_reported_action_state};
 pub use error::{StoreError, StoreResult};
 pub use memory::MemoryStore;
 pub use postgres::PgStore;
