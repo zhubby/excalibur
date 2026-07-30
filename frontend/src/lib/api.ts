@@ -152,6 +152,7 @@ export type ApiKey = {
 export type ApiClientOptions = {
   baseUrl?: string;
   token?: string | null;
+  credentials?: RequestCredentials;
   fetcher?: typeof fetch;
 };
 
@@ -214,6 +215,7 @@ export function createExcaliburApi(options: ApiClientOptions = {}) {
   const baseUrl = normalizeApiBaseUrl(options.baseUrl);
   const fetcher = options.fetcher ?? fetch;
   const token = options.token;
+  const credentials = options.credentials ?? "include";
 
   async function request<T>(
     path: string,
@@ -232,6 +234,7 @@ export function createExcaliburApi(options: ApiClientOptions = {}) {
 
     const response = await fetcher(buildApiUrl(baseUrl, path, init.query), {
       ...init,
+      credentials: init.credentials ?? credentials,
       headers,
       body: init.bodyJson === undefined ? init.body : JSON.stringify(init.bodyJson),
     });
@@ -265,8 +268,11 @@ export function createExcaliburApi(options: ApiClientOptions = {}) {
       request<AuthResponse>("/api/v1/auth/register", { method: "POST", bodyJson: body }),
     login: (body: LoginRequest) =>
       request<AuthResponse>("/api/v1/auth/login", { method: "POST", bodyJson: body }),
-    refreshSession: (body: RefreshRequest) =>
-      request<AuthResponse>("/api/v1/auth/refresh", { method: "POST", bodyJson: body }),
+    refreshSession: (body?: RefreshRequest) =>
+      request<AuthResponse>("/api/v1/auth/refresh", {
+        method: "POST",
+        ...(body ? { bodyJson: body } : {}),
+      }),
     logout: () => request<LogoutResponse>("/api/v1/auth/logout", { method: "POST" }),
     listApiKeys: (orgId: string, projectId?: string) =>
       request<ApiKey[]>("/api/v1/api-keys", {

@@ -57,6 +57,8 @@ docker compose up --build
 | `API_ADDR` | api | Axum bind address，默认 `0.0.0.0:8080`。 |
 | `STORAGE_BACKEND` | api/mqtt-ingest | `memory` 或 `timescale`。 |
 | `DATABASE_URL` | api/mqtt-ingest/worker | TimescaleDB DSN。 |
+| `CORS_ALLOWED_ORIGINS` | api | 允许携带 cookie 调用 API 的 Console origins，逗号分隔；默认只包含本地开发端口。 |
+| `SESSION_COOKIE_SECURE` | api | 设为 `true`/`1` 时 auth cookies 带 `Secure`，生产 TLS 环境必须开启。 |
 | `NATS_URL` | api/mqtt-ingest/worker | NATS DSN。 |
 | `S3_ENDPOINT` | api/worker | S3-compatible endpoint，默认指向 RustFS `http://rustfs:9000`。 |
 | `MQTT_LISTEN` | mqtt-ingest | rumqttd MQTT v4 bind address，默认 `0.0.0.0:1883`。 |

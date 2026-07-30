@@ -30,10 +30,10 @@ GET /api/v1/openapi.json
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `POST` | `/api/v1/auth/register` | 注册用户并返回 access token 与 refresh token。 |
-| `POST` | `/api/v1/auth/login` | 登录并返回 access token 与 refresh token。 |
-| `POST` | `/api/v1/auth/refresh` | 轮换 refresh token，并返回新的 access token 与 refresh token。 |
-| `POST` | `/api/v1/auth/logout` | 撤销当前 session。 |
+| `POST` | `/api/v1/auth/register` | 注册用户，返回 access/refresh token，并设置 HttpOnly cookies。 |
+| `POST` | `/api/v1/auth/login` | 登录，返回 access/refresh token，并设置 HttpOnly cookies。 |
+| `POST` | `/api/v1/auth/refresh` | 轮换 refresh token，返回新的 access/refresh token，并刷新 HttpOnly cookies。 |
+| `POST` | `/api/v1/auth/logout` | 撤销当前 session，并清理 HttpOnly cookies。 |
 
 `RegisterRequest`：
 
@@ -57,11 +57,11 @@ GET /api/v1/openapi.json
 }
 ```
 
-Refresh token 使用 rotation 语义：旧 refresh token 成功使用后会写入 reuse detection 表，再次使用会返回 unauthorized。Logout 会撤销当前 access token 对应的 session。
+Refresh token 使用 rotation 语义：旧 refresh token 成功使用后会写入 reuse detection 表，再次使用会返回 unauthorized。Refresh 请求可以传 JSON `refresh_token`，也可以依赖 `excalibur_refresh` HttpOnly cookie。Logout 会撤销当前 access token 对应的 session，并清理 `excalibur_access` / `excalibur_refresh` cookies。
 
 ## API Keys
 
-API key 用于后续自动化和服务端集成。当前管理接口仍要求用户 Bearer session，创建和撤销都会写 audit。
+API key 用于自动化和服务端集成。当前管理接口仍要求用户 session，创建和撤销都会写 audit。资源 API 支持 `Authorization: Bearer excak_...` 或 `x-api-key`，并按 key 的 org/project scope 与字符串 scope enforcement 授权。
 
 | 方法 | 路径 | 最小角色 | 说明 |
 | --- | --- | --- | --- |

@@ -23,17 +23,16 @@ org -> project -> device
 
 - `POST /api/v1/auth/register` 使用 Argon2id 生成密码哈希，密码长度至少 12。
 - `POST /api/v1/auth/login` 使用 Argon2id 校验密码，并用 dummy hash 避免明显用户枚举。
-- 返回值包含 Bearer access token、refresh token 和过期时间。`memory` 模式把 session 存在进程内，`timescale` 模式只在 SQL 保存 access/refresh token hash。
-- `POST /api/v1/auth/refresh` 使用 refresh token rotation，并记录已使用 refresh token hash 用于 reuse detection。
-- `POST /api/v1/auth/logout` 撤销当前 session。
+- 返回值包含 Bearer access token、refresh token 和过期时间，并同时设置 HttpOnly cookie。`memory` 模式把 session 存在进程内，`timescale` 模式只在 SQL 保存 access/refresh token hash。
+- `POST /api/v1/auth/refresh` 使用 refresh token rotation，并记录已使用 refresh token hash 用于 reuse detection；请求可通过 JSON `refresh_token` 或 HttpOnly refresh cookie 完成。
+- `POST /api/v1/auth/logout` 撤销当前 session，并清理 access/refresh cookie。
 - API key 明文只在创建时返回一次，SQL/memory store 只保存 key hash、scope、expires/revoke/last_used 元数据。
+- API key 可通过 `Authorization: Bearer excak_...` 或 `x-api-key` 认证资源 API，并按 org/project scope 与字符串 scope enforcement 授权；API key 管理接口仍要求用户 session。
 
 生产目标：
 
-- HttpOnly secure cookie session。
 - 邮箱验证。
 - 邀请和 membership 管理。
-- API key scope enforcement 接入自动化/ingest 入口。
 - Session refresh、login failure 和异常登录 audit。
 
 ## RBAC 角色
@@ -53,6 +52,18 @@ org -> project -> device
 - 创建设备、stream、action、firmware、dashboard、alert：`Operator`。
 - 查询 project、device、telemetry、actions、dashboard、alerts：`Viewer`。
 - 查询 audit：org `Viewer` 起。
+
+API key scope 支持精确 scope、`resource:*` wildcard 和全局 `*`。当前 handler 使用的 scope 包括：
+
+- `projects:read` / `projects:write`
+- `devices:read` / `devices:write` / `devices:provision`
+- `streams:read` / `streams:write`
+- `telemetry:read` / `telemetry:write`
+- `actions:read` / `actions:write`
+- `firmware:read` / `firmware:write`
+- `dashboards:read` / `dashboards:write`
+- `alerts:read` / `alerts:write`
+- `audit:read`
 
 ## Tenant Context 要求
 
