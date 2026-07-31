@@ -60,11 +60,11 @@ docker compose up --build
 | `CORS_ALLOWED_ORIGINS` | api | 允许携带 cookie 调用 API 的 Console origins，逗号分隔；默认只包含本地开发端口。 |
 | `SESSION_COOKIE_SECURE` | api | 设为 `true`/`1` 时 auth cookies 带 `Secure`，生产 TLS 环境必须开启。 |
 | `NATS_URL` | api/mqtt-ingest/worker | NATS DSN。 |
-| `S3_ENDPOINT` | api/worker | S3-compatible internal endpoint，默认指向 RustFS `http://rustfs:9000`。 |
-| `S3_PUBLIC_ENDPOINT` | api | 签发给 Console/agent 的 public S3 endpoint。 |
-| `S3_BUCKET` | api | firmware/diagnostics/export object bucket。 |
-| `S3_REGION` | api | S3 SigV4 region。 |
-| `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | api | S3 SigV4 signing credentials，生产必须来自 secret manager。 |
+| `S3_ENDPOINT` | api/mqtt-ingest | S3-compatible internal endpoint，默认指向 RustFS `http://rustfs:9000`。 |
+| `S3_PUBLIC_ENDPOINT` | api/mqtt-ingest | 签发给 Console/agent 的 public S3 endpoint。 |
+| `S3_BUCKET` | api/mqtt-ingest | firmware/diagnostics/export object bucket。 |
+| `S3_REGION` | api/mqtt-ingest | S3 SigV4 region。 |
+| `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | api/mqtt-ingest | S3 SigV4 signing credentials，生产必须来自 secret manager。 |
 | `API_AUTH_RATE_LIMIT_MAX_ATTEMPTS` | api | register/login 在窗口内允许的最大尝试次数。 |
 | `API_AUTH_RATE_LIMIT_WINDOW_SECONDS` | api | auth rate limit 窗口秒数。 |
 | `EXCALIBUR_CA_PRIVATE_KEY_PEM` | api | 设备证书签发 CA private key PEM；生产必须通过 Helm Secret/secret manager 注入。 |
@@ -76,12 +76,20 @@ docker compose up --build
 | `MQTT_TELEMETRY_NATS_STREAM` | mqtt-ingest | telemetry JetStream stream name。 |
 | `MQTT_COMMAND_BRIDGE` | mqtt-ingest | `auto`/`disabled`/`nats`，把 worker command bus 转发到 MQTT broker。 |
 | `MQTT_COMMAND_NATS_SUBJECT` | mqtt-ingest | command bridge 订阅 subject。 |
+| `MQTT_COMMAND_NATS_STREAM` | mqtt-ingest | command bridge durable JetStream stream。 |
+| `MQTT_COMMAND_DELIVERY_SUBJECT` | mqtt-ingest | command bridge push consumer delivery subject。 |
+| `MQTT_COMMAND_DURABLE` | mqtt-ingest | command bridge durable consumer name。 |
+| `MQTT_COMMAND_QUEUE_GROUP` | mqtt-ingest | command bridge queue group。 |
+| `MQTT_COMMAND_DEAD_LETTER_SUBJECT` | mqtt-ingest | invalid command envelope dead-letter subject。 |
+| `MQTT_COMMAND_DOWNLOAD_URL_TTL_SECONDS` | mqtt-ingest | command bridge 发布 OTA MQTT command 前即时签发 download URL 的 TTL。 |
 | `MQTT_REQUIRE_CERT_FINGERPRINT_USERNAME` | mqtt-ingest | 设为 `true` 时，用 certificate fingerprint 建立连接身份，并按连接身份校验 publish/subscribe topic。 |
 | `WORKER_TELEMETRY_NATS_SUBJECT` | worker | telemetry ingest source subject。 |
 | `WORKER_TELEMETRY_NATS_STREAM` | worker | telemetry durable consumer 所属 stream。 |
 | `WORKER_TELEMETRY_DELIVERY_SUBJECT` | worker | JetStream push consumer delivery subject。 |
 | `WORKER_TELEMETRY_DEAD_LETTER_SUBJECT` | worker | invalid telemetry envelope dead-letter subject。 |
 | `WORKER_ACTION_COMMAND_SUBJECT` | worker | action dispatcher 发布 command envelope 的 subject。 |
+| `WORKER_ACTION_COMMAND_STREAM` | worker | action command JetStream stream name。 |
+| `WORKER_ACTION_COMMAND_DEAD_LETTER_SUBJECT` | worker | command dispatch dead-letter subject。 |
 | `WORKER_ACTION_TIMEOUT_SECONDS` | worker | running action target 超时时间。 |
 | `WORKER_ALERT_SCAN_INTERVAL_MS` | worker | alert rule 扫描间隔。 |
 | `WORKER_ALERT_DEFAULT_OFFLINE_AFTER_SECONDS` | worker | offline alert 未单独配置时的默认离线阈值。 |
@@ -119,11 +127,13 @@ helm lint infra/helm/excalibur
 默认 values：
 
 - API replicas: 1。
-- MQTT ingest replicas: 2，Service port: 1883。
+- MQTT ingest replicas: 1，Service port: 1883。当前本地 rumqttd broker + command bridge 只能安全默认单副本；多副本需要 sticky/device ownership routing 或外部共享 broker 后再开启。
 - Worker replicas: 1。
 - Frontend replicas: 2。
 - Migrations enabled。
 - `STORAGE_BACKEND=timescale` 默认启用持久化 SQL repository；快速临时开发可改为 `memory`。
+
+Command bus rolling upgrade 注意：worker 和 mqtt-ingest 会在启动时校验 JetStream command stream subjects、consumer delivery subject、deliver group 和 explicit ack policy。已有环境如果手工创建过不兼容的 `EXCALIBUR_COMMANDS` stream 或 `excalibur-mqtt-command-bridge` durable consumer，启动会 fail closed；升级前应通过 JetStream API/CLI update 对应 stream subjects 和 consumer config，或在确认无待处理 command 后删除旧 consumer 让应用重建。
 
 生产部署需先创建 CA private key Secret，并在 values 中引用：
 

@@ -6,6 +6,7 @@ members = [
   "crates/device-protocol",
   "crates/domain",
   "crates/nats-lite",
+  "crates/object-storage",
   "crates/storage",
 ]
 exclude = ["vendor/rumqttd-0.20.0"]

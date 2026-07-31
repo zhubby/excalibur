@@ -195,9 +195,10 @@ API key 用于自动化和服务端集成。当前管理接口仍要求用户 se
   "firmware_id": "018f4c5c-9b4d-7cc2-a62a-44590f671201",
   "component": "motor",
   "version": "3.2.1",
-  "signed_url": "https://objects.example/firmware.bin?signature=...",
   "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "signature": "ed25519:optional-signature",
   "size_bytes": 1048576
 }
 ```
+
+API action payload 只保存 firmware reference 和校验 metadata；最终下发给设备的 `signed_url` 由 mqtt-ingest command bridge 发布 MQTT command 前即时签发。

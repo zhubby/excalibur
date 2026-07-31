@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use excalibur_domain::{
-    Action, ActionDispatchTarget, ActionStatusUpdate, ActionTargetStatusChange,
+    Action, ActionDispatchTarget, ActionState, ActionStatusUpdate, ActionTargetStatusChange,
     ActionTargetTransition, AlertEvent, AlertEventState, AlertRule, ApiKey, AuditLog, Dashboard,
     Device, DeviceCertificate, DiagnosticsSession, FirmwareArtifact, FirmwareRollout, Id,
     Membership, Org, Project, Role, StreamDefinition, TelemetryAggregateBucket, TelemetryPoint,
@@ -407,6 +407,26 @@ impl Store {
         match self {
             Store::Memory(store) => store.claim_queued_action_targets(limit).await,
             Store::Postgres(store) => store.claim_queued_action_targets(limit).await,
+        }
+    }
+
+    pub async fn get_action_target_state(
+        &self,
+        project_id: Id,
+        action_id: Id,
+        device_id: Id,
+    ) -> StoreResult<ActionState> {
+        match self {
+            Store::Memory(store) => {
+                store
+                    .get_action_target_state(project_id, action_id, device_id)
+                    .await
+            }
+            Store::Postgres(store) => {
+                store
+                    .get_action_target_state(project_id, action_id, device_id)
+                    .await
+            }
         }
     }
 

@@ -1870,6 +1870,13 @@ async fn pg_store_contract_runs_when_database_url_is_set() {
     let claimed = store.claim_queued_action_targets(1).await.unwrap();
     assert_eq!(claimed.len(), 1);
     assert_eq!(claimed[0].action_id, action.id);
+    assert_eq!(
+        store
+            .get_action_target_state(project.id, action.id, device.id)
+            .await
+            .unwrap(),
+        ActionState::Running
+    );
     let action = store
         .update_action_status(ActionStatusUpdate {
             project_id: project.id,
@@ -2058,6 +2065,13 @@ async fn pg_store_contract_runs_when_database_url_is_set() {
             .await
             .unwrap()
             .state,
+        ActionState::Cancelled
+    );
+    assert_eq!(
+        store
+            .get_action_target_state(project.id, approval_action.id, device.id)
+            .await
+            .unwrap(),
         ActionState::Cancelled
     );
 

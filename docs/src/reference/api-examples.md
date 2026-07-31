@@ -139,7 +139,6 @@ curl -s http://localhost:8080/api/v1/actions \
       "firmware_id": "018f4c5c-9b4d-7cc2-a62a-44590f671201",
       "component": "motor",
       "version": "3.2.1",
-      "signed_url": "https://objects.example/firmware/motor-3.2.1.bin?sig=...",
       "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "size_bytes": 1048576
     }

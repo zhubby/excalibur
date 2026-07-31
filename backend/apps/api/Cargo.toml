@@ -12,6 +12,7 @@ base64.workspace = true
 chrono.workspace = true
 excalibur-device-protocol = { path = "../../crates/device-protocol" }
 excalibur-domain = { path = "../../crates/domain" }
+excalibur-object-storage = { path = "../../crates/object-storage" }
 excalibur-storage = { path = "../../crates/storage" }
 futures-util.workspace = true
 password-hash.workspace = true

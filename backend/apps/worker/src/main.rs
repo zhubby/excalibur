@@ -36,6 +36,8 @@ struct WorkerConfig {
     telemetry_batch_size: usize,
     telemetry_batch_window_ms: u64,
     action_command_subject: String,
+    action_command_stream: String,
+    action_command_dead_letter_subject: String,
     action_claim_limit: usize,
     action_dispatch_interval_ms: u64,
     action_timeout_seconds: u64,
@@ -83,6 +85,7 @@ async fn main() -> anyhow::Result<()> {
     });
     ensure_telemetry_stream(&client, &config).await?;
     ensure_telemetry_consumer(&client, &config).await?;
+    ensure_action_command_stream(&client, &config).await?;
     let action_dispatch_store = store.clone();
     let action_dispatch_client = client.clone();
     let action_dispatch_config = config.clone();
@@ -290,6 +293,67 @@ async fn ensure_telemetry_consumer(
         num_pending = response_json.get("num_pending").and_then(serde_json::Value::as_u64).unwrap_or(0),
         num_ack_pending = response_json.get("num_ack_pending").and_then(serde_json::Value::as_u64).unwrap_or(0),
         "JetStream telemetry consumer ready"
+    );
+    Ok(())
+}
+
+async fn ensure_action_command_stream(
+    client: &NatsClient,
+    config: &WorkerConfig,
+) -> anyhow::Result<()> {
+    let payload = serde_json::json!({
+        "name": config.action_command_stream,
+        "subjects": [
+            config.action_command_subject,
+            config.action_command_dead_letter_subject
+        ],
+        "retention": "limits",
+        "storage": "file",
+        "discard": "old",
+        "max_msgs": -1,
+        "max_bytes": -1,
+        "max_age": 0,
+        "max_msg_size": -1
+    });
+    let api_subject = format!("$JS.API.STREAM.CREATE.{}", config.action_command_stream);
+    let response = client
+        .request(
+            &api_subject,
+            payload.to_string().as_bytes(),
+            Duration::from_secs(5),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "failed to ensure JetStream command stream {}",
+                config.action_command_stream
+            )
+        })?;
+    let response_json = serde_json::from_slice::<serde_json::Value>(&response.payload)
+        .context("JetStream command stream create response was not JSON")?;
+    if let Some(error) = response_json.get("error") {
+        let description = error
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown JetStream error");
+        if !description.contains("already in use") && !description.contains("already exists") {
+            bail!("JetStream command stream create failed: {description}");
+        }
+    }
+    verify_stream_subjects(
+        client,
+        &config.action_command_stream,
+        &[
+            config.action_command_subject.as_str(),
+            config.action_command_dead_letter_subject.as_str(),
+        ],
+    )
+    .await?;
+    info!(
+        stream = %config.action_command_stream,
+        subject = %config.action_command_subject,
+        dead_letter_subject = %config.action_command_dead_letter_subject,
+        "JetStream action command stream ready"
     );
     Ok(())
 }
@@ -524,12 +588,35 @@ async fn dispatch_action_targets_once(
         .await?;
     let mut dispatched = 0usize;
     for target in targets {
-        let envelope = command_envelope_for_target(target.clone());
-        let payload = serde_json::to_vec(&envelope).context("failed to encode command envelope")?;
-        match client
-            .publish(&config.action_command_subject, &payload)
-            .await
-        {
+        let dispatch_result = async {
+            let envelope = command_envelope_for_target(target.clone()).await?;
+            let payload =
+                serde_json::to_vec(&envelope).context("failed to encode command envelope")?;
+            let ack = client
+                .publish_jetstream(
+                    &config.action_command_subject,
+                    &payload,
+                    Duration::from_secs(5),
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to durably publish action command to {}",
+                        config.action_command_subject
+                    )
+                })?;
+            if ack.stream != config.action_command_stream {
+                bail!(
+                    "JetStream command publish ack stream mismatch: expected {}, got {}",
+                    config.action_command_stream,
+                    ack.stream
+                );
+            }
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+
+        match dispatch_result {
             Ok(()) => dispatched += 1,
             Err(error) => {
                 warn!(
@@ -538,22 +625,31 @@ async fn dispatch_action_targets_once(
                     device_id = %target.device_id,
                     "failed to dispatch action target"
                 );
-                store
-                    .transition_action_targets(ActionTargetTransition {
-                        project_id: target.project_id,
-                        action_id: target.action_id,
-                        device_ids: Some(vec![target.device_id]),
-                        allowed_source_states: vec![ActionState::Running],
-                        next_state: ActionState::Queued,
-                        progress: Some(0),
-                        errors: Some(vec![format!("dispatch retry pending: {error}")]),
-                        ts: chrono::Utc::now(),
-                    })
-                    .await?;
+                requeue_action_target_after_dispatch_failure(store, &target, &error).await?;
             }
         }
     }
     Ok(dispatched)
+}
+
+async fn requeue_action_target_after_dispatch_failure(
+    store: &Store,
+    target: &ActionDispatchTarget,
+    error: &anyhow::Error,
+) -> anyhow::Result<()> {
+    store
+        .transition_action_targets(ActionTargetTransition {
+            project_id: target.project_id,
+            action_id: target.action_id,
+            device_ids: Some(vec![target.device_id]),
+            allowed_source_states: vec![ActionState::Running],
+            next_state: ActionState::Queued,
+            progress: Some(0),
+            errors: Some(vec![format!("dispatch retry pending: {error}")]),
+            ts: chrono::Utc::now(),
+        })
+        .await?;
+    Ok(())
 }
 
 async fn timeout_action_targets_once(
@@ -846,13 +942,15 @@ fn compare_threshold(observed: f64, threshold: f64, op: &str) -> bool {
     }
 }
 
-fn command_envelope_for_target(target: ActionDispatchTarget) -> DeviceCommandEnvelope {
-    DeviceCommandEnvelope {
+async fn command_envelope_for_target(
+    target: ActionDispatchTarget,
+) -> anyhow::Result<DeviceCommandEnvelope> {
+    Ok(DeviceCommandEnvelope {
         project_id: target.project_id,
         device_id: target.device_id,
         topic: commands_topic(target.project_id, target.device_id),
         command: command_for_action(target.action_id, target.name, target.payload),
-    }
+    })
 }
 
 fn worker_config_from_env() -> anyhow::Result<WorkerConfig> {
@@ -875,6 +973,12 @@ fn worker_config_from_env() -> anyhow::Result<WorkerConfig> {
         telemetry_batch_window_ms: parse_env("WORKER_TELEMETRY_BATCH_WINDOW_MS", "1000")?,
         action_command_subject: std::env::var("WORKER_ACTION_COMMAND_SUBJECT")
             .unwrap_or_else(|_| "excalibur.commands.dispatch".to_owned()),
+        action_command_stream: std::env::var("WORKER_ACTION_COMMAND_STREAM")
+            .unwrap_or_else(|_| "EXCALIBUR_COMMANDS".to_owned()),
+        action_command_dead_letter_subject: std::env::var(
+            "WORKER_ACTION_COMMAND_DEAD_LETTER_SUBJECT",
+        )
+        .unwrap_or_else(|_| "excalibur.commands.dead_letter".to_owned()),
         action_claim_limit: parse_env("WORKER_ACTION_CLAIM_LIMIT", "100")?,
         action_dispatch_interval_ms: parse_env("WORKER_ACTION_DISPATCH_INTERVAL_MS", "1000")?,
         action_timeout_seconds: parse_env("WORKER_ACTION_TIMEOUT_SECONDS", "900")?,
@@ -1014,8 +1118,8 @@ mod tests {
         assert_eq!(rows[0].payload["value"], 24.1);
     }
 
-    #[test]
-    fn command_envelope_targets_device_command_topic() {
+    #[tokio::test]
+    async fn command_envelope_targets_device_command_topic() {
         let project_id = Id::now_v7();
         let device_id = Id::now_v7();
         let action_id = Id::now_v7();
@@ -1026,7 +1130,9 @@ mod tests {
             device_id,
             name: "diagnostics.collect".to_owned(),
             payload: json!({ "paths": ["/var/log"] }),
-        });
+        })
+        .await
+        .unwrap();
 
         assert_eq!(
             envelope,
@@ -1041,6 +1147,35 @@ mod tests {
                 )
             }
         );
+    }
+
+    #[tokio::test]
+    async fn ota_command_envelope_persists_reference_without_signed_url() {
+        let project_id = Id::now_v7();
+        let device_id = Id::now_v7();
+        let firmware_id = Id::now_v7();
+
+        let envelope = command_envelope_for_target(ActionDispatchTarget {
+            project_id,
+            action_id: Id::now_v7(),
+            device_id,
+            name: "ota.install".to_owned(),
+            payload: json!({
+                "firmware_id": firmware_id,
+                "component": "main",
+                "version": "1.0.0",
+                "sha256": "a".repeat(64),
+                "signature": "ed25519:test",
+                "size_bytes": 1024
+            }),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(envelope.topic, commands_topic(project_id, device_id));
+        assert_eq!(envelope.command.name, "ota.install");
+        assert_eq!(envelope.command.payload["firmware_id"], json!(firmware_id));
+        assert!(envelope.command.payload.get("signed_url").is_none());
     }
 
     #[tokio::test]
@@ -1088,6 +1223,8 @@ mod tests {
             telemetry_batch_size: 10,
             telemetry_batch_window_ms: 100,
             action_command_subject: "excalibur.commands.dispatch".to_owned(),
+            action_command_stream: "EXCALIBUR_COMMANDS".to_owned(),
+            action_command_dead_letter_subject: "excalibur.commands.dead_letter".to_owned(),
             action_claim_limit: 10,
             action_dispatch_interval_ms: 100,
             action_timeout_seconds: 0,
@@ -1169,6 +1306,8 @@ mod tests {
             telemetry_batch_size: 10,
             telemetry_batch_window_ms: 100,
             action_command_subject: "excalibur.commands.dispatch".to_owned(),
+            action_command_stream: "EXCALIBUR_COMMANDS".to_owned(),
+            action_command_dead_letter_subject: "excalibur.commands.dead_letter".to_owned(),
             action_claim_limit: 10,
             action_dispatch_interval_ms: 100,
             action_timeout_seconds: 900,

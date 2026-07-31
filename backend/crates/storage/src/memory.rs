@@ -904,6 +904,27 @@ impl MemoryStore {
         Ok(dispatch_targets)
     }
 
+    pub async fn get_action_target_state(
+        &self,
+        project_id: Id,
+        action_id: Id,
+        device_id: Id,
+    ) -> StoreResult<ActionState> {
+        let state = self.state.read().await;
+        let action = state
+            .actions
+            .get(&action_id)
+            .ok_or(StoreError::NotFound("action"))?;
+        if action.project_id != project_id {
+            return Err(StoreError::NotFound("action"));
+        }
+        state
+            .action_targets
+            .get(&(action_id, device_id))
+            .map(|target| target.state.clone())
+            .ok_or(StoreError::NotFound("action target"))
+    }
+
     pub async fn transition_action_targets(
         &self,
         transition: ActionTargetTransition,

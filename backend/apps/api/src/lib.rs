@@ -18,9 +18,8 @@ use axum::{
 };
 use chrono::{Duration, Utc};
 use excalibur_device_protocol::{
-    DeviceAgentAuthentication, DeviceConfig, DiagnosticsCollectPayload, OtaInstallPayload,
-    ProvisioningMode, PublishTopic, decode_command_status_payload, decode_telemetry_payload,
-    parse_publish_topic,
+    DeviceAgentAuthentication, DeviceConfig, DiagnosticsCollectPayload, ProvisioningMode,
+    PublishTopic, decode_command_status_payload, decode_telemetry_payload, parse_publish_topic,
 };
 use excalibur_domain::{
     Action, ActionState, ActionStatusUpdate, ActionTargetTransition, AlertEventState, AlertKind,
@@ -29,17 +28,17 @@ use excalibur_domain::{
     NewFirmwareRollout, Org, Project, Role, StreamDefinition, StreamField, StreamFieldType,
     TelemetryAggregateBucket, TelemetryPoint, User, UserSession,
 };
+use excalibur_object_storage::{
+    ObjectStorageConfig, presigned_object_key_url as sign_object_key_url,
+};
 use excalibur_storage::{Store, StoreError, parse_reported_action_state};
 use futures_util::stream;
-use ring::hmac;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use tower_http::{
     cors::{AllowOrigin, CorsLayer},
     trace::TraceLayer,
 };
-use url::Url;
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
@@ -141,43 +140,6 @@ impl AppConfig {
         self.ca_private_key_pem
             .as_deref()
             .ok_or_else(|| ApiError::Internal("certificate authority is not configured".to_owned()))
-    }
-}
-
-#[derive(Debug, Clone)]
-struct ObjectStorageConfig {
-    public_endpoint: String,
-    bucket: String,
-    region: String,
-    access_key_id: String,
-    secret_access_key: String,
-}
-
-impl ObjectStorageConfig {
-    fn development() -> Self {
-        Self {
-            public_endpoint: "http://localhost:9000".to_owned(),
-            bucket: "excalibur".to_owned(),
-            region: "us-east-1".to_owned(),
-            access_key_id: "excalibur".to_owned(),
-            secret_access_key: "excalibur-secret".to_owned(),
-        }
-    }
-
-    fn from_env() -> anyhow::Result<Self> {
-        let endpoint =
-            std::env::var("S3_PUBLIC_ENDPOINT").or_else(|_| std::env::var("S3_ENDPOINT"))?;
-        Ok(Self {
-            public_endpoint: endpoint,
-            bucket: std::env::var("S3_BUCKET").unwrap_or_else(|_| "excalibur".to_owned()),
-            region: std::env::var("S3_REGION").unwrap_or_else(|_| "us-east-1".to_owned()),
-            access_key_id: std::env::var("S3_ACCESS_KEY_ID")
-                .or_else(|_| std::env::var("AWS_ACCESS_KEY_ID"))
-                .unwrap_or_else(|_| "excalibur".to_owned()),
-            secret_access_key: std::env::var("S3_SECRET_ACCESS_KEY")
-                .or_else(|_| std::env::var("AWS_SECRET_ACCESS_KEY"))
-                .unwrap_or_else(|_| "excalibur-secret".to_owned()),
-        })
     }
 }
 
@@ -2236,6 +2198,38 @@ pub struct CreateActionRequest {
     pub requires_approval: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+struct OtaInstallReferencePayload {
+    firmware_id: Id,
+    component: String,
+    version: String,
+    sha256: String,
+    signature: Option<String>,
+    size_bytes: i64,
+}
+
+impl OtaInstallReferencePayload {
+    fn validate(&self) -> Result<(), ApiError> {
+        if self.component.trim().is_empty() {
+            return Err(ApiError::BadRequest("component is required".to_owned()));
+        }
+        if self.version.trim().is_empty() {
+            return Err(ApiError::BadRequest("version is required".to_owned()));
+        }
+        if self.sha256.len() != 64 || !self.sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(ApiError::BadRequest(
+                "sha256 must be 64 hex characters".to_owned(),
+            ));
+        }
+        if self.size_bytes <= 0 {
+            return Err(ApiError::BadRequest(
+                "size_bytes must be positive".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[utoipa::path(post, path = "/api/v1/actions", request_body = CreateActionRequest, responses((status = 200, body = ActionResponse)))]
 async fn create_action(
     headers: HeaderMap,
@@ -2301,12 +2295,10 @@ async fn validate_device_action(
     match name {
         "ota.install" => {
             let payload =
-                serde_json::from_value::<OtaInstallPayload>(payload).map_err(|error| {
+                serde_json::from_value::<OtaInstallReferencePayload>(payload).map_err(|error| {
                     ApiError::BadRequest(format!("invalid ota.install payload: {error}"))
                 })?;
-            payload
-                .validate()
-                .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+            payload.validate()?;
             validate_ota_payload_against_firmware(state, project_id, payload).await
         }
         "diagnostics.collect" => {
@@ -2328,7 +2320,7 @@ async fn validate_device_action(
 async fn validate_ota_payload_against_firmware(
     state: &AppState,
     project_id: Id,
-    mut payload: OtaInstallPayload,
+    payload: OtaInstallReferencePayload,
 ) -> Result<Value, ApiError> {
     let artifact = state
         .store
@@ -2358,14 +2350,7 @@ async fn validate_ota_payload_against_firmware(
             "ota.install payload does not match firmware metadata".to_owned(),
         ));
     }
-    payload.signed_url = presigned_object_url(
-        &state.config.object_storage,
-        &artifact,
-        "GET",
-        Duration::minutes(15),
-    )?
-    .url;
-    serde_json::to_value(payload)
+    serde_json::to_value(ota_payload_reference_for_artifact(&artifact))
         .map_err(|_| ApiError::Internal("failed to encode ota.install payload".to_owned()))
 }
 
@@ -2935,7 +2920,7 @@ async fn create_firmware_rollout(
             .get_device(request.project_id, *device_id)
             .await?;
     }
-    let payload = ota_payload_for_artifact(&state, &artifact)?;
+    let payload = ota_payload_reference_for_artifact(&artifact);
     let mut action = Action::new(
         request.project_id,
         target_ids.clone(),
@@ -3008,31 +2993,15 @@ async fn firmware_artifact_for_project(
         .ok_or_else(|| ApiError::NotFound("firmware not found".to_owned()))
 }
 
-fn ota_payload_for_artifact(
-    state: &AppState,
-    artifact: &FirmwareArtifact,
-) -> Result<Value, ApiError> {
-    let signed_url = presigned_object_url(
-        &state.config.object_storage,
-        artifact,
-        "GET",
-        Duration::minutes(15),
-    )?
-    .url;
-    let payload = OtaInstallPayload {
-        firmware_id: artifact.id,
-        component: artifact.component.clone(),
-        version: artifact.version.clone(),
-        signed_url,
-        sha256: artifact.sha256.clone(),
-        signature: artifact.signature.clone(),
-        size_bytes: artifact.size_bytes,
-    };
-    payload
-        .validate()
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-    serde_json::to_value(payload)
-        .map_err(|_| ApiError::Internal("failed to encode ota.install payload".to_owned()))
+fn ota_payload_reference_for_artifact(artifact: &FirmwareArtifact) -> Value {
+    json!({
+        "firmware_id": artifact.id,
+        "component": artifact.component,
+        "version": artifact.version,
+        "sha256": artifact.sha256,
+        "signature": artifact.signature,
+        "size_bytes": artifact.size_bytes,
+    })
 }
 
 fn firmware_object_key_prefix(project_id: Id) -> String {
@@ -3068,128 +3037,12 @@ fn presigned_object_key_url(
     method: &str,
     ttl: Duration,
 ) -> Result<SignedObjectUrl, ApiError> {
-    let expires_at = Utc::now() + ttl;
-    let expires = ttl.num_seconds().clamp(1, 604_800);
-    let endpoint = Url::parse(&config.public_endpoint)
-        .map_err(|_| ApiError::Internal("S3_PUBLIC_ENDPOINT is invalid".to_owned()))?;
-    let host = endpoint
-        .host_str()
-        .ok_or_else(|| ApiError::Internal("S3_PUBLIC_ENDPOINT is missing host".to_owned()))?;
-    let host_header = match endpoint.port() {
-        Some(port) => format!("{host}:{port}"),
-        None => host.to_owned(),
-    };
-    let date = Utc::now();
-    let datestamp = date.format("%Y%m%d").to_string();
-    let amz_date = date.format("%Y%m%dT%H%M%SZ").to_string();
-    let credential_scope = format!("{}/{}/s3/aws4_request", datestamp, config.region);
-    let credential = format!("{}/{}", config.access_key_id, credential_scope);
-    let endpoint_path = endpoint.path().trim_end_matches('/');
-    let object_path = format!(
-        "{}/{}/{}",
-        endpoint_path,
-        percent_encode_path_segment(&config.bucket),
-        percent_encode_object_key(object_key)
-    );
-    let canonical_uri = if object_path.starts_with('/') {
-        object_path
-    } else {
-        format!("/{object_path}")
-    };
-    let mut query = HashMap::from([
-        ("X-Amz-Algorithm", "AWS4-HMAC-SHA256".to_owned()),
-        ("X-Amz-Credential", credential),
-        ("X-Amz-Date", amz_date),
-        ("X-Amz-Expires", expires.to_string()),
-        ("X-Amz-SignedHeaders", "host".to_owned()),
-    ]);
-    let canonical_query = canonical_query_string(&query);
-    let canonical_request = format!(
-        "{method}\n{canonical_uri}\n{canonical_query}\nhost:{host_header}\n\nhost\nUNSIGNED-PAYLOAD"
-    );
-    let string_to_sign = format!(
-        "AWS4-HMAC-SHA256\n{}\n{}\n{}",
-        query["X-Amz-Date"],
-        credential_scope,
-        encode_hex(&sha256_digest(canonical_request.as_bytes()))
-    );
-    let signature = aws_sigv4_signature(
-        config.secret_access_key.as_bytes(),
-        &datestamp,
-        &config.region,
-        string_to_sign.as_bytes(),
-    );
-    query.insert("X-Amz-Signature", signature);
-    let query = canonical_query_string(&query);
-    let url = format!(
-        "{}://{}{}?{}",
-        endpoint.scheme(),
-        host_header,
-        canonical_uri,
-        query
-    );
-    Ok(SignedObjectUrl { url, expires_at })
-}
-
-fn canonical_query_string(query: &HashMap<&'static str, String>) -> String {
-    let mut pairs = query
-        .iter()
-        .map(|(key, value)| {
-            (
-                percent_encode_path_segment(key),
-                percent_encode_path_segment(value),
-            )
-        })
-        .collect::<Vec<_>>();
-    pairs.sort();
-    pairs
-        .into_iter()
-        .map(|(key, value)| format!("{key}={value}"))
-        .collect::<Vec<_>>()
-        .join("&")
-}
-
-fn sha256_digest(bytes: &[u8]) -> Vec<u8> {
-    Sha256::digest(bytes).to_vec()
-}
-
-fn hmac_sha256(key: &[u8], message: &[u8]) -> Vec<u8> {
-    let signing_key = hmac::Key::new(hmac::HMAC_SHA256, key);
-    hmac::sign(&signing_key, message).as_ref().to_vec()
-}
-
-fn aws_sigv4_signature(secret: &[u8], date: &str, region: &str, string_to_sign: &[u8]) -> String {
-    let mut seed = b"AWS4".to_vec();
-    seed.extend_from_slice(secret);
-    let date_key = hmac_sha256(&seed, date.as_bytes());
-    let region_key = hmac_sha256(&date_key, region.as_bytes());
-    let service_key = hmac_sha256(&region_key, b"s3");
-    let signing_key = hmac_sha256(&service_key, b"aws4_request");
-    encode_hex(&hmac_sha256(&signing_key, string_to_sign))
-}
-
-fn percent_encode_object_key(value: &str) -> String {
-    value
-        .split('/')
-        .map(percent_encode_path_segment)
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
-fn percent_encode_path_segment(value: &str) -> String {
-    value
-        .bytes()
-        .flat_map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                vec![byte as char]
-            }
-            _ => format!("%{byte:02X}").chars().collect(),
-        })
-        .collect()
-}
-
-fn encode_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    let signed = sign_object_key_url(config, object_key, method, ttl)
+        .map_err(|error| ApiError::Internal(error.to_string()))?;
+    Ok(SignedObjectUrl {
+        url: signed.url,
+        expires_at: signed.expires_at,
+    })
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -5351,6 +5204,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_ota_action_persists_reference_without_signed_url() {
+        let state = AppState::default();
+        let user = state
+            .store
+            .create_user(User::new("ota-action@example.com", "OTA Action", "hash"))
+            .await
+            .unwrap();
+        let org = state
+            .store
+            .create_org(Org::new("OTA Action Org", "ota-action"), user.id)
+            .await
+            .unwrap();
+        let project = state
+            .store
+            .create_project(Project::new(org.id, "Factory", "factory"))
+            .await
+            .unwrap();
+        let device = state
+            .store
+            .create_device(Device::new(project.id, "press-1", json!({})))
+            .await
+            .unwrap();
+        let firmware = state
+            .store
+            .create_firmware(FirmwareArtifact::new(
+                project.id,
+                "main",
+                "1.0.0",
+                format!("projects/{}/firmware/main.bin", project.id),
+                "a".repeat(64),
+                "application/octet-stream",
+                Some("ed25519:test".to_owned()),
+                1024,
+            ))
+            .await
+            .unwrap();
+        let firmware = state
+            .store
+            .finalize_firmware(
+                project.id,
+                firmware.id,
+                &"a".repeat(64),
+                1024,
+                Some("ed25519:test"),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        seed_session(&state, "ota-action-token", user.id).await;
+
+        let response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/actions")
+                    .header("authorization", "Bearer ota-action-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "project_id": project.id,
+                            "device_ids": [device.id],
+                            "name": "ota.install",
+                            "payload": {
+                                "firmware_id": firmware.id,
+                                "component": "main",
+                                "version": "1.0.0",
+                                "signed_url": "https://objects.example/stale.bin?X-Amz-Signature=old",
+                                "sha256": "a".repeat(64),
+                                "signature": "ed25519:test",
+                                "size_bytes": 1024
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let actions = state.store.list_actions(project.id).await.unwrap();
+        let action = actions
+            .iter()
+            .find(|action| action.name == "ota.install")
+            .unwrap();
+        assert_eq!(action.payload["firmware_id"], json!(firmware.id));
+        assert!(action.payload.get("signed_url").is_none());
+    }
+
+    #[tokio::test]
     async fn finalized_firmware_cannot_receive_new_upload_urls() {
         let state = AppState::default();
         let user = state
@@ -5908,8 +5851,13 @@ mod tests {
         assert_eq!(rollout.cohort_size, 1);
         assert_eq!(rollout.state, FirmwareRolloutState::WaitingApproval);
         let actions = state.store.list_actions(project.id).await.unwrap();
-        assert!(actions.iter().any(|action| {
-            action.id == rollout.action_id && action.state == ActionState::WaitingApproval
-        }));
+        let action = actions
+            .iter()
+            .find(|action| {
+                action.id == rollout.action_id && action.state == ActionState::WaitingApproval
+            })
+            .unwrap();
+        assert_eq!(action.payload["firmware_id"], json!(firmware.id));
+        assert!(action.payload.get("signed_url").is_none());
     }
 }

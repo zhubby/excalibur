@@ -54,12 +54,11 @@
 
 ## Milestone 4: Actions 与 OTA
 
-状态：action target 持久状态、queued target claim、worker dispatcher、NATS command bus、MQTT command bridge、firmware metadata、短 TTL signed upload URL、approval/retry/cancel API 和 worker timeout sweeper 已接入。
+状态：action target 持久状态、queued target claim、worker dispatcher、JetStream durable command bus、MQTT command bridge durable consumer、firmware metadata、短 TTL signed upload URL、approval/retry/cancel API 和 worker timeout sweeper 已接入。worker 发布 reference-only command envelope 时要求 JetStream PubAck，bridge 确认 action target 仍为 `Running` 后发布到 MQTT broker，成功后再 ack；`ota.install` action payload 和 JetStream command stream 只持久化 firmware metadata/reference，bridge 发布前即时签发短 TTL download URL，避免审批/排队期间 URL 过期或 signed URL 落入 durable stream。
 
 目标：
 
-- 将 action command bus 切到 JetStream durable subject/consumer，bridge 成功发布到 MQTT 后再 ack，覆盖 bridge restart/offline retry。
-- action payload 只持久化 firmware/session 引用，worker dispatch 前即时签发短 TTL object URL，避免审批/排队期间 URL 过期。
+- 补 live NATS/MQTT bridge restart/offline retry 集成测试。
 - 直接对象存储 upload finalize/verify 流程。
 - OTA rollout cohort、审批策略和回滚策略。
 - Agent installer contract。

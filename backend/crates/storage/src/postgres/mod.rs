@@ -1442,6 +1442,29 @@ impl PgStore {
         Ok(dispatch_targets)
     }
 
+    pub async fn get_action_target_state(
+        &self,
+        project_id: Id,
+        action_id: Id,
+        device_id: Id,
+    ) -> StoreResult<ActionState> {
+        let row = sqlx::query(
+            "SELECT state::text AS state
+             FROM action_targets
+             WHERE project_id = $1 AND action_id = $2 AND device_id = $3",
+        )
+        .bind(project_id)
+        .bind(action_id)
+        .bind(device_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "action target"))?;
+        let Some(row) = row else {
+            return Err(StoreError::NotFound("action target"));
+        };
+        action_state_from_db(row.try_get("state").map_err(map_decode_error)?)
+    }
+
     pub async fn transition_action_targets(
         &self,
         transition: ActionTargetTransition,
