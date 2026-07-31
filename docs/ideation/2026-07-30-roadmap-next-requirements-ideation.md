@@ -26,7 +26,7 @@ The remaining highest-leverage gaps are no longer broad scaffolding gaps. They a
 
 **Complexity:** High
 
-**Status:** Unexplored
+**Status:** Explored - first implementation slice added a rumqttd publish ack gate for NATS telemetry; disk outbox/resume remains a follow-up.
 
 ### 2. Durable Action/OTA Command Bus With JIT Object URLs
 
@@ -128,3 +128,5 @@ The remaining highest-leverage gaps are no longer broad scaffolding gaps. They a
 ## Session Log
 
 - 2026-07-30: Initial ideation - 18 candidates generated, 7 survived after production-roadmap filtering.
+- 2026-07-31: Resumed ideation - current roadmap still points to durable ingest ACK/outbox as the strongest next implementation candidate, followed by durable action command bus and diagnostics object verification.
+- 2026-07-31: Started implementation - scoped first slice to JetStream PubAck-before-MQTT-PubAck for remote telemetry publish, leaving disk outbox/resume for the next reliability slice.

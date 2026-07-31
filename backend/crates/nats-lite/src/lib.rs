@@ -390,4 +390,27 @@ mod tests {
     fn rejects_subject_with_whitespace() {
         assert!(validate_subject("bad subject").is_err());
     }
+
+    #[test]
+    fn parses_jetstream_publish_ack() {
+        let ack = parse_jetstream_pub_ack(br#"{"stream":"EXCALIBUR_TELEMETRY","seq":42}"#).unwrap();
+
+        assert_eq!(
+            ack,
+            JetStreamPubAck {
+                stream: "EXCALIBUR_TELEMETRY".to_owned(),
+                sequence: 42
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_jetstream_publish_error_ack() {
+        let error = parse_jetstream_pub_ack(
+            br#"{"error":{"code":503,"description":"stream unavailable"}}"#,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("JetStream publish failed"));
+    }
 }

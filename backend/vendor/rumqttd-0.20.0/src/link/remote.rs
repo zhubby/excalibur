@@ -5,7 +5,7 @@ use crate::local::LinkBuilder;
 use crate::protocol::{ConnAck, Connect, ConnectReturnCode, Login, Packet, Protocol};
 use crate::router::{Event, Notification};
 use crate::{
-    ConnectionId, ConnectionSettings, PeerCertFingerprint, PublishAuthHandler,
+    ConnectionId, ConnectionSettings, PeerCertFingerprint, PublishAckHandler, PublishAuthHandler,
     SubscribeAuthHandler,
 };
 
@@ -50,6 +50,8 @@ pub enum Error {
     InvalidPublishTopic,
     #[error("Publish not authorized")]
     PublishNotAuthorized,
+    #[error("Publish not durably accepted")]
+    PublishNotDurablyAccepted,
     #[error("Channel try send error")]
     TrySend(#[from] TrySendError<(ConnectionId, Event)>),
     #[error("Link error = {0}")]
@@ -59,11 +61,13 @@ pub enum Error {
 /// Orchestrates between Router and Network.
 pub struct RemoteLink<P> {
     connect: Connect,
+    client_id: String,
     pub(crate) connection_id: ConnectionId,
     network: Network<P>,
     link_tx: LinkTx,
     link_rx: LinkRx,
     publish_auth: Option<PublishAuthHandler>,
+    publish_ack: Option<PublishAckHandler>,
     notifications: VecDeque<Notification>,
     pub(crate) will_delay_interval: u32,
 }
@@ -76,6 +80,7 @@ impl<P: Protocol> RemoteLink<P> {
         connect_packet: Packet,
         dynamic_filters: bool,
         publish_auth: Option<PublishAuthHandler>,
+        publish_ack: Option<PublishAckHandler>,
         subscribe_auth: Option<SubscribeAuthHandler>,
         assigned_client_id: Option<String>,
     ) -> Result<RemoteLink<P>, Error> {
@@ -85,7 +90,7 @@ impl<P: Protocol> RemoteLink<P> {
 
         // Register this connection with the router. Router replys with ack which if ok will
         // start the link. Router can sometimes reject the connection (ex max connection limit)
-        let client_id = assigned_client_id.as_ref().unwrap_or(&connect.client_id);
+        let client_id = effective_client_id(&connect.client_id, assigned_client_id.as_deref());
         let clean_session = connect.clean_session;
 
         let topic_alias_max = props.as_ref().and_then(|p| p.topic_alias_max);
@@ -103,7 +108,7 @@ impl<P: Protocol> RemoteLink<P> {
         // the Will Delay Interval has passed or the Session ends, whichever happens first
         let will_delay_interval = min(session_expiry, delay_interval);
 
-        let (link_tx, link_rx, notification) = LinkBuilder::new(client_id, router_tx)
+        let (link_tx, link_rx, notification) = LinkBuilder::new(&client_id, router_tx)
             .tenant_id(tenant_id)
             .clean_session(clean_session)
             .last_will(lastwill)
@@ -128,11 +133,13 @@ impl<P: Protocol> RemoteLink<P> {
 
         Ok(RemoteLink {
             connect,
+            client_id,
             connection_id: id,
             network,
             link_tx,
             link_rx,
             publish_auth,
+            publish_ack,
             notifications: VecDeque::with_capacity(100),
             will_delay_interval,
         })
@@ -147,20 +154,25 @@ impl<P: Protocol> RemoteLink<P> {
             select! {
                 o = self.network.read() => {
                     let packet = o?;
-                    let len = {
-                        let mut packets = VecDeque::new();
-                        packets.push_back(packet);
-                        self.network.readv(&mut packets)?;
-                        let mut buffer = self.link_tx.buffer();
-                        while let Some(packet) = packets.pop_front() {
-                            self.authorize_packet(&packet)?;
-                            buffer.push_back(packet);
+                    let mut packets = VecDeque::new();
+                    packets.push_back(packet);
+                    self.network.readv(&mut packets)?;
+                    let mut len = 0;
+                    while let Some(packet) = packets.pop_front() {
+                        if let Some((topic, payload)) = publish_packet_parts(&packet)? {
+                            accept_publish(
+                                self.client_id.clone(),
+                                self.publish_auth.clone(),
+                                self.publish_ack.clone(),
+                                topic,
+                                payload,
+                            )
+                            .await?;
                         }
-                        buffer.len()
-                    };
+                        len = self.link_tx.send(packet).await?;
+                    }
 
                     trace!("Packets read from network, count = {}", len);
-                    self.link_tx.notify().await?;
                 }
                 // Receive from router when previous when state isn't in collision
                 // due to previously received data request
@@ -186,20 +198,40 @@ impl<P: Protocol> RemoteLink<P> {
         }
     }
 
-    fn authorize_packet(&self, packet: &Packet) -> Result<(), Error> {
-        let Some(auth) = &self.publish_auth else {
-            return Ok(());
-        };
-        let Packet::Publish(publish, _) = packet else {
-            return Ok(());
-        };
-        let topic = std::str::from_utf8(&publish.topic).map_err(|_| Error::InvalidPublishTopic)?;
-        if auth(self.connect.client_id.clone(), topic.to_owned()) {
-            Ok(())
-        } else {
-            Err(Error::PublishNotAuthorized)
+}
+
+fn effective_client_id(connect_client_id: &str, assigned_client_id: Option<&str>) -> String {
+    assigned_client_id.unwrap_or(connect_client_id).to_owned()
+}
+
+fn publish_packet_parts(packet: &Packet) -> Result<Option<(String, Vec<u8>)>, Error> {
+    let Packet::Publish(publish, _) = packet else {
+        return Ok(None);
+    };
+    let topic = std::str::from_utf8(&publish.topic)
+        .map_err(|_| Error::InvalidPublishTopic)?
+        .to_owned();
+    Ok(Some((topic, publish.payload.to_vec())))
+}
+
+async fn accept_publish(
+    client_id: String,
+    publish_auth: Option<PublishAuthHandler>,
+    publish_ack: Option<PublishAckHandler>,
+    topic: String,
+    payload: Vec<u8>,
+) -> Result<(), Error> {
+    if let Some(auth) = publish_auth {
+        if !auth(client_id.clone(), topic.clone()) {
+            return Err(Error::PublishNotAuthorized);
         }
     }
+    if let Some(ack) = publish_ack {
+        if !ack(client_id, topic, payload).await {
+            return Err(Error::PublishNotDurablyAccepted);
+        }
+    }
+    Ok(())
 }
 
 /// Read MQTT connect packet from network and verify it.
@@ -311,11 +343,17 @@ async fn handle_auth(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::{
+        collections::HashMap,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
 
     use crate::{protocol::Login, ConnectionSettings};
 
-    use super::handle_auth;
+    use super::{Error, accept_publish, effective_client_id, handle_auth};
 
     fn config() -> ConnectionSettings {
         ConnectionSettings {
@@ -325,6 +363,7 @@ mod tests {
             auth: None,
             external_auth: None,
             publish_auth: None,
+            publish_ack: None,
             subscribe_auth: None,
             dynamic_filters: false,
         }
@@ -440,5 +479,95 @@ mod tests {
         )
         .await;
         assert!(r.is_ok());
+    }
+
+    #[test]
+    fn assigned_client_id_is_used_as_effective_remote_identity() {
+        assert_eq!(
+            effective_client_id("", Some("rumqtt-assigned")),
+            "rumqtt-assigned"
+        );
+        assert_eq!(effective_client_id("device-1", None), "device-1");
+    }
+
+    #[tokio::test]
+    async fn publish_accept_runs_auth_before_ack_gate() {
+        let ack_called = Arc::new(AtomicBool::new(false));
+        let mut cfg = config();
+        cfg.set_publish_auth_handler(|_, _| false);
+        cfg.set_publish_ack_handler({
+            let ack_called = ack_called.clone();
+            move |_, _, _| {
+                let ack_called = ack_called.clone();
+                async move {
+                    ack_called.store(true, Ordering::SeqCst);
+                    true
+                }
+            }
+        });
+
+        let result = accept_publish(
+            "client-1".to_owned(),
+            cfg.publish_auth.clone(),
+            cfg.publish_ack.clone(),
+            "v1/p/project/d/device/telemetry/temperature".to_owned(),
+            vec![1, 2, 3],
+        )
+        .await;
+
+        assert!(matches!(result, Err(Error::PublishNotAuthorized)));
+        assert!(!ack_called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn publish_accept_rejects_when_ack_gate_fails() {
+        let mut cfg = config();
+        cfg.set_publish_auth_handler(|_, _| true);
+        cfg.set_publish_ack_handler(|_, _, _| async { false });
+
+        let result = accept_publish(
+            "client-1".to_owned(),
+            cfg.publish_auth.clone(),
+            cfg.publish_ack.clone(),
+            "v1/p/project/d/device/telemetry/temperature".to_owned(),
+            vec![1, 2, 3],
+        )
+        .await;
+
+        assert!(matches!(result, Err(Error::PublishNotDurablyAccepted)));
+    }
+
+    #[tokio::test]
+    async fn publish_accept_passes_topic_payload_and_client_id_to_ack_gate() {
+        let ack_called = Arc::new(AtomicBool::new(false));
+        let mut cfg = config();
+        cfg.set_publish_auth_handler(|client_id, topic| {
+            client_id == "rumqtt-assigned"
+                && topic == "v1/p/project/d/device/telemetry/temperature"
+        });
+        cfg.set_publish_ack_handler({
+            let ack_called = ack_called.clone();
+            move |client_id, topic, payload| {
+                let ack_called = ack_called.clone();
+                async move {
+                    ack_called.store(true, Ordering::SeqCst);
+                    client_id == "rumqtt-assigned"
+                        && topic == "v1/p/project/d/device/telemetry/temperature"
+                        && payload == vec![1, 2, 3]
+                }
+            }
+        });
+
+        let result = accept_publish(
+            "rumqtt-assigned".to_owned(),
+            cfg.publish_auth.clone(),
+            cfg.publish_ack.clone(),
+            "v1/p/project/d/device/telemetry/temperature".to_owned(),
+            vec![1, 2, 3],
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert!(ack_called.load(Ordering::SeqCst));
     }
 }
