@@ -9,11 +9,13 @@ import { MetricStrip } from "@/components/metric-strip";
 import { ProjectHeader } from "@/components/project-header";
 import { Sidebar } from "@/components/sidebar";
 import { TelemetryPanel } from "@/components/telemetry-panel";
+import { WorkspaceManagement, type ApiKeyCreateInput } from "@/components/workspace-management";
 import {
   ExcaliburApiError,
   createExcaliburApi,
   type Action,
   type AlertRule,
+  type ApiKey,
   type AuditLog,
   type AuthResponse,
   type Device,
@@ -30,10 +32,13 @@ import type {
   AlertSummary,
   DeviceRow,
   DeviceStatus,
+  ManagementSectionId,
   MetricItem,
+  NavSectionId,
   StreamSummary,
 } from "@/lib/data";
 import { commandStatusTopic, commandTopic, shadowTopic, telemetryTopic } from "@/lib/protocol";
+import { getApiKeyScopePreset, slugifyWorkspaceName } from "@/lib/workspace-management";
 
 type Session = {
   expiresAt: string;
@@ -479,6 +484,11 @@ export function ConsoleApp() {
   const [displayName, setDisplayName] = useState("");
   const [session, setSession] = useState<Session | null>(null);
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
+  const [orgs, setOrgs] = useState<Org[]>([]);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [apiKeys, setApiKeys] = useState<ApiKey[]>([]);
+  const [apiKeyError, setApiKeyError] = useState<string | null>(null);
+  const [createdApiKey, setCreatedApiKey] = useState<ApiKey | null>(null);
   const [projectData, setProjectData] = useState<ProjectData>(emptyProjectData);
   const [selectedDeviceId, setSelectedDeviceId] = useState<string | undefined>();
   const [devAuthConfig, setDevAuthConfig] = useState<DeviceConfig | null>(null);
@@ -486,7 +496,44 @@ export function ConsoleApp() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [activeSection, setActiveSection] = useState<NavSectionId>("fleet");
   const initializedSessionKey = useRef<string | null>(null);
+  const workspaceSessionKey = session && workspace ? `${session.userId}:${session.expiresAt}:${workspace.org.id}:${workspace.project.id}` : null;
+  const workspaceSessionKeyRef = useRef<string | null>(null);
+  const sectionRefs = useRef<Record<NavSectionId, HTMLElement | null>>({
+    fleet: null,
+    streams: null,
+    actions: null,
+    firmware: null,
+    security: null,
+    organization: null,
+    projects: null,
+    permissions: null,
+    audit: null,
+  });
+
+  const setSectionRef = useCallback(
+    (section: NavSectionId) => (node: HTMLElement | null) => {
+      sectionRefs.current[section] = node;
+    },
+    [],
+  );
+
+  const setManagementSectionRef = useCallback(
+    (section: ManagementSectionId) => (node: HTMLElement | null) => {
+      sectionRefs.current[section] = node;
+    },
+    [],
+  );
+
+  const handleNavigate = useCallback((section: NavSectionId) => {
+    setActiveSection(section);
+    sectionRefs.current[section]?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, []);
+
+  useEffect(() => {
+    workspaceSessionKeyRef.current = workspaceSessionKey;
+  }, [workspaceSessionKey]);
 
   const clearSession = useCallback(() => {
     window.localStorage.removeItem(SESSION_KEY);
@@ -537,6 +584,24 @@ export function ConsoleApp() {
     );
   }, []);
 
+  const refreshWorkspaceManagement = useCallback(async (api: Api, activeWorkspace: Workspace) => {
+    const [nextOrgs, nextProjects] = await Promise.all([
+      api.listOrgs(),
+      api.listProjects(activeWorkspace.org.id),
+    ]);
+    setOrgs(nextOrgs);
+    setProjects(nextProjects);
+
+    try {
+      const nextApiKeys = await api.listApiKeys(activeWorkspace.org.id, activeWorkspace.project.id);
+      setApiKeys(nextApiKeys);
+      setApiKeyError(null);
+    } catch (apiKeyListError) {
+      setApiKeys([]);
+      setApiKeyError(formatError(apiKeyListError));
+    }
+  }, []);
+
   const initializeWorkspace = useCallback(
     async (activeSession: Session) => {
       setBusy(true);
@@ -547,8 +612,12 @@ export function ConsoleApp() {
         const org = await ensureOrg(api, activeSession.userId);
         const project = await ensureProject(api, org);
         await ensureDefaultControlPlane(api, project.id);
-        setWorkspace({ org, project });
-        await loadProjectData(api, org.id, project.id);
+        const nextWorkspace = { org, project };
+        setWorkspace(nextWorkspace);
+        await Promise.all([
+          refreshWorkspaceManagement(api, nextWorkspace),
+          loadProjectData(api, org.id, project.id),
+        ]);
         setNotice("Workspace ready");
         return true;
       } catch (loadError) {
@@ -558,7 +627,7 @@ export function ConsoleApp() {
         setBusy(false);
       }
     },
-    [getApiForSession, loadProjectData],
+    [getApiForSession, loadProjectData, refreshWorkspaceManagement],
   );
 
   useEffect(() => {
@@ -605,6 +674,11 @@ export function ConsoleApp() {
     } else {
       initializedSessionKey.current = null;
       setWorkspace(null);
+      setOrgs([]);
+      setProjects([]);
+      setApiKeys([]);
+      setApiKeyError(null);
+      setCreatedApiKey(null);
       setProjectData(emptyProjectData);
       setSelectedDeviceId(undefined);
       setDevAuthConfig(null);
@@ -618,10 +692,14 @@ export function ConsoleApp() {
       }
       setBusy(true);
       setError(null);
+      setCreatedApiKey(null);
       try {
         const api = await getApiForSession(session);
         await work(api, workspace);
-        await loadProjectData(api, workspace.org.id, workspace.project.id);
+        await Promise.all([
+          loadProjectData(api, workspace.org.id, workspace.project.id),
+          refreshWorkspaceManagement(api, workspace),
+        ]);
         setNotice(success);
       } catch (mutationError) {
         setError(formatError(mutationError));
@@ -629,7 +707,22 @@ export function ConsoleApp() {
         setBusy(false);
       }
     },
-    [getApiForSession, loadProjectData, session, workspace],
+    [getApiForSession, loadProjectData, refreshWorkspaceManagement, session, workspace],
+  );
+
+  const activateWorkspace = useCallback(
+    async (api: Api, nextWorkspace: Workspace, success: string) => {
+      await ensureDefaultControlPlane(api, nextWorkspace.project.id);
+      setWorkspace(nextWorkspace);
+      setCreatedApiKey(null);
+      setDevAuthConfig(null);
+      await Promise.all([
+        refreshWorkspaceManagement(api, nextWorkspace),
+        loadProjectData(api, nextWorkspace.org.id, nextWorkspace.project.id),
+      ]);
+      setNotice(success);
+    },
+    [loadProjectData, refreshWorkspaceManagement],
   );
 
   const selectedDevice = useMemo(
@@ -767,6 +860,193 @@ export function ConsoleApp() {
     }
     void runProjectMutation("Refreshed", async () => {});
   }, [initializeWorkspace, runProjectMutation, session, workspace]);
+
+  const handleCreateOrg = useCallback(
+    (name: string) => {
+      if (!session) {
+        return;
+      }
+      setBusy(true);
+      setError(null);
+      setCreatedApiKey(null);
+      void (async () => {
+        try {
+          const api = await getApiForSession(session);
+          const org = await api.createOrg({
+            name,
+            slug: slugifyWorkspaceName(name, "org"),
+          });
+          const project = await ensureProject(api, org);
+          await activateWorkspace(api, { org, project }, `Organization ${org.name} created`);
+        } catch (orgError) {
+          setError(formatError(orgError));
+        } finally {
+          setBusy(false);
+        }
+      })();
+    },
+    [activateWorkspace, getApiForSession, session],
+  );
+
+  const handleSelectOrg = useCallback(
+    (orgId: string) => {
+      if (!session || workspace?.org.id === orgId) {
+        return;
+      }
+      const org = orgs.find((candidate) => candidate.id === orgId);
+      if (!org) {
+        return;
+      }
+      setBusy(true);
+      setError(null);
+      setCreatedApiKey(null);
+      void (async () => {
+        try {
+          const api = await getApiForSession(session);
+          const project = await ensureProject(api, org);
+          await activateWorkspace(api, { org, project }, `Switched to ${org.name}`);
+        } catch (orgError) {
+          setError(formatError(orgError));
+        } finally {
+          setBusy(false);
+        }
+      })();
+    },
+    [activateWorkspace, getApiForSession, orgs, session, workspace?.org.id],
+  );
+
+  const handleCreateProject = useCallback(
+    (name: string) => {
+      if (!session || !workspace) {
+        return;
+      }
+      setBusy(true);
+      setError(null);
+      setCreatedApiKey(null);
+      void (async () => {
+        try {
+          const api = await getApiForSession(session);
+          const project = await api.createProject({
+            org_id: workspace.org.id,
+            name,
+            slug: slugifyWorkspaceName(name, "project"),
+          });
+          await activateWorkspace(api, { org: workspace.org, project }, `Project ${project.name} created`);
+        } catch (projectError) {
+          setError(formatError(projectError));
+        } finally {
+          setBusy(false);
+        }
+      })();
+    },
+    [activateWorkspace, getApiForSession, session, workspace],
+  );
+
+  const handleSelectProject = useCallback(
+    (projectId: string) => {
+      if (!session || !workspace || workspace.project.id === projectId) {
+        return;
+      }
+      const project = projects.find((candidate) => candidate.id === projectId);
+      if (!project) {
+        return;
+      }
+      setBusy(true);
+      setError(null);
+      void (async () => {
+        try {
+          const api = await getApiForSession(session);
+          await activateWorkspace(api, { org: workspace.org, project }, `Switched to ${project.name}`);
+        } catch (projectError) {
+          setError(formatError(projectError));
+        } finally {
+          setBusy(false);
+        }
+      })();
+    },
+    [activateWorkspace, getApiForSession, projects, session, workspace],
+  );
+
+  const handleCreateApiKey = useCallback(
+    (input: ApiKeyCreateInput) => {
+      if (!session || !workspace) {
+        return;
+      }
+      setBusy(true);
+      setError(null);
+      setCreatedApiKey(null);
+      const mutationWorkspaceKey = workspaceSessionKeyRef.current;
+      void (async () => {
+        try {
+          const api = await getApiForSession(session);
+          const preset = getApiKeyScopePreset(input.presetId);
+          const expiresAt =
+            input.expiresInDays === null
+              ? null
+              : new Date(Date.now() + input.expiresInDays * 24 * 60 * 60 * 1000).toISOString();
+          const created = await api.createApiKey({
+            org_id: workspace.org.id,
+            project_id: workspace.project.id,
+            name: input.name,
+            scopes: [...preset.scopes],
+            expires_at: expiresAt,
+          });
+          if (workspaceSessionKeyRef.current !== mutationWorkspaceKey) {
+            return;
+          }
+          await Promise.all([
+            refreshWorkspaceManagement(api, workspace),
+            loadProjectData(api, workspace.org.id, workspace.project.id),
+          ]);
+          if (workspaceSessionKeyRef.current !== mutationWorkspaceKey) {
+            return;
+          }
+          setCreatedApiKey(created);
+          setNotice("API key created");
+        } catch (apiKeyErrorValue) {
+          if (workspaceSessionKeyRef.current === mutationWorkspaceKey) {
+            setCreatedApiKey(null);
+            setError(formatError(apiKeyErrorValue));
+          }
+        } finally {
+          setBusy(false);
+        }
+      })();
+    },
+    [getApiForSession, loadProjectData, refreshWorkspaceManagement, session, workspace],
+  );
+
+  const handleRevokeApiKey = useCallback(
+    (apiKeyId: string) => {
+      if (!session || !workspace) {
+        return;
+      }
+      const apiKey = apiKeys.find((candidate) => candidate.id === apiKeyId);
+      const label = apiKey?.name ?? apiKeyId;
+      if (!window.confirm(`Revoke API key "${label}" for ${workspace.project.name}?`)) {
+        return;
+      }
+      setBusy(true);
+      setError(null);
+      void (async () => {
+        try {
+          const api = await getApiForSession(session);
+          await api.revokeApiKey(apiKeyId, workspace.org.id);
+          setCreatedApiKey(null);
+          await Promise.all([
+            refreshWorkspaceManagement(api, workspace),
+            loadProjectData(api, workspace.org.id, workspace.project.id),
+          ]);
+          setNotice("API key revoked");
+        } catch (apiKeyErrorValue) {
+          setError(formatError(apiKeyErrorValue));
+        } finally {
+          setBusy(false);
+        }
+      })();
+    },
+    [apiKeys, getApiForSession, loadProjectData, refreshWorkspaceManagement, session, workspace],
+  );
 
   const handleCreateDevice = useCallback(() => {
     void runProjectMutation("Device created", async (api, activeWorkspace) => {
@@ -945,6 +1225,7 @@ export function ConsoleApp() {
   }, [runProjectMutation]);
 
   const protocolDevice = selectedDevice ?? projectData.devices[0];
+  const sidebarUserLabel = session?.userId.slice(0, 8) ?? "User";
 
   if (!session) {
     return (
@@ -1046,7 +1327,14 @@ export function ConsoleApp() {
 
   return (
     <main className="min-h-screen bg-paper pb-20 text-ink lg:flex lg:pb-0">
-      <Sidebar />
+      <Sidebar
+        activeSection={activeSection}
+        orgName={workspace?.org.name ?? "Loading org"}
+        projectName={workspace?.project.name ?? "Loading project"}
+        userLabel={sidebarUserLabel}
+        onNavigate={handleNavigate}
+        onLogout={handleLogout}
+      />
       <div className="min-w-0 flex-1">
         <ProjectHeader
           orgName={workspace?.org.name ?? "Loading org"}
@@ -1056,6 +1344,8 @@ export function ConsoleApp() {
           busy={busy}
           onSearch={setSearch}
           onToggleTheme={handleToggleTheme}
+          onOpenProjects={() => handleNavigate("projects")}
+          onOpenPermissions={() => handleNavigate("permissions")}
           onRefresh={handleRefresh}
           onBootstrapDemo={handleBootstrapDemo}
           onLogout={handleLogout}
@@ -1071,18 +1361,22 @@ export function ConsoleApp() {
             </div>
           ) : null}
 
-          <MetricStrip metrics={metrics} />
+          <div id="fleet" ref={setSectionRef("fleet")} className="scroll-mt-5">
+            <MetricStrip metrics={metrics} />
+          </div>
 
           <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_360px]">
             <div className="min-w-0 space-y-5">
-              <TelemetryPanel
-                values={telemetryValues}
-                streams={streamSummaries}
-                rowRateLabel={`${formatCount(projectData.telemetry.length)} rows`}
-                selectedDeviceName={selectedDeviceRow?.name}
-                busy={busy}
-                onIngestSample={() => handleIngestSample()}
-              />
+              <div id="streams" ref={setSectionRef("streams")} className="scroll-mt-5">
+                <TelemetryPanel
+                  values={telemetryValues}
+                  streams={streamSummaries}
+                  rowRateLabel={`${formatCount(projectData.telemetry.length)} rows`}
+                  selectedDeviceName={selectedDeviceRow?.name}
+                  busy={busy}
+                  onIngestSample={() => handleIngestSample()}
+                />
+              </div>
               <DeviceTable
                 data={filteredDeviceRows}
                 selectedDeviceId={selectedDeviceId}
@@ -1092,67 +1386,93 @@ export function ConsoleApp() {
                 onDownloadDevAuth={handleDownloadDevAuth}
                 onIngestSample={handleIngestSample}
               />
-              <DeviceAgentPanel
-                device={selectedDeviceRow}
-                projectId={workspace?.project.id}
-                devAuthConfig={devAuthConfig}
-                busy={busy}
-                onDownloadDevAuth={() => handleDownloadDevAuth()}
-                onIngestSample={() => handleIngestSample()}
-                onCreateDiagnostics={handleCreateDiagnostics}
-                onCreateOta={handleCreateOta}
-              />
+              <div id="firmware" ref={setSectionRef("firmware")} className="scroll-mt-5">
+                <DeviceAgentPanel
+                  device={selectedDeviceRow}
+                  projectId={workspace?.project.id}
+                  devAuthConfig={devAuthConfig}
+                  busy={busy}
+                  onDownloadDevAuth={() => handleDownloadDevAuth()}
+                  onIngestSample={() => handleIngestSample()}
+                  onCreateDiagnostics={handleCreateDiagnostics}
+                  onCreateOta={handleCreateOta}
+                />
+              </div>
             </div>
 
             <aside className="min-w-0 space-y-5">
-              <ActionQueuePanel
-                actions={actionSummaries}
-                busy={busy}
-                canRunDeviceAction={Boolean(selectedDeviceId)}
-                onCreateDiagnostics={handleCreateDiagnostics}
-                onCreateOta={handleCreateOta}
-                onCompleteLatest={handleCompleteLatest}
-              />
+              <div id="actions" ref={setSectionRef("actions")} className="scroll-mt-5">
+                <ActionQueuePanel
+                  actions={actionSummaries}
+                  busy={busy}
+                  canRunDeviceAction={Boolean(selectedDeviceId)}
+                  onCreateDiagnostics={handleCreateDiagnostics}
+                  onCreateOta={handleCreateOta}
+                  onCompleteLatest={handleCompleteLatest}
+                />
+              </div>
               <AlertPanel rules={alertSummaries} busy={busy} onCreateDefault={handleCreateDefaultAlert} />
-              <section className="panel-in rounded-md border border-line bg-rail p-4 text-ink">
-                <h2 className="text-base font-semibold">Protocol</h2>
-                <div className="mt-3 space-y-3 text-xs text-muted">
-                  {protocolDevice && workspace ? (
-                    [
-                      ["telemetry publish", telemetryTopic(workspace.project.id, protocolDevice.id, SYSTEM_STREAM)],
-                      ["shadow publish", shadowTopic(workspace.project.id, protocolDevice.id)],
-                      ["commands subscribe", commandTopic(workspace.project.id, protocolDevice.id)],
-                      ["command status", commandStatusTopic(workspace.project.id, protocolDevice.id)],
-                    ].map(([label, topic]) => (
-                      <div key={label}>
-                        <p className="mb-1 text-faint">{label}</p>
-                        <code className="block break-all rounded-sm bg-elevated p-2 text-ink">{topic}</code>
-                      </div>
-                    ))
-                  ) : (
-                    <p className="text-muted">No device selected.</p>
-                  )}
-                </div>
-              </section>
-              <section className="panel-in rounded-md border border-line bg-panel">
-                <div className="border-b border-line px-4 py-3">
-                  <h2 className="text-base font-semibold text-ink">Audit</h2>
-                  <p className="text-sm text-muted">Recent scoped control-plane writes.</p>
-                </div>
-                <div className="divide-y divide-line">
-                  {projectData.audit.slice(0, 6).map((entry) => (
-                    <article key={entry.id} className="px-4 py-3">
-                      <p className="truncate text-sm font-medium text-ink">{entry.action}</p>
-                      <p className="truncate text-xs text-faint">{entry.resource}</p>
-                    </article>
-                  ))}
-                  {projectData.audit.length === 0 ? (
-                    <div className="px-4 py-6 text-center text-sm text-muted">No audit entries yet.</div>
-                  ) : null}
-                </div>
-              </section>
+              <div id="security" ref={setSectionRef("security")} className="scroll-mt-5 space-y-5">
+                <section className="panel-in rounded-md border border-line bg-rail p-4 text-ink">
+                  <h2 className="text-base font-semibold">Protocol</h2>
+                  <div className="mt-3 space-y-3 text-xs text-muted">
+                    {protocolDevice && workspace ? (
+                      [
+                        ["telemetry publish", telemetryTopic(workspace.project.id, protocolDevice.id, SYSTEM_STREAM)],
+                        ["shadow publish", shadowTopic(workspace.project.id, protocolDevice.id)],
+                        ["commands subscribe", commandTopic(workspace.project.id, protocolDevice.id)],
+                        ["command status", commandStatusTopic(workspace.project.id, protocolDevice.id)],
+                      ].map(([label, topic]) => (
+                        <div key={label}>
+                          <p className="mb-1 text-faint">{label}</p>
+                          <code className="block break-all rounded-sm bg-elevated p-2 text-ink">{topic}</code>
+                        </div>
+                      ))
+                    ) : (
+                      <p className="text-muted">No device selected.</p>
+                    )}
+                  </div>
+                </section>
+                <section className="panel-in rounded-md border border-line bg-panel">
+                  <div className="border-b border-line px-4 py-3">
+                    <h2 className="text-base font-semibold text-ink">Audit</h2>
+                    <p className="text-sm text-muted">Recent scoped control-plane writes.</p>
+                  </div>
+                  <div className="divide-y divide-line">
+                    {projectData.audit.slice(0, 6).map((entry) => (
+                      <article key={entry.id} className="px-4 py-3">
+                        <p className="truncate text-sm font-medium text-ink">{entry.action}</p>
+                        <p className="truncate text-xs text-faint">{entry.resource}</p>
+                      </article>
+                    ))}
+                    {projectData.audit.length === 0 ? (
+                      <div className="px-4 py-6 text-center text-sm text-muted">No audit entries yet.</div>
+                    ) : null}
+                  </div>
+                </section>
+              </div>
             </aside>
           </div>
+          {workspace ? (
+            <WorkspaceManagement
+              currentOrg={workspace.org}
+              currentProject={workspace.project}
+              orgs={orgs}
+              projects={projects}
+              apiKeys={apiKeys}
+              apiKeyError={apiKeyError}
+              audit={projectData.audit}
+              createdApiKey={createdApiKey}
+              busy={busy}
+              setSectionRef={setManagementSectionRef}
+              onCreateOrg={handleCreateOrg}
+              onSelectOrg={handleSelectOrg}
+              onCreateProject={handleCreateProject}
+              onSelectProject={handleSelectProject}
+              onCreateApiKey={handleCreateApiKey}
+              onRevokeApiKey={handleRevokeApiKey}
+            />
+          ) : null}
         </div>
       </div>
     </main>
