@@ -14,6 +14,7 @@ chrono.workspace = true
 excalibur-device-protocol = { path = "../../crates/device-protocol" }
 excalibur-domain = { path = "../../crates/domain" }
 excalibur-nats-lite = { path = "../../crates/nats-lite" }
+excalibur-object-storage = { path = "../../crates/object-storage" }
 excalibur-storage = { path = "../../crates/storage" }
 rumqttd = { workspace = true, optional = true, features = ["verify-client-cert"] }
 serde_json.workspace = true

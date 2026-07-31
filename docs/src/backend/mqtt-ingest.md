@@ -54,6 +54,12 @@ make mqtt
 | `MQTT_TELEMETRY_NATS_STREAM` | `EXCALIBUR_TELEMETRY` | JetStream stream name。 |
 | `MQTT_COMMAND_BRIDGE` | `auto` | `auto`/`disabled`/`nats`；有 NATS 时订阅 command bus 并发布到本地 broker。 |
 | `MQTT_COMMAND_NATS_SUBJECT` | `excalibur.commands.dispatch` | worker action dispatcher 发布的 command envelope subject。 |
+| `MQTT_COMMAND_NATS_STREAM` | `EXCALIBUR_COMMANDS` | command bridge 使用的 JetStream stream name。 |
+| `MQTT_COMMAND_DELIVERY_SUBJECT` | `excalibur.commands.deliver` | command bridge durable push consumer delivery subject。 |
+| `MQTT_COMMAND_DURABLE` | `excalibur-mqtt-command-bridge` | command bridge durable consumer name。 |
+| `MQTT_COMMAND_QUEUE_GROUP` | 同 `MQTT_COMMAND_DURABLE` | command bridge queue group。 |
+| `MQTT_COMMAND_DEAD_LETTER_SUBJECT` | `excalibur.commands.dead_letter` | invalid command envelope dead-letter subject。 |
+| `MQTT_COMMAND_DOWNLOAD_URL_TTL_SECONDS` | `900` | `ota.install` publish 到 MQTT broker 前即时签发 download URL 的 TTL。 |
 | `STORAGE_BACKEND` | 根据 `DATABASE_URL` 自动选择 | `DATABASE_URL` 存在时默认 `timescale`，否则 `memory`。 |
 | `DATABASE_URL` | 无 | SQL-backed ingest 的 TimescaleDB DSN。 |
 | `NATS_URL` | 无 | NATS DSN。 |
@@ -67,6 +73,8 @@ v1/p/+/d/+/commands/status
 ```
 
 当前 runtime 能让真实 MQTT publish 进入 Store 或 JetStream，并能把 worker command envelope 转发到设备 commands topic。仓库通过本地 vendored rumqttd patch 在 `Forward` 中携带 source client id，并新增 publish/subscribe authorization hook、publish ack gate、effective ClientId 传递和 TLS peer fingerprint 传递；因此开启 `MQTT_REQUIRE_CERT_FINGERPRINT_USERNAME=true` 时，cross-device/cross-project publish 和 commands subscribe 会按连接身份拒绝。NATS telemetry buffer 模式下，远端 telemetry publish 会先完成 topic/payload 校验和 JetStream PubAck，再交给 router 生成 MQTT QoS1 PUBACK；失败时 publish 不会被 router ack。
+
+NATS command bridge 模式下，mqtt-ingest 会幂等确保 `EXCALIBUR_COMMANDS` stream 和 durable push consumer。worker 先把 reference-only command envelope 写入 JetStream；bridge 从 delivery subject 消费，发布前确认 action target 仍是 `Running`。`ota.install` 会在 bridge 发布到本地 broker 前即时查 firmware metadata 并签发短 TTL download URL，因此 action DB 和 JetStream command stream 不持久化 signed URL。只有成功发布到本地 MQTT broker 后才 ack JetStream message；已取消/超时的 stale command 会直接 ack 丢弃；无效 command envelope 或永久无效 OTA metadata 会写入 dead-letter subject 后 ack，避免 poison message 阻塞；MQTT publish 失败不会 ack，等待 JetStream redelivery。
 
 ## Publish ACL
 

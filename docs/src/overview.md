@@ -10,8 +10,8 @@ Excalibur 的目标是复刻 Bytebeam 类物联网平台的核心能力，但不
 | 设备 mTLS | 设备用证书连接 MQTT broker，证书 fingerprint 与 device/project 绑定。 | CSR/dev-auth 已签发真实证书并持久化 fingerprint；runtime 支持 TLS listener、peer cert fingerprint 身份校验、publish/subscribe ACL；username-as-fingerprint 仅作显式 dev 过渡。 |
 | Telemetry Streams | 设备按 stream 批量发布 JSON array，TimescaleDB hypertable 存储。 | 协议解析、JetStream ingest buffer、远端 publish durable ack gate、worker batch writer、Timescale migration 和 SQL repository 写入/查询已实现；高吞吐 COPY writer 和本地 disk outbox 待生产化。 |
 | Device Shadow | 设备发布最新 shadow object，控制面维护 latest shadow。 | topic、agent serializer、API/mqtt ingest update 已有。 |
-| Actions/Commands | 控制面创建 action，dispatcher 下发 command，设备回传状态。 | action 模型、payload 校验、status ingest、worker dispatcher、NATS command bus 和 MQTT command bridge 已接入。 |
-| OTA | 固件 artifact 保存在对象存储，`ota.install` command 下发 signed URL 和校验信息。 | payload 类型、agent 下载校验、firmware metadata、signed upload/download URL、finalize 校验、rollout cohort、approval/retry/cancel/timeout 状态转换已接入；完整 rollback 自动化待实现。 |
+| Actions/Commands | 控制面创建 action，dispatcher 下发 command，设备回传状态。 | action 模型、payload 校验、status ingest、worker JetStream dispatcher、durable command bus 和 MQTT command bridge ack/dead-letter 已接入。 |
+| OTA | 固件 artifact 保存在对象存储，`ota.install` command 下发 signed URL 和校验信息。 | payload 类型、agent 下载校验、firmware metadata、signed upload/download URL、finalize 校验、rollout cohort、approval/retry/cancel/timeout 状态转换已接入；action payload 和 JetStream command stream 持久化 firmware reference，mqtt-ingest bridge 发布前即时签发 download URL；完整 rollback 自动化和对象 HEAD verify 待实现。 |
 | Alerts | offline、threshold、window aggregation 规则。 | alert rule API、worker 扫描、firing/resolved event 去重恢复和 notification attempt 计数已接入；真实 email/webhook provider 待实现。 |
 | Diagnostics | 日志、system stats、文件采集、导出。 | diagnostics session、短 TTL upload/download URL、object finalize、action dispatch 和 audit 已接入；retention/lifecycle policy 待实现。 |
 | Remote Shell | 高风险 beta 能力，必须 RBAC、短时授权、审计和 feature flag。 | agent 保留 gated 代码；API 默认拒绝 `remote_shell.open`。 |

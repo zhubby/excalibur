@@ -830,6 +830,7 @@ dependencies = [
  "chrono",
  "excalibur-device-protocol",
  "excalibur-domain",
+ "excalibur-object-storage",
  "excalibur-storage",
  "futures-util",
  "password-hash",
@@ -881,6 +882,7 @@ dependencies = [
  "excalibur-device-protocol",
  "excalibur-domain",
  "excalibur-nats-lite",
+ "excalibur-object-storage",
  "excalibur-storage",
  "rumqttd",
  "serde_json",
@@ -899,6 +901,17 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "excalibur-object-storage"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "ring 0.17.14",
+ "sha2",
+ "thiserror 2.0.19",
+ "url",
 ]
 
 [[package]]

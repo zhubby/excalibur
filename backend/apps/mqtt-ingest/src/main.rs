@@ -11,15 +11,16 @@ use anyhow::{Context, bail};
 #[cfg(test)]
 use chrono::Utc;
 use excalibur_device_protocol::{
-    DeviceCommandEnvelope, PublishTopic, TelemetryIngestEnvelope, commands_topic,
-    parse_publish_topic,
+    DeviceCommand, DeviceCommandEnvelope, OtaInstallPayload, PublishTopic, TelemetryIngestEnvelope,
+    commands_topic, parse_publish_topic,
 };
-use excalibur_domain::{DeviceStatus, Id};
+use excalibur_domain::{ActionState, DeviceStatus, FirmwareArtifact, Id};
 use excalibur_mqtt_ingest::{
     AuthenticatedDevice, authenticate_device_certificate_fingerprint, ingest_publish,
     telemetry_envelope_from_publish,
 };
-use excalibur_nats_lite::NatsClient;
+use excalibur_nats_lite::{NatsClient, NatsMessage};
+use excalibur_object_storage::{ObjectStorageConfig, presigned_object_key_url};
 use excalibur_storage::{PgStore, Store};
 use rumqttd::{
     Broker, Config, ConnectionSettings, Notification, RouterConfig, ServerSettings, TlsConfig,
@@ -80,7 +81,20 @@ enum TelemetryBufferConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CommandBridgeConfig {
     Disabled,
-    Nats { url: String, subject: String },
+    Nats(Box<NatsCommandBridgeConfig>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NatsCommandBridgeConfig {
+    url: String,
+    subject: String,
+    stream: String,
+    delivery_subject: String,
+    durable_name: String,
+    queue_group: String,
+    dead_letter_subject: String,
+    download_url_ttl_seconds: i64,
+    object_storage: ObjectStorageConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -157,7 +171,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let _broker_thread = start_broker_thread(broker);
-    let command_bridge_task = start_command_bridge_task(link_tx, runtime.command_bridge.clone());
+    let command_bridge_task =
+        start_command_bridge_task(link_tx, store.clone(), runtime.command_bridge.clone());
     info!(
         listen = %runtime.listen,
         filters = ?INGEST_FILTERS,
@@ -459,26 +474,32 @@ async fn verify_telemetry_stream_subject(
 
 fn start_command_bridge_task(
     link_tx: rumqttd::local::LinkTx,
+    store: Store,
     command_bridge: CommandBridgeConfig,
 ) -> Option<tokio::task::JoinHandle<anyhow::Result<()>>> {
-    let CommandBridgeConfig::Nats { url, subject } = command_bridge else {
+    let CommandBridgeConfig::Nats(config) = command_bridge else {
         info!("MQTT command bridge disabled");
         return None;
     };
     Some(tokio::spawn(async move {
-        run_command_bridge_loop(link_tx, url, subject).await
+        run_command_bridge_loop(link_tx, store, *config).await
     }))
 }
 
 async fn run_command_bridge_loop(
     mut link_tx: rumqttd::local::LinkTx,
-    nats_url: String,
-    subject: String,
+    store: Store,
+    config: NatsCommandBridgeConfig,
 ) -> anyhow::Result<()> {
     loop {
-        if let Err(error) = run_command_bridge_subscription(&mut link_tx, &nats_url, &subject).await
-        {
-            warn!(%error, subject, "MQTT command bridge disconnected; retrying");
+        if let Err(error) = run_command_bridge_subscription(&mut link_tx, &store, &config).await {
+            warn!(
+                %error,
+                subject = %config.subject,
+                delivery_subject = %config.delivery_subject,
+                durable = %config.durable_name,
+                "MQTT command bridge disconnected; retrying"
+            );
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
     }
@@ -486,42 +507,488 @@ async fn run_command_bridge_loop(
 
 async fn run_command_bridge_subscription(
     link_tx: &mut rumqttd::local::LinkTx,
-    nats_url: &str,
-    subject: &str,
+    store: &Store,
+    config: &NatsCommandBridgeConfig,
 ) -> anyhow::Result<()> {
-    let client = NatsClient::new(nats_url, "excalibur-mqtt-command-bridge")?;
+    let client = NatsClient::new(&config.url, "excalibur-mqtt-command-bridge")?;
+    ensure_command_bridge_stream(&client, config).await?;
+    ensure_command_bridge_consumer(&client, config).await?;
     let mut subscription = client
-        .subscribe(subject, None)
+        .subscribe(&config.delivery_subject, Some(&config.queue_group))
         .await
-        .with_context(|| format!("failed to subscribe command bridge to {subject}"))?;
-    info!(subject, "MQTT command bridge ready");
+        .with_context(|| {
+            format!(
+                "failed to subscribe command bridge to {}",
+                config.delivery_subject
+            )
+        })?;
+    info!(
+        subject = %config.subject,
+        stream = %config.stream,
+        delivery_subject = %config.delivery_subject,
+        durable = %config.durable_name,
+        queue = %config.queue_group,
+        "MQTT command bridge ready"
+    );
 
     loop {
         let message = subscription.next_message().await?;
-        match mqtt_command_publish_from_nats_payload(&message.payload) {
-            Ok((topic, payload)) => {
-                link_tx
-                    .publish(topic.clone(), payload)
-                    .with_context(|| format!("failed to publish command to MQTT topic {topic}"))?;
-                info!(%topic, "published action command to MQTT broker");
-            }
-            Err(error) => {
-                warn!(%error, "dropping invalid command bridge message");
-            }
-        }
+        handle_command_bridge_message(link_tx, store, &client, config, message).await?;
     }
 }
 
-fn mqtt_command_publish_from_nats_payload(payload: &[u8]) -> anyhow::Result<(String, Vec<u8>)> {
+async fn ensure_command_bridge_stream(
+    client: &NatsClient,
+    config: &NatsCommandBridgeConfig,
+) -> anyhow::Result<()> {
+    let payload = json!({
+        "name": config.stream,
+        "subjects": [config.subject, config.dead_letter_subject],
+        "retention": "limits",
+        "storage": "file",
+        "discard": "old",
+        "max_msgs": -1,
+        "max_bytes": -1,
+        "max_age": 0,
+        "max_msg_size": -1
+    });
+    let response = client
+        .request(
+            &format!("$JS.API.STREAM.CREATE.{}", config.stream),
+            payload.to_string().as_bytes(),
+            Duration::from_secs(5),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "failed to ensure JetStream command stream {}",
+                config.stream
+            )
+        })?;
+    let response_json = serde_json::from_slice::<Value>(&response.payload)
+        .context("JetStream command stream create response was not JSON")?;
+    if let Some(error) = response_json.get("error") {
+        let description = error
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown JetStream error");
+        if !description.contains("already in use") && !description.contains("already exists") {
+            bail!("JetStream command stream create failed: {description}");
+        }
+    }
+    verify_jetstream_stream_subjects(
+        client,
+        &config.stream,
+        &[&config.subject, &config.dead_letter_subject],
+    )
+    .await?;
+    Ok(())
+}
+
+async fn ensure_command_bridge_consumer(
+    client: &NatsClient,
+    config: &NatsCommandBridgeConfig,
+) -> anyhow::Result<()> {
+    let payload = json!({
+        "stream_name": config.stream,
+        "config": {
+            "durable_name": config.durable_name,
+            "deliver_subject": config.delivery_subject,
+            "deliver_group": config.queue_group,
+            "filter_subject": config.subject,
+            "deliver_policy": "all",
+            "ack_policy": "explicit",
+            "max_ack_pending": 1024,
+        }
+    });
+    let response = client
+        .request(
+            &format!(
+                "$JS.API.CONSUMER.DURABLE.CREATE.{}.{}",
+                config.stream, config.durable_name
+            ),
+            payload.to_string().as_bytes(),
+            Duration::from_secs(5),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "failed to ensure JetStream command consumer {} on {}",
+                config.durable_name, config.stream
+            )
+        })?;
+    let response_json = serde_json::from_slice::<Value>(&response.payload)
+        .context("JetStream command consumer create response was not JSON")?;
+    if let Some(error) = response_json.get("error") {
+        let description = error
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown JetStream error");
+        let already_exists =
+            description.contains("already in use") || description.contains("already exists");
+        if !already_exists {
+            bail!("JetStream command consumer create failed: {description}");
+        }
+    }
+    verify_command_bridge_consumer_config(client, config).await?;
+    Ok(())
+}
+
+async fn verify_command_bridge_consumer_config(
+    client: &NatsClient,
+    config: &NatsCommandBridgeConfig,
+) -> anyhow::Result<()> {
+    let response = client
+        .request(
+            &format!(
+                "$JS.API.CONSUMER.INFO.{}.{}",
+                config.stream, config.durable_name
+            ),
+            b"{}",
+            Duration::from_secs(5),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "failed to read JetStream command consumer info for {} on {}",
+                config.durable_name, config.stream
+            )
+        })?;
+    let response_json = serde_json::from_slice::<Value>(&response.payload)
+        .context("JetStream command consumer info response was not JSON")?;
+    fail_on_jetstream_error(&response_json, "command consumer info")?;
+    let consumer_config = response_json
+        .get("config")
+        .ok_or_else(|| anyhow::anyhow!("JetStream command consumer info missing config"))?;
+    validate_command_consumer_config_fields(consumer_config, config)
+}
+
+fn validate_command_consumer_config_fields(
+    consumer_config: &Value,
+    config: &NatsCommandBridgeConfig,
+) -> anyhow::Result<()> {
+    let expected = [
+        ("durable_name", config.durable_name.as_str()),
+        ("deliver_subject", config.delivery_subject.as_str()),
+        ("deliver_group", config.queue_group.as_str()),
+        ("filter_subject", config.subject.as_str()),
+    ];
+    for (field, expected_value) in expected {
+        let actual = consumer_config
+            .get(field)
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("JetStream command consumer missing {field}"))?;
+        if actual != expected_value {
+            bail!(
+                "JetStream command consumer {field} mismatch: expected {expected_value}, got {actual}"
+            );
+        }
+    }
+    let ack_policy = consumer_config.get("ack_policy");
+    let explicit_ack = ack_policy
+        .and_then(Value::as_str)
+        .is_some_and(|value| value == "explicit")
+        || ack_policy
+            .and_then(Value::as_i64)
+            .is_some_and(|value| value == 2);
+    if !explicit_ack {
+        bail!("JetStream command consumer ack_policy mismatch: expected explicit");
+    }
+    Ok(())
+}
+
+async fn verify_jetstream_stream_subjects(
+    client: &NatsClient,
+    stream: &str,
+    expected_subjects: &[&str],
+) -> anyhow::Result<()> {
+    let response = client
+        .request(
+            &format!("$JS.API.STREAM.INFO.{stream}"),
+            b"{}",
+            Duration::from_secs(5),
+        )
+        .await
+        .with_context(|| format!("failed to read JetStream stream info for {stream}"))?;
+    let response_json = serde_json::from_slice::<Value>(&response.payload)
+        .context("JetStream stream info response was not JSON")?;
+    fail_on_jetstream_error(&response_json, "stream info")?;
+    let subjects = response_json
+        .pointer("/config/subjects")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("JetStream stream info missing config.subjects"))?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    for expected in expected_subjects {
+        if !subjects.iter().any(|subject| subject == expected) {
+            bail!("JetStream stream {stream} is missing expected subject {expected}");
+        }
+    }
+    Ok(())
+}
+
+fn fail_on_jetstream_error(value: &Value, context: &str) -> anyhow::Result<()> {
+    if let Some(error) = value.get("error") {
+        let description = error
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown JetStream error");
+        bail!("JetStream {context} failed: {description}");
+    }
+    Ok(())
+}
+
+async fn handle_command_bridge_message(
+    link_tx: &mut rumqttd::local::LinkTx,
+    store: &Store,
+    client: &NatsClient,
+    config: &NatsCommandBridgeConfig,
+    message: NatsMessage,
+) -> anyhow::Result<()> {
+    let ack_subject = message
+        .reply
+        .as_deref()
+        .context("JetStream command delivery is missing ack subject")?;
+    let envelope = match decode_command_bridge_envelope(&message.payload) {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            warn!(%error, "dead-lettering invalid command bridge envelope");
+            publish_command_dead_letter(client, config, &message.payload).await?;
+            client
+                .ack(ack_subject)
+                .await
+                .context("failed to ack invalid command bridge message")?;
+            return Ok(());
+        }
+    };
+    let current_state = command_bridge_envelope_state(store, &envelope).await?;
+    if current_state != ActionState::Running {
+        client
+            .ack(ack_subject)
+            .await
+            .context("failed to ack stale command bridge message")?;
+        info!(
+            action_id = %envelope.command.action_id,
+            device_id = %envelope.device_id,
+            state = ?current_state,
+            "acked stale action command without MQTT publish"
+        );
+        return Ok(());
+    }
+
+    match mqtt_command_publish_from_envelope(store, config, envelope).await {
+        Ok((topic, payload)) => {
+            link_tx
+                .publish(topic.clone(), payload)
+                .with_context(|| format!("failed to publish command to MQTT topic {topic}"))?;
+            client
+                .ack(ack_subject)
+                .await
+                .context("failed to ack command bridge message")?;
+            info!(%topic, "published and acked action command to MQTT broker");
+        }
+        Err(CommandPayloadError::Permanent(error)) => {
+            warn!(%error, "dead-lettering invalid command bridge payload");
+            publish_command_dead_letter(client, config, &message.payload).await?;
+            client
+                .ack(ack_subject)
+                .await
+                .context("failed to ack invalid command bridge payload")?;
+        }
+        Err(CommandPayloadError::Transient(error)) => return Err(error),
+    }
+    Ok(())
+}
+
+async fn command_bridge_envelope_state(
+    store: &Store,
+    envelope: &DeviceCommandEnvelope,
+) -> anyhow::Result<ActionState> {
+    store
+        .get_action_target_state(
+            envelope.project_id,
+            envelope.command.action_id,
+            envelope.device_id,
+        )
+        .await
+        .context("failed to read action target state before MQTT command publish")
+}
+
+async fn publish_command_dead_letter(
+    client: &NatsClient,
+    config: &NatsCommandBridgeConfig,
+    payload: &[u8],
+) -> anyhow::Result<()> {
+    let ack = client
+        .publish_jetstream(&config.dead_letter_subject, payload, Duration::from_secs(5))
+        .await
+        .with_context(|| {
+            format!(
+                "failed to publish command dead-letter to {}",
+                config.dead_letter_subject
+            )
+        })?;
+    if ack.stream != config.stream {
+        bail!(
+            "JetStream command dead-letter ack stream mismatch: expected {}, got {}",
+            config.stream,
+            ack.stream
+        );
+    }
+    Ok(())
+}
+
+fn decode_command_bridge_envelope(payload: &[u8]) -> anyhow::Result<DeviceCommandEnvelope> {
     let envelope = serde_json::from_slice::<DeviceCommandEnvelope>(payload)
         .context("command bridge payload is not a DeviceCommandEnvelope")?;
     let expected_topic = commands_topic(envelope.project_id, envelope.device_id);
     if envelope.topic != expected_topic {
         bail!("command envelope topic does not match project/device identity");
     }
-    let payload =
-        serde_json::to_vec(&envelope.command).context("failed to encode device command payload")?;
+    Ok(envelope)
+}
+
+#[derive(Debug)]
+enum CommandPayloadError {
+    Permanent(anyhow::Error),
+    Transient(anyhow::Error),
+}
+
+async fn mqtt_command_publish_from_envelope(
+    store: &Store,
+    config: &NatsCommandBridgeConfig,
+    envelope: DeviceCommandEnvelope,
+) -> Result<(String, Vec<u8>), CommandPayloadError> {
+    let command =
+        command_for_bridge_dispatch(store, config, envelope.command, envelope.project_id).await?;
+    let payload = serde_json::to_vec(&command).map_err(|error| {
+        CommandPayloadError::Permanent(
+            anyhow::Error::from(error).context("failed to encode device command payload"),
+        )
+    })?;
     Ok((envelope.topic, payload))
+}
+
+async fn command_for_bridge_dispatch(
+    store: &Store,
+    config: &NatsCommandBridgeConfig,
+    mut command: DeviceCommand,
+    project_id: Id,
+) -> Result<DeviceCommand, CommandPayloadError> {
+    if command.name != "ota.install" {
+        return Ok(command);
+    }
+    command.payload =
+        ota_install_payload_for_bridge_dispatch(store, config, project_id, &command.payload)
+            .await?;
+    Ok(command)
+}
+
+async fn ota_install_payload_for_bridge_dispatch(
+    store: &Store,
+    config: &NatsCommandBridgeConfig,
+    project_id: Id,
+    payload: &Value,
+) -> Result<Value, CommandPayloadError> {
+    let firmware_id = payload
+        .get("firmware_id")
+        .and_then(Value::as_str)
+        .and_then(|value| Id::parse_str(value).ok())
+        .ok_or_else(|| {
+            CommandPayloadError::Permanent(anyhow::anyhow!(
+                "ota.install command payload is missing firmware_id"
+            ))
+        })?;
+    let artifacts = store.list_firmware(project_id).await.map_err(|error| {
+        CommandPayloadError::Transient(
+            anyhow::Error::from(error).context("failed to load firmware for ota.install command"),
+        )
+    })?;
+    let artifact = artifacts
+        .into_iter()
+        .find(|artifact| artifact.id == firmware_id && artifact.active)
+        .ok_or_else(|| {
+            CommandPayloadError::Permanent(anyhow::anyhow!(
+                "firmware not found for ota.install command"
+            ))
+        })?;
+    validate_ota_reference_for_bridge(project_id, payload, &artifact)?;
+    let ttl = chrono::Duration::seconds(config.download_url_ttl_seconds.clamp(60, 3600));
+    let signed_url =
+        presigned_object_key_url(&config.object_storage, &artifact.object_key, "GET", ttl)
+            .map_err(|error| {
+                CommandPayloadError::Transient(
+                    anyhow::Error::from(error)
+                        .context("failed to sign firmware download URL for command bridge"),
+                )
+            })?
+            .url;
+    let payload = OtaInstallPayload {
+        firmware_id: artifact.id,
+        component: artifact.component,
+        version: artifact.version,
+        signed_url,
+        sha256: artifact.sha256,
+        signature: artifact.signature,
+        size_bytes: artifact.size_bytes,
+    };
+    payload.validate().map_err(|error| {
+        CommandPayloadError::Permanent(
+            anyhow::Error::from(error).context("generated ota.install payload is invalid"),
+        )
+    })?;
+    serde_json::to_value(payload).map_err(|error| {
+        CommandPayloadError::Permanent(
+            anyhow::Error::from(error).context("failed to encode ota.install payload"),
+        )
+    })
+}
+
+fn validate_ota_reference_for_bridge(
+    project_id: Id,
+    payload: &Value,
+    artifact: &FirmwareArtifact,
+) -> Result<(), CommandPayloadError> {
+    let expected_prefix = format!("projects/{project_id}/firmware/");
+    if !artifact.object_key.starts_with(&expected_prefix) {
+        return Err(CommandPayloadError::Permanent(anyhow::anyhow!(
+            "firmware object_key must stay under its project prefix"
+        )));
+    }
+    if artifact.verified_at.is_none() {
+        return Err(CommandPayloadError::Permanent(anyhow::anyhow!(
+            "firmware must be finalized before ota.install command dispatch"
+        )));
+    }
+    let expected_signature = serde_json::to_value(&artifact.signature).map_err(|error| {
+        CommandPayloadError::Permanent(
+            anyhow::Error::from(error).context("failed to encode firmware signature"),
+        )
+    })?;
+    let matches = payload
+        .get("component")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value == artifact.component)
+        && payload
+            .get("version")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value == artifact.version)
+        && payload
+            .get("sha256")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value == artifact.sha256)
+        && payload
+            .get("size_bytes")
+            .and_then(Value::as_i64)
+            .is_some_and(|value| value == artifact.size_bytes)
+        && payload.get("signature") == Some(&expected_signature);
+    if !matches {
+        return Err(CommandPayloadError::Permanent(anyhow::anyhow!(
+            "ota.install command payload does not match firmware metadata"
+        )));
+    }
+    Ok(())
 }
 
 async fn authenticated_device_for_forward(
@@ -688,17 +1155,59 @@ fn telemetry_buffer_config_from_env() -> anyhow::Result<TelemetryBufferConfig> {
 fn command_bridge_config_from_env() -> anyhow::Result<CommandBridgeConfig> {
     let subject = std::env::var("MQTT_COMMAND_NATS_SUBJECT")
         .unwrap_or_else(|_| "excalibur.commands.dispatch".to_owned());
+    let stream = std::env::var("MQTT_COMMAND_NATS_STREAM")
+        .unwrap_or_else(|_| "EXCALIBUR_COMMANDS".to_owned());
+    let delivery_subject = std::env::var("MQTT_COMMAND_DELIVERY_SUBJECT")
+        .unwrap_or_else(|_| "excalibur.commands.deliver".to_owned());
+    let durable_name = std::env::var("MQTT_COMMAND_DURABLE")
+        .unwrap_or_else(|_| "excalibur-mqtt-command-bridge".to_owned());
+    let queue_group =
+        std::env::var("MQTT_COMMAND_QUEUE_GROUP").unwrap_or_else(|_| durable_name.clone());
+    let dead_letter_subject = std::env::var("MQTT_COMMAND_DEAD_LETTER_SUBJECT")
+        .unwrap_or_else(|_| "excalibur.commands.dead_letter".to_owned());
+    let download_url_ttl_seconds = parse_env("MQTT_COMMAND_DOWNLOAD_URL_TTL_SECONDS", "900")?;
     match std::env::var("MQTT_COMMAND_BRIDGE")
         .unwrap_or_else(|_| "auto".to_owned())
         .as_str()
     {
         "disabled" => Ok(CommandBridgeConfig::Disabled),
-        "nats" => Ok(CommandBridgeConfig::Nats {
-            url: std::env::var("NATS_URL").context("NATS_URL is required for command bridge")?,
-            subject,
-        }),
+        "nats" => {
+            let object_storage = ObjectStorageConfig::from_env()
+                .context("S3_PUBLIC_ENDPOINT or S3_ENDPOINT is required for MQTT command bridge")?;
+            Ok(CommandBridgeConfig::Nats(Box::new(
+                NatsCommandBridgeConfig {
+                    url: std::env::var("NATS_URL")
+                        .context("NATS_URL is required for command bridge")?,
+                    subject,
+                    stream,
+                    delivery_subject,
+                    durable_name,
+                    queue_group,
+                    dead_letter_subject,
+                    download_url_ttl_seconds,
+                    object_storage,
+                },
+            )))
+        }
         "auto" => match std::env::var("NATS_URL") {
-            Ok(url) => Ok(CommandBridgeConfig::Nats { url, subject }),
+            Ok(url) => {
+                let object_storage = ObjectStorageConfig::from_env().context(
+                    "S3_PUBLIC_ENDPOINT or S3_ENDPOINT is required for MQTT command bridge",
+                )?;
+                Ok(CommandBridgeConfig::Nats(Box::new(
+                    NatsCommandBridgeConfig {
+                        url,
+                        subject,
+                        stream,
+                        delivery_subject,
+                        durable_name,
+                        queue_group,
+                        dead_letter_subject,
+                        download_url_ttl_seconds,
+                        object_storage,
+                    },
+                )))
+            }
             Err(_) => Ok(CommandBridgeConfig::Disabled),
         },
         value => bail!("unsupported MQTT_COMMAND_BRIDGE={value}; expected auto, disabled, or nats"),
@@ -1532,8 +2041,8 @@ mod tests {
         assert!(!auth("missing-peer".to_owned(), fingerprint, String::new(), None,).await);
     }
 
-    #[test]
-    fn command_bridge_publishes_device_command_payload_to_envelope_topic() {
+    #[tokio::test]
+    async fn command_bridge_publishes_device_command_payload_to_envelope_topic() {
         let project_id = Id::now_v7();
         let device_id = Id::now_v7();
         let action_id = Id::now_v7();
@@ -1549,7 +2058,14 @@ mod tests {
         };
         let payload = serde_json::to_vec(&envelope).unwrap();
 
-        let (topic, command_payload) = mqtt_command_publish_from_nats_payload(&payload).unwrap();
+        let decoded_envelope = decode_command_bridge_envelope(&payload).unwrap();
+        let (topic, command_payload) = mqtt_command_publish_from_envelope(
+            &Store::memory(),
+            &test_command_bridge_config(),
+            decoded_envelope,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(topic, commands_topic(project_id, device_id));
         assert_eq!(
@@ -1559,6 +2075,191 @@ mod tests {
                 "name": "diagnostics.collect",
                 "payload": { "paths": ["/var/log"] }
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn command_bridge_signs_ota_url_after_command_stream_delivery() {
+        use excalibur_domain::{Action, FirmwareArtifact, Org, Project, User};
+
+        let store = Store::memory();
+        let user = store
+            .create_user(User::new("bridge-ota@example.com", "Bridge OTA", "hash"))
+            .await
+            .unwrap();
+        let org = store
+            .create_org(Org::new("Bridge OTA Org", "bridge-ota"), user.id)
+            .await
+            .unwrap();
+        let project = store
+            .create_project(Project::new(org.id, "Factory", "factory"))
+            .await
+            .unwrap();
+        let device = store
+            .create_device(excalibur_domain::Device::new(
+                project.id,
+                "press-1",
+                json!({}),
+            ))
+            .await
+            .unwrap();
+        let firmware = store
+            .create_firmware(FirmwareArtifact::new(
+                project.id,
+                "main",
+                "1.0.0",
+                format!("projects/{}/firmware/main.bin", project.id),
+                "a".repeat(64),
+                "application/octet-stream",
+                Some("ed25519:test".to_owned()),
+                1024,
+            ))
+            .await
+            .unwrap();
+        let firmware = store
+            .finalize_firmware(
+                project.id,
+                firmware.id,
+                &"a".repeat(64),
+                1024,
+                Some("ed25519:test"),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        let action = store
+            .create_action(Action::new(
+                project.id,
+                vec![device.id],
+                "ota.install",
+                json!({
+                    "firmware_id": firmware.id,
+                    "component": "main",
+                    "version": "1.0.0",
+                    "sha256": "a".repeat(64),
+                    "signature": "ed25519:test",
+                    "size_bytes": 1024
+                }),
+                Some(user.id),
+            ))
+            .await
+            .unwrap();
+        store.claim_queued_action_targets(1).await.unwrap();
+        let envelope = DeviceCommandEnvelope {
+            project_id: project.id,
+            device_id: device.id,
+            topic: commands_topic(project.id, device.id),
+            command: excalibur_device_protocol::command_for_action(
+                action.id,
+                "ota.install",
+                action.payload.clone(),
+            ),
+        };
+        let payload = serde_json::to_vec(&envelope).unwrap();
+
+        let decoded_envelope = decode_command_bridge_envelope(&payload).unwrap();
+        let (topic, command_payload) = mqtt_command_publish_from_envelope(
+            &store,
+            &test_command_bridge_config(),
+            decoded_envelope,
+        )
+        .await
+        .unwrap();
+        let command = serde_json::from_slice::<DeviceCommand>(&command_payload).unwrap();
+
+        assert_eq!(topic, commands_topic(project.id, device.id));
+        assert!(envelope.command.payload.get("signed_url").is_none());
+        assert_eq!(command.name, "ota.install");
+        assert!(
+            command.payload["signed_url"]
+                .as_str()
+                .unwrap()
+                .contains("X-Amz-Signature=")
+        );
+        assert!(
+            command.payload["signed_url"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("projects/{}/firmware/main.bin", project.id))
+        );
+    }
+
+    #[tokio::test]
+    async fn command_bridge_rejects_cancelled_stale_command_before_publish() {
+        use excalibur_domain::{Action, ActionTargetTransition, Org, Project, User};
+
+        let store = Store::memory();
+        let user = store
+            .create_user(User::new(
+                "bridge-stale@example.com",
+                "Bridge Stale",
+                "hash",
+            ))
+            .await
+            .unwrap();
+        let org = store
+            .create_org(Org::new("Bridge Stale Org", "bridge-stale"), user.id)
+            .await
+            .unwrap();
+        let project = store
+            .create_project(Project::new(org.id, "Factory", "factory"))
+            .await
+            .unwrap();
+        let device = store
+            .create_device(excalibur_domain::Device::new(
+                project.id,
+                "press-1",
+                json!({}),
+            ))
+            .await
+            .unwrap();
+        let action = store
+            .create_action(Action::new(
+                project.id,
+                vec![device.id],
+                "diagnostics.collect",
+                json!({ "paths": ["/var/log"] }),
+                Some(user.id),
+            ))
+            .await
+            .unwrap();
+        store.claim_queued_action_targets(1).await.unwrap();
+        let envelope = DeviceCommandEnvelope {
+            project_id: project.id,
+            device_id: device.id,
+            topic: commands_topic(project.id, device.id),
+            command: excalibur_device_protocol::command_for_action(
+                action.id,
+                "diagnostics.collect",
+                action.payload.clone(),
+            ),
+        };
+        assert_eq!(
+            command_bridge_envelope_state(&store, &envelope)
+                .await
+                .unwrap(),
+            ActionState::Running
+        );
+
+        store
+            .transition_action_targets(ActionTargetTransition {
+                project_id: project.id,
+                action_id: action.id,
+                device_ids: Some(vec![device.id]),
+                allowed_source_states: vec![ActionState::Running],
+                next_state: ActionState::Cancelled,
+                progress: None,
+                errors: Some(vec!["operator cancelled".to_owned()]),
+                ts: Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            command_bridge_envelope_state(&store, &envelope)
+                .await
+                .unwrap(),
+            ActionState::Cancelled
         );
     }
 
@@ -1578,6 +2279,54 @@ mod tests {
         };
         let payload = serde_json::to_vec(&envelope).unwrap();
 
-        assert!(mqtt_command_publish_from_nats_payload(&payload).is_err());
+        assert!(decode_command_bridge_envelope(&payload).is_err());
+    }
+
+    #[test]
+    fn command_bridge_consumer_validation_requires_explicit_ack() {
+        let config = test_command_bridge_config();
+        let consumer_config = json!({
+            "durable_name": config.durable_name,
+            "deliver_subject": config.delivery_subject,
+            "deliver_group": config.queue_group,
+            "filter_subject": config.subject,
+            "ack_policy": "none",
+        });
+
+        let error = validate_command_consumer_config_fields(&consumer_config, &config).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("ack_policy mismatch: expected explicit")
+        );
+    }
+
+    #[test]
+    fn command_bridge_consumer_validation_accepts_numeric_explicit_ack() {
+        let config = test_command_bridge_config();
+        let consumer_config = json!({
+            "durable_name": config.durable_name,
+            "deliver_subject": config.delivery_subject,
+            "deliver_group": config.queue_group,
+            "filter_subject": config.subject,
+            "ack_policy": 2,
+        });
+
+        validate_command_consumer_config_fields(&consumer_config, &config).unwrap();
+    }
+
+    fn test_command_bridge_config() -> NatsCommandBridgeConfig {
+        NatsCommandBridgeConfig {
+            url: "nats://127.0.0.1:4222".to_owned(),
+            subject: "excalibur.commands.dispatch".to_owned(),
+            stream: "EXCALIBUR_COMMANDS".to_owned(),
+            delivery_subject: "excalibur.commands.deliver".to_owned(),
+            durable_name: "excalibur-mqtt-command-bridge".to_owned(),
+            queue_group: "excalibur-mqtt-command-bridge".to_owned(),
+            dead_letter_subject: "excalibur.commands.dead_letter".to_owned(),
+            download_url_ttl_seconds: 900,
+            object_storage: ObjectStorageConfig::development(),
+        }
     }
 }

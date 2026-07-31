@@ -48,12 +48,12 @@ flowchart LR
 
 1. 操作员在 Console 创建 action，例如 `ota.install`。
 2. API 校验 payload，创建 action 记录，写 audit。
-3. dispatcher/worker 读取 queued action target，构造 command envelope。
-4. worker 发布到 NATS command bus，mqtt-ingest command bridge 转发到 `v1/p/{project_id}/d/{device_id}/commands`。
+3. dispatcher/worker 读取 queued action target，构造 reference-only command envelope。
+4. worker 发布到 JetStream durable command bus 并校验 PubAck，mqtt-ingest command bridge durable consumer 确认 action target 仍为 `Running` 后转发到 `v1/p/{project_id}/d/{device_id}/commands`；`ota.install` 在 bridge 发布前用对象存储 metadata 即时签发短 TTL download URL，成功 publish 到本地 broker 后再 ack JetStream message。
 5. `device-agent` 执行 action，向 `commands/status` 发送状态数组。
 6. ingest 更新 action target 和 aggregate action 状态，并通过 SSE 推送进度。
 
-当前仓库已实现 API action 创建、payload 校验、approval/retry/cancel/timeout 状态转换、agent command shape、worker dispatcher、MQTT command bridge 和 status ingest。
+当前仓库已实现 API action 创建、payload 校验、approval/retry/cancel/timeout 状态转换、agent command shape、worker durable dispatcher、MQTT durable command bridge、invalid command dead-letter 和 status ingest。
 
 ## 数据所有权
 

@@ -98,11 +98,23 @@ services:
       STORAGE_BACKEND: timescale
       DATABASE_URL: postgres://excalibur:excalibur@timescaledb:5432/excalibur
       NATS_URL: nats://nats:4222
+      S3_ENDPOINT: http://rustfs:9000
+      S3_PUBLIC_ENDPOINT: http://localhost:9000
+      S3_BUCKET: excalibur
+      S3_REGION: us-east-1
+      S3_ACCESS_KEY_ID: excalibur
+      S3_SECRET_ACCESS_KEY: excalibur-secret
       MQTT_TELEMETRY_BUFFER: nats
       MQTT_TELEMETRY_NATS_SUBJECT: excalibur.telemetry.ingest
       MQTT_TELEMETRY_NATS_STREAM: EXCALIBUR_TELEMETRY
       MQTT_COMMAND_BRIDGE: nats
       MQTT_COMMAND_NATS_SUBJECT: excalibur.commands.dispatch
+      MQTT_COMMAND_NATS_STREAM: EXCALIBUR_COMMANDS
+      MQTT_COMMAND_DELIVERY_SUBJECT: excalibur.commands.deliver
+      MQTT_COMMAND_DURABLE: excalibur-mqtt-command-bridge
+      MQTT_COMMAND_QUEUE_GROUP: excalibur-mqtt-command-bridge
+      MQTT_COMMAND_DEAD_LETTER_SUBJECT: excalibur.commands.dead_letter
+      MQTT_COMMAND_DOWNLOAD_URL_TTL_SECONDS: "900"
       MQTT_REQUIRE_CERT_FINGERPRINT_USERNAME: "true"
       MQTT_ALLOW_PLAINTEXT_FINGERPRINT_AUTH: "true"
     ports:
@@ -131,6 +143,8 @@ services:
       WORKER_TELEMETRY_BATCH_SIZE: "256"
       WORKER_TELEMETRY_BATCH_WINDOW_MS: "1000"
       WORKER_ACTION_COMMAND_SUBJECT: excalibur.commands.dispatch
+      WORKER_ACTION_COMMAND_STREAM: EXCALIBUR_COMMANDS
+      WORKER_ACTION_COMMAND_DEAD_LETTER_SUBJECT: excalibur.commands.dead_letter
       WORKER_ACTION_CLAIM_LIMIT: "100"
       WORKER_ACTION_DISPATCH_INTERVAL_MS: "1000"
       WORKER_ACTION_TIMEOUT_SECONDS: "900"
