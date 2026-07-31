@@ -75,6 +75,7 @@ enum TelemetryBufferConfig {
         url: String,
         subject: String,
         stream: String,
+        dead_letter_subject: String,
     },
 }
 
@@ -112,6 +113,7 @@ enum TelemetrySink {
         client: NatsClient,
         subject: String,
         stream: String,
+        dead_letter_subject: String,
     },
 }
 
@@ -123,10 +125,12 @@ impl TelemetrySink {
                 url,
                 subject,
                 stream,
+                dead_letter_subject,
             } => Ok(Self::Nats {
                 client: NatsClient::new(url, "excalibur-mqtt-ingest")?,
                 subject: subject.clone(),
                 stream: stream.clone(),
+                dead_letter_subject: dead_letter_subject.clone(),
             }),
         }
     }
@@ -367,6 +371,7 @@ async fn publish_telemetry_envelope_to_jetstream(
         client,
         subject,
         stream,
+        ..
     } = telemetry_sink
     else {
         bail!("telemetry JetStream sink is not configured");
@@ -393,13 +398,14 @@ async fn ensure_telemetry_stream(telemetry_sink: &TelemetrySink) -> anyhow::Resu
         client,
         subject,
         stream,
+        dead_letter_subject,
     } = telemetry_sink
     else {
         return Ok(());
     };
     let payload = json!({
         "name": stream,
-        "subjects": [subject],
+        "subjects": [subject, dead_letter_subject],
         "retention": "limits",
         "storage": "file",
         "discard": "old",
@@ -432,43 +438,11 @@ async fn ensure_telemetry_stream(telemetry_sink: &TelemetrySink) -> anyhow::Resu
             bail!("JetStream stream create failed: {description}");
         }
     }
-    verify_telemetry_stream_subject(client, stream, subject).await?;
-    info!(stream, subject, "JetStream telemetry stream ready");
-    Ok(())
-}
-
-async fn verify_telemetry_stream_subject(
-    client: &NatsClient,
-    stream: &str,
-    subject: &str,
-) -> anyhow::Result<()> {
-    let response = client
-        .request(
-            &format!("$JS.API.STREAM.INFO.{stream}"),
-            b"{}",
-            Duration::from_secs(5),
-        )
-        .await
-        .with_context(|| format!("failed to read JetStream stream info for {stream}"))?;
-    let response_json = serde_json::from_slice::<Value>(&response.payload)
-        .context("JetStream stream info response was not JSON")?;
-    if let Some(error) = response_json.get("error") {
-        let description = error
-            .get("description")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown JetStream error");
-        bail!("JetStream stream info failed: {description}");
-    }
-    let subjects = response_json
-        .pointer("/config/subjects")
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow::anyhow!("JetStream stream info missing config.subjects"))?
-        .iter()
-        .filter_map(Value::as_str)
-        .collect::<Vec<_>>();
-    if !subjects.iter().any(|existing| existing == &subject) {
-        bail!("JetStream stream {stream} is missing expected subject {subject}");
-    }
+    verify_jetstream_stream_subjects(client, stream, &[subject, dead_letter_subject]).await?;
+    info!(
+        stream,
+        subject, dead_letter_subject, "JetStream telemetry stream ready"
+    );
     Ok(())
 }
 
@@ -1130,6 +1104,8 @@ fn telemetry_buffer_config_from_env() -> anyhow::Result<TelemetryBufferConfig> {
         .unwrap_or_else(|_| "excalibur.telemetry.ingest".to_owned());
     let stream = std::env::var("MQTT_TELEMETRY_NATS_STREAM")
         .unwrap_or_else(|_| "EXCALIBUR_TELEMETRY".to_owned());
+    let dead_letter_subject = std::env::var("MQTT_TELEMETRY_DEAD_LETTER_SUBJECT")
+        .unwrap_or_else(|_| "excalibur.telemetry.dead_letter".to_owned());
     match std::env::var("MQTT_TELEMETRY_BUFFER")
         .unwrap_or_else(|_| "auto".to_owned())
         .as_str()
@@ -1139,12 +1115,14 @@ fn telemetry_buffer_config_from_env() -> anyhow::Result<TelemetryBufferConfig> {
             url: std::env::var("NATS_URL").context("NATS_URL is required for nats buffer")?,
             subject,
             stream,
+            dead_letter_subject,
         }),
         "auto" => match std::env::var("NATS_URL") {
             Ok(url) => Ok(TelemetryBufferConfig::Nats {
                 url,
                 subject,
                 stream,
+                dead_letter_subject,
             }),
             Err(_) => Ok(TelemetryBufferConfig::Direct),
         },
@@ -1575,6 +1553,7 @@ mod tests {
                 url: "nats://127.0.0.1:4222".to_owned(),
                 subject: "excalibur.telemetry.ingest".to_owned(),
                 stream: "EXCALIBUR_TELEMETRY".to_owned(),
+                dead_letter_subject: "excalibur.telemetry.dead_letter".to_owned(),
             },
             command_bridge: CommandBridgeConfig::Disabled,
             storage: StorageConfig::Memory,
@@ -1583,6 +1562,7 @@ mod tests {
             client: NatsClient::new("nats://127.0.0.1:4222", "ack-gate-config-test").unwrap(),
             subject: "excalibur.telemetry.ingest".to_owned(),
             stream: "EXCALIBUR_TELEMETRY".to_owned(),
+            dead_letter_subject: "excalibur.telemetry.dead_letter".to_owned(),
         };
 
         let config = rumqttd_config(
@@ -1613,6 +1593,7 @@ mod tests {
                 url: "nats://127.0.0.1:4222".to_owned(),
                 subject: "excalibur.telemetry.ingest".to_owned(),
                 stream: "EXCALIBUR_TELEMETRY".to_owned(),
+                dead_letter_subject: "excalibur.telemetry.dead_letter".to_owned(),
             },
             command_bridge: CommandBridgeConfig::Disabled,
             storage: StorageConfig::Memory,
@@ -1621,6 +1602,7 @@ mod tests {
             client: NatsClient::new("nats://127.0.0.1:9", "ack-gate-invalid-topic-test").unwrap(),
             subject: "excalibur.telemetry.ingest".to_owned(),
             stream: "EXCALIBUR_TELEMETRY".to_owned(),
+            dead_letter_subject: "excalibur.telemetry.dead_letter".to_owned(),
         };
 
         let config = rumqttd_config(
@@ -1749,6 +1731,7 @@ mod tests {
             client: NatsClient::new("nats://127.0.0.1:9", "skip-duplicate-test").unwrap(),
             subject: "excalibur.telemetry.ingest".to_owned(),
             stream: "EXCALIBUR_TELEMETRY".to_owned(),
+            dead_letter_subject: "excalibur.telemetry.dead_letter".to_owned(),
         };
 
         let outcome = handle_ingest_publish(
@@ -1806,6 +1789,7 @@ mod tests {
             client: NatsClient::new("nats://127.0.0.1:9", "invalid-payload-test").unwrap(),
             subject: "excalibur.telemetry.ingest".to_owned(),
             stream: "EXCALIBUR_TELEMETRY".to_owned(),
+            dead_letter_subject: "excalibur.telemetry.dead_letter".to_owned(),
         };
 
         let error = durably_accept_remote_publish(
@@ -1841,6 +1825,7 @@ mod tests {
             client: NatsClient::new("nats://127.0.0.1:9", "invalid-topic-test").unwrap(),
             subject: "excalibur.telemetry.ingest".to_owned(),
             stream: "EXCALIBUR_TELEMETRY".to_owned(),
+            dead_letter_subject: "excalibur.telemetry.dead_letter".to_owned(),
         };
 
         let error = durably_accept_remote_publish(
@@ -1869,6 +1854,7 @@ mod tests {
             client: NatsClient::new("nats://127.0.0.1:9", "non-excalibur-topic-test").unwrap(),
             subject: "excalibur.telemetry.ingest".to_owned(),
             stream: "EXCALIBUR_TELEMETRY".to_owned(),
+            dead_letter_subject: "excalibur.telemetry.dead_letter".to_owned(),
         };
 
         let accepted = durably_accept_remote_publish(
@@ -1917,6 +1903,7 @@ mod tests {
             client: NatsClient::new("nats://127.0.0.1:9", "nats-failure-test").unwrap(),
             subject: "excalibur.telemetry.ingest".to_owned(),
             stream: "EXCALIBUR_TELEMETRY".to_owned(),
+            dead_letter_subject: "excalibur.telemetry.dead_letter".to_owned(),
         };
         let payload = serde_json::to_vec(
             &json!([{ "sequence": 1, "timestamp": Utc::now().to_rfc3339(), "value": 24.0 }]),

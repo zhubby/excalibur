@@ -107,6 +107,7 @@ services:
       MQTT_TELEMETRY_BUFFER: nats
       MQTT_TELEMETRY_NATS_SUBJECT: excalibur.telemetry.ingest
       MQTT_TELEMETRY_NATS_STREAM: EXCALIBUR_TELEMETRY
+      MQTT_TELEMETRY_DEAD_LETTER_SUBJECT: excalibur.telemetry.dead_letter
       MQTT_COMMAND_BRIDGE: nats
       MQTT_COMMAND_NATS_SUBJECT: excalibur.commands.dispatch
       MQTT_COMMAND_NATS_STREAM: EXCALIBUR_COMMANDS

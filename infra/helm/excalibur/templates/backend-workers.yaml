@@ -7,6 +7,15 @@
 {{- if ne .Values.env.MQTT_COMMAND_DEAD_LETTER_SUBJECT .Values.env.WORKER_ACTION_COMMAND_DEAD_LETTER_SUBJECT }}
 {{- fail "MQTT_COMMAND_DEAD_LETTER_SUBJECT must match WORKER_ACTION_COMMAND_DEAD_LETTER_SUBJECT" }}
 {{- end }}
+{{- if ne .Values.env.MQTT_TELEMETRY_NATS_SUBJECT .Values.env.WORKER_TELEMETRY_NATS_SUBJECT }}
+{{- fail "MQTT_TELEMETRY_NATS_SUBJECT must match WORKER_TELEMETRY_NATS_SUBJECT" }}
+{{- end }}
+{{- if ne .Values.env.MQTT_TELEMETRY_NATS_STREAM .Values.env.WORKER_TELEMETRY_NATS_STREAM }}
+{{- fail "MQTT_TELEMETRY_NATS_STREAM must match WORKER_TELEMETRY_NATS_STREAM" }}
+{{- end }}
+{{- if ne .Values.env.MQTT_TELEMETRY_DEAD_LETTER_SUBJECT .Values.env.WORKER_TELEMETRY_DEAD_LETTER_SUBJECT }}
+{{- fail "MQTT_TELEMETRY_DEAD_LETTER_SUBJECT must match WORKER_TELEMETRY_DEAD_LETTER_SUBJECT" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -55,6 +64,8 @@ spec:
               value: {{ .Values.env.MQTT_TELEMETRY_NATS_SUBJECT | quote }}
             - name: MQTT_TELEMETRY_NATS_STREAM
               value: {{ .Values.env.MQTT_TELEMETRY_NATS_STREAM | quote }}
+            - name: MQTT_TELEMETRY_DEAD_LETTER_SUBJECT
+              value: {{ .Values.env.MQTT_TELEMETRY_DEAD_LETTER_SUBJECT | quote }}
             - name: MQTT_COMMAND_BRIDGE
               value: {{ .Values.env.MQTT_COMMAND_BRIDGE | quote }}
             - name: MQTT_COMMAND_NATS_SUBJECT

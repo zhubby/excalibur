@@ -74,6 +74,7 @@ docker compose up --build
 | `MQTT_TELEMETRY_BUFFER` | mqtt-ingest | `auto`/`direct`/`nats`，有 NATS 时默认进入 JetStream buffer。 |
 | `MQTT_TELEMETRY_NATS_SUBJECT` | mqtt-ingest | telemetry envelope subject。 |
 | `MQTT_TELEMETRY_NATS_STREAM` | mqtt-ingest | telemetry JetStream stream name。 |
+| `MQTT_TELEMETRY_DEAD_LETTER_SUBJECT` | mqtt-ingest | telemetry JetStream stream 需要包含的 dead-letter subject，需与 worker 配置一致。 |
 | `MQTT_COMMAND_BRIDGE` | mqtt-ingest | `auto`/`disabled`/`nats`，把 worker command bus 转发到 MQTT broker。 |
 | `MQTT_COMMAND_NATS_SUBJECT` | mqtt-ingest | command bridge 订阅 subject。 |
 | `MQTT_COMMAND_NATS_STREAM` | mqtt-ingest | command bridge durable JetStream stream。 |

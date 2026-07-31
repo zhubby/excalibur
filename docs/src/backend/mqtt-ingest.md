@@ -52,6 +52,7 @@ make mqtt
 | `MQTT_TELEMETRY_BUFFER` | `auto` | `auto`/`direct`/`nats`；`auto` 在有 `NATS_URL` 时使用 NATS。 |
 | `MQTT_TELEMETRY_NATS_SUBJECT` | `excalibur.telemetry.ingest` | telemetry envelope publish subject。 |
 | `MQTT_TELEMETRY_NATS_STREAM` | `EXCALIBUR_TELEMETRY` | JetStream stream name。 |
+| `MQTT_TELEMETRY_DEAD_LETTER_SUBJECT` | `excalibur.telemetry.dead_letter` | JetStream stream dead-letter subject，需与 worker telemetry dead-letter subject 一致。 |
 | `MQTT_COMMAND_BRIDGE` | `auto` | `auto`/`disabled`/`nats`；有 NATS 时订阅 command bus 并发布到本地 broker。 |
 | `MQTT_COMMAND_NATS_SUBJECT` | `excalibur.commands.dispatch` | worker action dispatcher 发布的 command envelope subject。 |
 | `MQTT_COMMAND_NATS_STREAM` | `EXCALIBUR_COMMANDS` | command bridge 使用的 JetStream stream name。 |
