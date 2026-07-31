@@ -35,12 +35,12 @@
 
 ## Milestone 3: Telemetry 写入链路
 
-状态：MQTT ingest 可将 telemetry envelope 发布到 NATS-backed JetStream stream；worker 会幂等确保 stream 和 durable push consumer，按 batch 写入 store，并在成功写库后 ack；invalid envelope 会 dead-letter 并 ack。仍需引入官方 `async-nats` 或等价客户端替代当前 raw `nats-lite` MVP，并补 live NATS 集成测试。
+状态：MQTT ingest 可将 telemetry envelope 发布到 NATS-backed JetStream stream；NATS buffer 模式下 rumqttd 远端 publish path 已增加 durable ack gate，telemetry payload 需先拿到 JetStream PubAck 才会交给 router 生成 MQTT QoS1 PUBACK；worker 会幂等确保 stream 和 durable push consumer，按 batch 写入 store，并在成功写库后 ack；invalid envelope 会 dead-letter 并 ack。`nats-lite` 已有 gated live JetStream PubAck 测试；仍需引入官方 `async-nats` 或等价长连接客户端，并补 live MQTT QoS1/outage 集成测试。
 
 目标：
 
-- 将 MQTT QoS1 ACK 与 durable ingest/outbox 绑定，避免 broker ack 后 JetStream/storage 失败导致 telemetry 丢失。
-- 官方 JetStream client 或完整 raw protocol 覆盖。
+- 补本地 disk outbox/resume，覆盖 broker crash、NATS 长时间不可用和重放恢复。
+- 官方 JetStream client 或完整 raw protocol 覆盖，包含 deterministic publish dedupe、长连接 publisher 和熔断。
 - Timescale COPY 或 batch insert。
 - Duplicate sequence 策略。
 - Continuous aggregates。

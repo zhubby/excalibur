@@ -38,11 +38,11 @@ flowchart LR
 1. 设备通过 CSR 或 dev auth JSON 获得 broker、project_id、device_id、CA、device cert 和私钥路径。
 2. `device-agent` 使用 mTLS 连接 MQTT broker。
 3. 设备向 `v1/p/{project_id}/d/{device_id}/telemetry/{stream}` 发布 JSON array。
-4. MQTT runtime 调用 `mqtt-ingest` ingest path；本地 runtime 会按 topic 查 device，生产 hook 还必须确认 topic project/device 与证书身份一致。
-5. ingest 解码 payload，触发 heartbeat；telemetry 可先写入 NATS JetStream，由 worker durable consumer batch 写入 TimescaleDB hypertable。
+4. MQTT runtime 调用 `mqtt-ingest` ingest path；本地 runtime 会按 topic 查 device，生产身份模式要求稳定非空 ClientId，并确认 topic project/device 与证书身份一致。
+5. ingest 解码 payload，触发 heartbeat；telemetry 在 NATS buffer 模式下先拿 JetStream PubAck，再允许 broker ack 设备 publish；随后由 worker durable consumer batch 写入 TimescaleDB hypertable。
 6. Dashboard query 可通过 `/api/v1/telemetry/aggregate` 查询 time range bucket；后续高吞吐场景再补 continuous aggregate 或 cache。
 
-当前仓库已实现第 3 到第 5 步中的本地 rumqttd listener、TLS listener 配置、peer certificate fingerprint 传递、topic parser、payload decoder、连接身份绑定 ACL、JetStream buffer、worker batch writer、内存 store 写入和 SQL repository 写入；高吞吐 COPY writer 仍待生产化。
+当前仓库已实现第 3 到第 5 步中的本地 rumqttd listener、TLS listener 配置、peer certificate fingerprint 传递、topic parser、payload decoder、连接身份绑定 ACL、JetStream buffer、远端 publish durable ack gate、worker batch writer、内存 store 写入和 SQL repository 写入；高吞吐 COPY writer、长连接 JetStream publisher/熔断和本地 disk outbox 仍待生产化。
 
 ## 命令路径
 

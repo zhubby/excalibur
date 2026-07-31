@@ -519,6 +519,7 @@ async fn remote<P: Protocol>(
 
     let dynamic_filters = config.dynamic_filters;
     let publish_auth = config.publish_auth.clone();
+    let publish_ack = config.publish_ack.clone();
     let subscribe_auth = config.subscribe_auth.clone();
 
     let connect_packet = match mqtt_connect(config, &mut network, peer_certificate_fingerprint_sha256).await {
@@ -573,6 +574,7 @@ async fn remote<P: Protocol>(
         connect_packet,
         dynamic_filters,
         publish_auth,
+        publish_ack,
         subscribe_auth,
         assigned_client_id,
     )

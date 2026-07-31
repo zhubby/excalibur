@@ -8,6 +8,7 @@ members = [
   "crates/nats-lite",
   "crates/storage",
 ]
+exclude = ["vendor/rumqttd-0.20.0"]
 resolver = "2"
 
 [workspace.package]

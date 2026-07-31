@@ -9,9 +9,10 @@ This copy is vendored because Excalibur needs broker callbacks that are not expo
 - Exposes source client id on forwarded publish packets so the runtime can bind publish ACLs to the authenticated MQTT connection.
 - Adds subscribe authorization hook for command topic ACL checks.
 - Adds publish authorization hook before routing publish packets.
+- Adds an async publish ack gate before routing inbound publish packets so Excalibur can wait for JetStream durable accept before broker PUBACK. The gate uses the effective ClientId assigned to the router link.
 - Propagates TLS peer certificate fingerprint from the accepted TLS connection into connect auth.
 - Adds `set_auth_handler_with_peer` while preserving the existing auth handler shape.
-- Adds `PeerCertFingerprint` and `PublishAuthHandler` public types.
+- Adds `PeerCertFingerprint`, `PublishAuthHandler`, and `PublishAckHandler` public types.
 
 ## Files Touched
 

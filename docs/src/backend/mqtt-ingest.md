@@ -25,7 +25,7 @@ pub struct AuthenticatedDevice {
 }
 ```
 
-本地 runtime 默认仍可在 dev 模式下从 topic 中解析 `(project_id, device_id)`。开启 `MQTT_REQUIRE_CERT_FINGERPRINT_USERNAME=true` 后，runtime 会把 certificate fingerprint 查询为 active device，记录 `client_id -> device identity`，再用 vendored rumqttd patch 暴露的 source client id 校验 publish/subscribe topic。TLS listener 可直接从 peer certificate DER 计算 fingerprint；本地明文 dev 模式可显式允许 username-as-fingerprint 过渡。Telemetry 可直接写 Store，也可先发布为 NATS JetStream envelope。
+本地 runtime 默认仍可在 dev 模式下从 topic 中解析 `(project_id, device_id)`。开启 `MQTT_REQUIRE_CERT_FINGERPRINT_USERNAME=true` 后，runtime 要求设备使用稳定非空 ClientId，并会把 certificate fingerprint 查询为 active device，记录 `client_id -> device identity`，再用 vendored rumqttd patch 暴露的 source client id 校验 publish/subscribe topic。TLS listener 可直接从 peer certificate DER 计算 fingerprint；本地明文 dev 模式可显式允许 username-as-fingerprint 过渡。Telemetry 可直接写 Store，也可先发布为 NATS JetStream envelope。
 
 ## 本地 runtime
 
@@ -66,7 +66,7 @@ v1/p/+/d/+/shadow
 v1/p/+/d/+/commands/status
 ```
 
-当前 runtime 能让真实 MQTT publish 进入 Store 或 JetStream，并能把 worker command envelope 转发到设备 commands topic。仓库通过本地 vendored rumqttd patch 在 `Forward` 中携带 source client id，并新增 publish/subscribe authorization hook 和 TLS peer fingerprint 传递；因此开启 `MQTT_REQUIRE_CERT_FINGERPRINT_USERNAME=true` 时，cross-device/cross-project publish 和 commands subscribe 会按连接身份拒绝。
+当前 runtime 能让真实 MQTT publish 进入 Store 或 JetStream，并能把 worker command envelope 转发到设备 commands topic。仓库通过本地 vendored rumqttd patch 在 `Forward` 中携带 source client id，并新增 publish/subscribe authorization hook、publish ack gate、effective ClientId 传递和 TLS peer fingerprint 传递；因此开启 `MQTT_REQUIRE_CERT_FINGERPRINT_USERNAME=true` 时，cross-device/cross-project publish 和 commands subscribe 会按连接身份拒绝。NATS telemetry buffer 模式下，远端 telemetry publish 会先完成 topic/payload 校验和 JetStream PubAck，再交给 router 生成 MQTT QoS1 PUBACK；失败时 publish 不会被 router ack。
 
 ## Publish ACL
 
@@ -110,9 +110,9 @@ Telemetry record 支持两种 timestamp：
 当前实现：
 
 1. TLS listener 支持 CA trust、server cert 和 server key 配置。
-2. connect auth handler 会用 TLS peer certificate fingerprint 查询 active certificate；明文 dev 模式只有显式开启 `MQTT_ALLOW_PLAINTEXT_FINGERPRINT_AUTH` 时才接受 username fingerprint。
+2. connect auth handler 要求稳定非空 ClientId，并会用 TLS peer certificate fingerprint 查询 active certificate；明文 dev 模式只有显式开启 `MQTT_ALLOW_PLAINTEXT_FINGERPRINT_AUTH` 时才接受 username fingerprint。
 3. runtime 维护 `client_id -> (project_id, device_id)` 连接身份，并在 publish 路径调用 `authorize_publish`。
-4. vendored rumqttd patch 新增 publish/subscribe authorization hook，commands topic 订阅会调用 `authorize_subscribe`。
+4. vendored rumqttd patch 新增 publish/subscribe authorization hook 和 publish ack gate，commands topic 订阅会调用 `authorize_subscribe`。
 
 剩余生产目标：
 
@@ -124,7 +124,7 @@ Telemetry record 支持两种 timestamp：
 ingest 和 worker 之间已接入第一版 JetStream buffer：
 
 - MQTT hook 不应被 TimescaleDB 慢写长期阻塞。
-- ingest 把 telemetry publish 编码为 `TelemetryIngestEnvelope`。
+- ingest 把 telemetry publish 编码为 `TelemetryIngestEnvelope`，NATS 模式下先拿到 JetStream PubAck，再允许 broker ACK 设备 publish。
 - worker 幂等确保 stream 和 durable push consumer。
 - worker 批量写入 TimescaleDB，并在成功写库后 ack。
 - invalid envelope 会写入 dead-letter subject 并 ack，避免 poison message 无限重试。
@@ -147,5 +147,5 @@ alerts.evaluate.{project_id}
 - MQTT QoS 策略，当前 agent 使用 QoS 1。
 - duplicate sequence 策略，推荐对同一 `(project_id, device_id, stream, sequence, ts)` upsert-ignore。
 - payload size limit，与 agent `max_packet_size` 对齐。
-- NATS publish timeout 和 broker disconnect 策略。
+- NATS publish timeout、长连接 publisher、熔断和 broker disconnect 策略。
 - Timescale batch flush size、flush interval、retry 和 dead-letter subject。

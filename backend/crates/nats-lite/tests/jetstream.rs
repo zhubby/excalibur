@@ -24,7 +24,12 @@ async fn live_jetstream_push_consumer_delivers_and_acks_messages() {
         .unwrap();
 
     let payload = br#"{"project_id":"p","points":[{"sequence":1}]}"#;
-    client.publish(&subject, payload).await.unwrap();
+    let ack = client
+        .publish_jetstream(&subject, payload, Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(ack.stream, stream);
+    assert!(ack.sequence > 0);
 
     let message = tokio::time::timeout(Duration::from_secs(5), subscription.next_message())
         .await

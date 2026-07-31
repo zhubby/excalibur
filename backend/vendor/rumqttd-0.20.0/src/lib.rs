@@ -54,6 +54,11 @@ pub type AuthHandler = Arc<
         + Sync,
 >;
 pub type PublishAuthHandler = Arc<dyn Fn(ClientId, Topic) -> bool + Send + Sync>;
+pub type PublishAckHandler = Arc<
+    dyn Fn(ClientId, Topic, Vec<u8>) -> Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        + Send
+        + Sync,
+>;
 pub type SubscribeAuthHandler = Arc<dyn Fn(ClientId, Filter) -> bool + Send + Sync>;
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
@@ -155,6 +160,15 @@ impl ServerSettings {
     {
         self.connections.set_publish_auth_handler(auth_fn)
     }
+
+    pub fn set_publish_ack_handler<F, O>(&mut self, ack_fn: F)
+    where
+        F: Fn(ClientId, Topic, Vec<u8>) -> O + Send + Sync + 'static,
+        O: IntoFuture<Output = bool> + 'static,
+        O::IntoFuture: Send,
+    {
+        self.connections.set_publish_ack_handler(ack_fn)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -180,6 +194,8 @@ pub struct ConnectionSettings {
     pub external_auth: Option<AuthHandler>,
     #[serde(skip)]
     pub publish_auth: Option<PublishAuthHandler>,
+    #[serde(skip)]
+    pub publish_ack: Option<PublishAckHandler>,
     #[serde(skip)]
     pub subscribe_auth: Option<SubscribeAuthHandler>,
     #[serde(default)]
@@ -224,6 +240,18 @@ impl ConnectionSettings {
     {
         self.publish_auth = Some(Arc::new(auth_fn));
     }
+
+    pub fn set_publish_ack_handler<F, O>(&mut self, ack_fn: F)
+    where
+        F: Fn(ClientId, Topic, Vec<u8>) -> O + Send + Sync + 'static,
+        O: IntoFuture<Output = bool> + 'static,
+        O::IntoFuture: Send,
+    {
+        self.publish_ack = Some(Arc::new(move |client_id, topic, payload| {
+            let ack = ack_fn(client_id, topic, payload).into_future();
+            Box::pin(ack)
+        }));
+    }
 }
 
 impl fmt::Debug for ConnectionSettings {
@@ -235,6 +263,7 @@ impl fmt::Debug for ConnectionSettings {
             .field("auth", &self.auth)
             .field("external_auth", &self.external_auth.is_some())
             .field("publish_auth", &self.publish_auth.is_some())
+            .field("publish_ack", &self.publish_ack.is_some())
             .field("subscribe_auth", &self.subscribe_auth.is_some())
             .field("dynamic_filters", &self.dynamic_filters)
             .finish()

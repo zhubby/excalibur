@@ -11,7 +11,8 @@ use anyhow::{Context, bail};
 #[cfg(test)]
 use chrono::Utc;
 use excalibur_device_protocol::{
-    DeviceCommandEnvelope, PublishTopic, commands_topic, parse_publish_topic,
+    DeviceCommandEnvelope, PublishTopic, TelemetryIngestEnvelope, commands_topic,
+    parse_publish_topic,
 };
 use excalibur_domain::{DeviceStatus, Id};
 use excalibur_mqtt_ingest::{
@@ -141,6 +142,7 @@ async fn main() -> anyhow::Result<()> {
     let broker = Broker::new(rumqttd_config(
         &runtime,
         store.clone(),
+        telemetry_sink.clone(),
         client_identities.clone(),
     ));
     info!("creating rumqttd local ingest link");
@@ -251,8 +253,11 @@ async fn run_ingest_loop(
         };
 
         match handle_ingest_publish(&store, &telemetry_sink, topic, payload, device).await {
-            Ok(count) => {
+            Ok(IngestPublishOutcome::Written(count)) => {
                 info!(%topic, count, "ingested MQTT publish");
+            }
+            Ok(IngestPublishOutcome::DurablyAcceptedUpstream) => {
+                info!(%topic, "MQTT telemetry already durably accepted before broker ack");
             }
             Err(error) => {
                 warn!(%topic, %error, "failed to ingest MQTT publish");
@@ -261,35 +266,111 @@ async fn run_ingest_loop(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IngestPublishOutcome {
+    Written(usize),
+    DurablyAcceptedUpstream,
+}
+
 async fn handle_ingest_publish(
     store: &Store,
     telemetry_sink: &TelemetrySink,
     topic: &str,
     payload: Value,
     device: AuthenticatedDevice,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<IngestPublishOutcome> {
     let parsed = parse_publish_topic(topic)?;
+    if matches!(parsed, PublishTopic::Telemetry { .. }) && telemetry_sink.remote_ack_gate_enabled()
+    {
+        return Ok(IngestPublishOutcome::DurablyAcceptedUpstream);
+    }
     match (&parsed, telemetry_sink) {
-        (
-            PublishTopic::Telemetry { .. },
-            TelemetrySink::Nats {
-                client, subject, ..
-            },
-        ) => {
+        (PublishTopic::Telemetry { .. }, TelemetrySink::Nats { .. }) => {
             let envelope = telemetry_envelope_from_publish(topic, payload, device)?;
-            let point_count = envelope.points.len();
-            let payload = serde_json::to_vec(&envelope)
-                .context("failed to encode telemetry ingest envelope")?;
-            client
-                .publish_jetstream(subject, &payload, Duration::from_secs(5))
+            publish_telemetry_envelope_to_jetstream(telemetry_sink, envelope)
                 .await
-                .with_context(|| format!("failed to publish telemetry envelope to {subject}"))?;
-            Ok(point_count)
+                .map(IngestPublishOutcome::Written)
         }
         _ => ingest_publish(store, topic, payload, device)
             .await
+            .map(IngestPublishOutcome::Written)
             .map_err(anyhow::Error::from),
     }
+}
+
+impl TelemetrySink {
+    fn remote_ack_gate_enabled(&self) -> bool {
+        matches!(self, TelemetrySink::Nats { .. })
+    }
+}
+
+async fn durably_accept_remote_publish(
+    store: &Store,
+    telemetry_sink: &TelemetrySink,
+    client_identities: &ClientIdentityRegistry,
+    source_client_id: Option<&str>,
+    topic: &str,
+    payload: &[u8],
+    require_connection_identity: bool,
+) -> anyhow::Result<Option<usize>> {
+    let parsed = match parse_publish_topic(topic) {
+        Ok(parsed) => parsed,
+        Err(error) if is_excalibur_publish_namespace(topic) => {
+            bail!("invalid Excalibur publish topic: {error}");
+        }
+        Err(_) => return Ok(None),
+    };
+    if !matches!(parsed, PublishTopic::Telemetry { .. }) {
+        return Ok(None);
+    }
+    let payload =
+        serde_json::from_slice::<Value>(payload).context("telemetry payload is not valid JSON")?;
+    let device = authenticated_device_for_forward(
+        store,
+        client_identities,
+        source_client_id,
+        topic,
+        require_connection_identity,
+    )
+    .await?;
+    let envelope = telemetry_envelope_from_publish(topic, payload, device)?;
+    publish_telemetry_envelope_to_jetstream(telemetry_sink, envelope)
+        .await
+        .map(Some)
+}
+
+fn is_excalibur_publish_namespace(topic: &str) -> bool {
+    let topic = topic.trim_matches('/');
+    topic.is_empty() || topic == "v1" || topic.starts_with("v1/")
+}
+
+async fn publish_telemetry_envelope_to_jetstream(
+    telemetry_sink: &TelemetrySink,
+    envelope: TelemetryIngestEnvelope,
+) -> anyhow::Result<usize> {
+    let TelemetrySink::Nats {
+        client,
+        subject,
+        stream,
+    } = telemetry_sink
+    else {
+        bail!("telemetry JetStream sink is not configured");
+    };
+    let point_count = envelope.points.len();
+    let payload =
+        serde_json::to_vec(&envelope).context("failed to encode telemetry ingest envelope")?;
+    let ack = client
+        .publish_jetstream(subject, &payload, Duration::from_secs(5))
+        .await
+        .with_context(|| format!("failed to publish telemetry envelope to {subject}"))?;
+    if ack.stream != *stream {
+        bail!(
+            "JetStream publish ack stream mismatch: expected {}, got {}",
+            stream,
+            ack.stream
+        );
+    }
+    Ok(point_count)
 }
 
 async fn ensure_telemetry_stream(telemetry_sink: &TelemetrySink) -> anyhow::Result<()> {
@@ -717,6 +798,7 @@ async fn build_store(config: StorageConfig) -> anyhow::Result<Store> {
 fn rumqttd_config(
     runtime: &MqttRuntimeConfig,
     store: Store,
+    telemetry_sink: TelemetrySink,
     client_identities: ClientIdentityRegistry,
 ) -> Config {
     let mut v4 = HashMap::new();
@@ -736,10 +818,55 @@ fn rumqttd_config(
             auth: None,
             external_auth: None,
             publish_auth: None,
+            publish_ack: None,
             subscribe_auth: None,
             dynamic_filters: true,
         },
     };
+    if telemetry_sink.remote_ack_gate_enabled() {
+        let ack_store = store.clone();
+        let ack_sink = telemetry_sink.clone();
+        let ack_identities = client_identities.clone();
+        let require_connection_identity = runtime.require_cert_fingerprint_username;
+        server.set_publish_ack_handler(move |client_id, topic, payload| {
+            let ack_store = ack_store.clone();
+            let ack_sink = ack_sink.clone();
+            let ack_identities = ack_identities.clone();
+            async move {
+                match durably_accept_remote_publish(
+                    &ack_store,
+                    &ack_sink,
+                    &ack_identities,
+                    Some(&client_id),
+                    &topic,
+                    &payload,
+                    require_connection_identity,
+                )
+                .await
+                {
+                    Ok(Some(count)) => {
+                        info!(
+                            %client_id,
+                            %topic,
+                            count,
+                            "durably accepted MQTT telemetry before broker ack"
+                        );
+                        true
+                    }
+                    Ok(None) => true,
+                    Err(error) => {
+                        warn!(
+                            %client_id,
+                            %topic,
+                            %error,
+                            "rejecting MQTT publish before broker ack"
+                        );
+                        false
+                    }
+                }
+            }
+        });
+    }
     if runtime.require_cert_fingerprint_username {
         let bind_peer_certificate = runtime.tls.is_some();
         let auth_identities = client_identities.clone();
@@ -747,6 +874,10 @@ fn rumqttd_config(
             let store = store.clone();
             let auth_identities = auth_identities.clone();
             async move {
+                if client_id.trim().is_empty() {
+                    warn!("rejecting MQTT auth with empty client id");
+                    return false;
+                }
                 let username_fingerprint = username.trim().to_ascii_lowercase();
                 let fingerprint = if bind_peer_certificate {
                     let Some(peer_fingerprint) = peer_fingerprint else {
@@ -892,6 +1023,7 @@ mod tests {
         let config = rumqttd_config(
             &runtime,
             Store::memory(),
+            TelemetrySink::Direct,
             Arc::new(RwLock::new(HashMap::new())),
         );
         let server = config.v4.as_ref().unwrap().get("excalibur").unwrap();
@@ -900,6 +1032,7 @@ mod tests {
         assert_eq!(server.connections.max_payload_size, 4096);
         assert!(server.connections.external_auth.is_some());
         assert!(server.connections.publish_auth.is_some());
+        assert!(server.connections.publish_ack.is_none());
         assert!(server.connections.subscribe_auth.is_some());
         assert_eq!(
             server.tls.as_ref().unwrap().validate_paths(),
@@ -913,6 +1046,90 @@ mod tests {
                 "v1/p/+/d/+/shadow".to_owned(),
                 "v1/p/+/d/+/commands/status".to_owned(),
             ]
+        );
+    }
+
+    #[test]
+    fn rumqttd_config_attaches_publish_ack_gate_for_nats_telemetry() {
+        let runtime = MqttRuntimeConfig {
+            listen: "127.0.0.1:18832".parse().unwrap(),
+            max_connections: 10,
+            max_payload_size: 4096,
+            max_inflight_count: 8,
+            connection_timeout_ms: 1000,
+            router_max_outgoing_packet_count: 32,
+            router_max_segment_size: 1024,
+            router_max_segment_count: 2,
+            tls: None,
+            require_cert_fingerprint_username: false,
+            telemetry_buffer: TelemetryBufferConfig::Nats {
+                url: "nats://127.0.0.1:4222".to_owned(),
+                subject: "excalibur.telemetry.ingest".to_owned(),
+                stream: "EXCALIBUR_TELEMETRY".to_owned(),
+            },
+            command_bridge: CommandBridgeConfig::Disabled,
+            storage: StorageConfig::Memory,
+        };
+        let sink = TelemetrySink::Nats {
+            client: NatsClient::new("nats://127.0.0.1:4222", "ack-gate-config-test").unwrap(),
+            subject: "excalibur.telemetry.ingest".to_owned(),
+            stream: "EXCALIBUR_TELEMETRY".to_owned(),
+        };
+
+        let config = rumqttd_config(
+            &runtime,
+            Store::memory(),
+            sink,
+            Arc::new(RwLock::new(HashMap::new())),
+        );
+        let server = config.v4.as_ref().unwrap().get("excalibur").unwrap();
+
+        assert!(server.connections.publish_ack.is_some());
+    }
+
+    #[tokio::test]
+    async fn rumqttd_publish_ack_gate_rejects_invalid_excalibur_topic() {
+        let runtime = MqttRuntimeConfig {
+            listen: "127.0.0.1:18833".parse().unwrap(),
+            max_connections: 10,
+            max_payload_size: 4096,
+            max_inflight_count: 8,
+            connection_timeout_ms: 1000,
+            router_max_outgoing_packet_count: 32,
+            router_max_segment_size: 1024,
+            router_max_segment_count: 2,
+            tls: None,
+            require_cert_fingerprint_username: false,
+            telemetry_buffer: TelemetryBufferConfig::Nats {
+                url: "nats://127.0.0.1:4222".to_owned(),
+                subject: "excalibur.telemetry.ingest".to_owned(),
+                stream: "EXCALIBUR_TELEMETRY".to_owned(),
+            },
+            command_bridge: CommandBridgeConfig::Disabled,
+            storage: StorageConfig::Memory,
+        };
+        let sink = TelemetrySink::Nats {
+            client: NatsClient::new("nats://127.0.0.1:9", "ack-gate-invalid-topic-test").unwrap(),
+            subject: "excalibur.telemetry.ingest".to_owned(),
+            stream: "EXCALIBUR_TELEMETRY".to_owned(),
+        };
+
+        let config = rumqttd_config(
+            &runtime,
+            Store::memory(),
+            sink,
+            Arc::new(RwLock::new(HashMap::new())),
+        );
+        let server = config.v4.as_ref().unwrap().get("excalibur").unwrap();
+        let ack = server.connections.publish_ack.as_ref().unwrap().clone();
+
+        assert!(
+            !ack(
+                "client-1".to_owned(),
+                "v1/p/not-a-uuid/d/not-a-uuid/telemetry/temperature".to_owned(),
+                br#"[{"sequence":1}]"#.to_vec(),
+            )
+            .await
         );
     }
 
@@ -997,6 +1214,233 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_ingest_skips_telemetry_when_remote_ack_gate_is_enabled() {
+        use excalibur_domain::{Device, Org, Project, User};
+
+        let store = Store::memory();
+        let user = store
+            .create_user(User::new("mqtt-skip@example.com", "MQTT Skip", "hash"))
+            .await
+            .unwrap();
+        let org = store
+            .create_org(Org::new("MQTT Skip Org", "mqtt-skip"), user.id)
+            .await
+            .unwrap();
+        let project = store
+            .create_project(Project::new(org.id, "Factory", "factory"))
+            .await
+            .unwrap();
+        let device = store
+            .create_device(Device::new(project.id, "press-1", json!({})))
+            .await
+            .unwrap();
+        let topic =
+            excalibur_device_protocol::telemetry_topic(project.id, device.id, "temperature");
+        let sink = TelemetrySink::Nats {
+            client: NatsClient::new("nats://127.0.0.1:9", "skip-duplicate-test").unwrap(),
+            subject: "excalibur.telemetry.ingest".to_owned(),
+            stream: "EXCALIBUR_TELEMETRY".to_owned(),
+        };
+
+        let outcome = handle_ingest_publish(
+            &store,
+            &sink,
+            &topic,
+            json!([{ "sequence": 1, "timestamp": Utc::now().to_rfc3339(), "value": 24.0 }]),
+            AuthenticatedDevice {
+                project_id: project.id,
+                device_id: device.id,
+                status: DeviceStatus::Provisioned,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, IngestPublishOutcome::DurablyAcceptedUpstream);
+        assert!(
+            store
+                .query_telemetry(project.id, Some(device.id), Some("temperature"), 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_ack_gate_rejects_invalid_telemetry_payload_before_queueing() {
+        use excalibur_domain::{Device, Org, Project, User};
+
+        let store = Store::memory();
+        let user = store
+            .create_user(User::new(
+                "mqtt-invalid@example.com",
+                "MQTT Invalid",
+                "hash",
+            ))
+            .await
+            .unwrap();
+        let org = store
+            .create_org(Org::new("MQTT Invalid Org", "mqtt-invalid"), user.id)
+            .await
+            .unwrap();
+        let project = store
+            .create_project(Project::new(org.id, "Factory", "factory"))
+            .await
+            .unwrap();
+        let device = store
+            .create_device(Device::new(project.id, "press-1", json!({})))
+            .await
+            .unwrap();
+        let topic =
+            excalibur_device_protocol::telemetry_topic(project.id, device.id, "temperature");
+        let sink = TelemetrySink::Nats {
+            client: NatsClient::new("nats://127.0.0.1:9", "invalid-payload-test").unwrap(),
+            subject: "excalibur.telemetry.ingest".to_owned(),
+            stream: "EXCALIBUR_TELEMETRY".to_owned(),
+        };
+
+        let error = durably_accept_remote_publish(
+            &store,
+            &sink,
+            &Arc::new(RwLock::new(HashMap::new())),
+            None,
+            &topic,
+            b"{",
+            false,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("telemetry payload is not valid JSON")
+        );
+        assert!(
+            store
+                .query_telemetry(project.id, Some(device.id), Some("temperature"), 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_ack_gate_rejects_invalid_excalibur_topic_before_queueing() {
+        let store = Store::memory();
+        let sink = TelemetrySink::Nats {
+            client: NatsClient::new("nats://127.0.0.1:9", "invalid-topic-test").unwrap(),
+            subject: "excalibur.telemetry.ingest".to_owned(),
+            stream: "EXCALIBUR_TELEMETRY".to_owned(),
+        };
+
+        let error = durably_accept_remote_publish(
+            &store,
+            &sink,
+            &Arc::new(RwLock::new(HashMap::new())),
+            None,
+            "v1/p/not-a-uuid/d/not-a-uuid/telemetry/temperature",
+            br#"[{"sequence":1}]"#,
+            false,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid Excalibur publish topic")
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_ack_gate_ignores_non_excalibur_publish_topic() {
+        let store = Store::memory();
+        let sink = TelemetrySink::Nats {
+            client: NatsClient::new("nats://127.0.0.1:9", "non-excalibur-topic-test").unwrap(),
+            subject: "excalibur.telemetry.ingest".to_owned(),
+            stream: "EXCALIBUR_TELEMETRY".to_owned(),
+        };
+
+        let accepted = durably_accept_remote_publish(
+            &store,
+            &sink,
+            &Arc::new(RwLock::new(HashMap::new())),
+            None,
+            "external/topic",
+            br#"[{"sequence":1}]"#,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(accepted, None);
+    }
+
+    #[tokio::test]
+    async fn remote_ack_gate_rejects_when_jetstream_publish_fails() {
+        use excalibur_domain::{Device, Org, Project, User};
+
+        let store = Store::memory();
+        let user = store
+            .create_user(User::new(
+                "mqtt-nats-fail@example.com",
+                "MQTT NATS Fail",
+                "hash",
+            ))
+            .await
+            .unwrap();
+        let org = store
+            .create_org(Org::new("MQTT NATS Fail Org", "mqtt-nats-fail"), user.id)
+            .await
+            .unwrap();
+        let project = store
+            .create_project(Project::new(org.id, "Factory", "factory"))
+            .await
+            .unwrap();
+        let device = store
+            .create_device(Device::new(project.id, "press-1", json!({})))
+            .await
+            .unwrap();
+        let topic =
+            excalibur_device_protocol::telemetry_topic(project.id, device.id, "temperature");
+        let sink = TelemetrySink::Nats {
+            client: NatsClient::new("nats://127.0.0.1:9", "nats-failure-test").unwrap(),
+            subject: "excalibur.telemetry.ingest".to_owned(),
+            stream: "EXCALIBUR_TELEMETRY".to_owned(),
+        };
+        let payload = serde_json::to_vec(
+            &json!([{ "sequence": 1, "timestamp": Utc::now().to_rfc3339(), "value": 24.0 }]),
+        )
+        .unwrap();
+
+        let error = durably_accept_remote_publish(
+            &store,
+            &sink,
+            &Arc::new(RwLock::new(HashMap::new())),
+            None,
+            &topic,
+            &payload,
+            false,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to publish telemetry envelope")
+        );
+        assert!(
+            store
+                .query_telemetry(project.id, Some(device.id), Some("temperature"), 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn rumqttd_auth_binds_username_fingerprint_to_tls_peer_certificate() {
         use excalibur_domain::{Device, DeviceCertificate, Org, Project, User};
 
@@ -1048,7 +1492,7 @@ mod tests {
             storage: StorageConfig::Memory,
         };
         let identities = Arc::new(RwLock::new(HashMap::new()));
-        let config = rumqttd_config(&runtime, store, identities.clone());
+        let config = rumqttd_config(&runtime, store, TelemetrySink::Direct, identities.clone());
         let server = config.v4.as_ref().unwrap().get("excalibur").unwrap();
         let auth = server.connections.external_auth.as_ref().unwrap().clone();
 
@@ -1066,6 +1510,16 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        assert!(
+            !auth(
+                String::new(),
+                fingerprint.clone(),
+                String::new(),
+                Some(fingerprint.clone()),
+            )
+            .await
+        );
+        assert!(lookup_client_identity(&identities, "").unwrap().is_none());
         assert!(
             !auth(
                 "mismatch".to_owned(),
