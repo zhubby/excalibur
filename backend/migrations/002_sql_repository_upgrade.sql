@@ -45,9 +45,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_unique_idx ON users (lower(e
 
 DO $$
 BEGIN
-  ALTER TABLE projects ADD CONSTRAINT projects_org_id_id_key UNIQUE (org_id, id);
-EXCEPTION
-  WHEN duplicate_object THEN NULL;
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conname = 'projects_org_id_id_key'
+      AND conrelid = 'projects'::regclass
+  ) THEN
+    ALTER TABLE projects ADD CONSTRAINT projects_org_id_id_key UNIQUE (org_id, id);
+  END IF;
 END $$;
 
 CREATE INDEX IF NOT EXISTS devices_project_created_idx ON devices (project_id, created_at DESC, id);
@@ -88,11 +93,16 @@ CREATE INDEX IF NOT EXISTS actions_project_created_idx ON actions (project_id, c
 ALTER TABLE audit_logs DROP CONSTRAINT IF EXISTS audit_logs_project_id_fkey;
 DO $$
 BEGIN
-  ALTER TABLE audit_logs
-    ADD CONSTRAINT audit_logs_org_id_project_id_fkey
-    FOREIGN KEY (org_id, project_id) REFERENCES projects(org_id, id) ON DELETE CASCADE;
-EXCEPTION
-  WHEN duplicate_object THEN NULL;
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conname = 'audit_logs_org_id_project_id_fkey'
+      AND conrelid = 'audit_logs'::regclass
+  ) THEN
+    ALTER TABLE audit_logs
+      ADD CONSTRAINT audit_logs_org_id_project_id_fkey
+      FOREIGN KEY (org_id, project_id) REFERENCES projects(org_id, id) ON DELETE CASCADE;
+  END IF;
 END $$;
 
 DROP INDEX IF EXISTS audit_logs_scope_idx;
