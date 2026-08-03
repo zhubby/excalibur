@@ -2,7 +2,8 @@ use excalibur_domain::{
     Action, ActionState, AlertEvent, AlertEventState, AlertRule, ApiKey, AuditLog,
     CertificateStatus, Dashboard, Device, DeviceCertificate, DeviceStatus, DiagnosticsSession,
     DiagnosticsSessionState, FirmwareArtifact, FirmwareRollout, FirmwareRolloutState, Id,
-    Membership, Org, Project, Role, StreamDefinition, TelemetryPoint, User, UserSession,
+    Membership, MembershipWithUser, Org, Project, Role, StreamDefinition, TelemetryPoint, User,
+    UserSession,
 };
 use serde_json::Value;
 use sqlx::{Row, postgres::PgRow};
@@ -252,6 +253,15 @@ pub(super) fn map_membership(row: &PgRow) -> StoreResult<Membership> {
         user_id: row.try_get("user_id").map_err(map_decode_error)?,
         role: role_from_db(&role)?,
         created_at: row.try_get("created_at").map_err(map_decode_error)?,
+    })
+}
+
+pub(super) fn map_membership_with_user(row: &PgRow) -> StoreResult<MembershipWithUser> {
+    Ok(MembershipWithUser {
+        membership: map_membership(row)?,
+        email: row.try_get("email").map_err(map_decode_error)?,
+        display_name: row.try_get("display_name").map_err(map_decode_error)?,
+        email_verified: row.try_get("email_verified").map_err(map_decode_error)?,
     })
 }
 

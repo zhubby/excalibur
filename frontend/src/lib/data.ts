@@ -1,8 +1,20 @@
 import type { LucideIcon } from "lucide-react";
-import { Activity, Building2, FolderKanban, Gauge, KeyRound, ScrollText, ShieldCheck, UploadCloud, Zap } from "lucide-react";
+import {
+  Activity,
+  Building2,
+  FolderKanban,
+  Gauge,
+  KeyRound,
+  ScrollText,
+  ShieldCheck,
+  UploadCloud,
+  UserCircle,
+  Users,
+  Zap,
+} from "lucide-react";
 
 export type PrimaryNavSectionId = "fleet" | "streams" | "actions" | "firmware" | "security";
-export type ManagementSectionId = "organization" | "projects" | "permissions" | "audit";
+export type ManagementSectionId = "account" | "organizations" | "members" | "projects" | "apiKeys" | "audit";
 export type NavSectionId = PrimaryNavSectionId | ManagementSectionId;
 
 export type DeviceStatus = "online" | "offline" | "disabled" | "provisioned";
@@ -64,9 +76,11 @@ export const navItems = [
 }>;
 
 export const managementNavItems = [
-  { id: "organization", label: "Organization", icon: Building2 },
+  { id: "account", label: "Account", icon: UserCircle },
+  { id: "organizations", label: "Organizations", icon: Building2 },
+  { id: "members", label: "Members", icon: Users },
   { id: "projects", label: "Projects", icon: FolderKanban },
-  { id: "permissions", label: "Permissions", icon: KeyRound },
+  { id: "apiKeys", label: "API keys", icon: KeyRound },
   { id: "audit", label: "Audit log", icon: ScrollText },
 ] satisfies Array<{
   id: ManagementSectionId;

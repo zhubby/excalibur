@@ -184,6 +184,14 @@ impl Membership {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MembershipWithUser {
+    pub membership: Membership,
+    pub email: String,
+    pub display_name: String,
+    pub email_verified: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Project {
     pub id: Id,
     pub org_id: Id,

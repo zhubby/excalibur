@@ -195,6 +195,127 @@ describe("Excalibur API client", () => {
     ]);
   });
 
+  it("covers user, org, project, and membership management endpoint contracts", async () => {
+    const user = {
+      id: "user-1",
+      email: "ops@example.com",
+      display_name: "Ops",
+      email_verified: false,
+    };
+    const org = {
+      id: "org-1",
+      name: "Acme",
+      slug: "acme",
+      created_at: "2026-07-30T12:00:00Z",
+    };
+    const project = {
+      id: "project-1",
+      org_id: "org-1",
+      name: "Factory",
+      slug: "factory",
+      created_at: "2026-07-30T12:00:00Z",
+    };
+    const membership = {
+      id: "membership-1",
+      org_id: "org-1",
+      user_id: "user-2",
+      role: "Viewer",
+      email: "viewer@example.com",
+      display_name: "Viewer",
+      email_verified: true,
+      created_at: "2026-07-30T12:00:00Z",
+    };
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify(user)))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ...user, display_name: "Ops Lead" })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ org_id: "org-1", role: "Admin" })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ...org, name: "Acme IoT" })))
+      .mockResolvedValueOnce(new Response(JSON.stringify([membership])))
+      .mockResolvedValueOnce(new Response(JSON.stringify(membership)))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ...membership, role: "Operator" })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ...membership, role: "Operator" })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ...project, name: "Line 1" })));
+    const api = createExcaliburApi({
+      baseUrl: "http://api.example",
+      token: "session-token",
+      fetcher,
+    });
+
+    await expect(api.getMe()).resolves.toEqual(user);
+    await expect(api.updateMe({ display_name: "Ops Lead" })).resolves.toMatchObject({
+      display_name: "Ops Lead",
+    });
+    await expect(api.getOrgRole("org-1")).resolves.toEqual({ org_id: "org-1", role: "Admin" });
+    await expect(api.updateOrg("org-1", { name: "Acme IoT" })).resolves.toMatchObject({
+      name: "Acme IoT",
+    });
+    await expect(api.listMemberships("org-1")).resolves.toEqual([membership]);
+    await expect(api.createMembership("org-1", { email: "viewer@example.com", role: "Viewer" })).resolves.toEqual(
+      membership,
+    );
+    await expect(api.updateMembershipRole("org-1", "membership-1", { role: "Operator" })).resolves.toMatchObject({
+      role: "Operator",
+    });
+    await expect(api.removeMembership("org-1", "membership-1")).resolves.toMatchObject({
+      role: "Operator",
+    });
+    await expect(api.updateProject("project-1", { name: "Line 1" })).resolves.toMatchObject({
+      name: "Line 1",
+    });
+
+    const calls = (fetcher.mock.calls as unknown as [string, RequestInit][]).map(([url, init]) => ({
+      url: String(url),
+      method: init?.method ?? "GET",
+      body: init?.body,
+      authorization: new Headers(init.headers).get("authorization"),
+    }));
+    expect(calls).toMatchObject([
+      {
+        url: "http://api.example/api/v1/me",
+        method: "GET",
+        authorization: "Bearer session-token",
+      },
+      {
+        url: "http://api.example/api/v1/me",
+        method: "PATCH",
+        body: JSON.stringify({ display_name: "Ops Lead" }),
+      },
+      {
+        url: "http://api.example/api/v1/orgs/org-1/role",
+        method: "GET",
+      },
+      {
+        url: "http://api.example/api/v1/orgs/org-1",
+        method: "PATCH",
+        body: JSON.stringify({ name: "Acme IoT" }),
+      },
+      {
+        url: "http://api.example/api/v1/orgs/org-1/memberships",
+        method: "GET",
+      },
+      {
+        url: "http://api.example/api/v1/orgs/org-1/memberships",
+        method: "POST",
+        body: JSON.stringify({ email: "viewer@example.com", role: "Viewer" }),
+      },
+      {
+        url: "http://api.example/api/v1/orgs/org-1/memberships/membership-1",
+        method: "PATCH",
+        body: JSON.stringify({ role: "Operator" }),
+      },
+      {
+        url: "http://api.example/api/v1/orgs/org-1/memberships/membership-1",
+        method: "DELETE",
+      },
+      {
+        url: "http://api.example/api/v1/projects/project-1",
+        method: "PATCH",
+        body: JSON.stringify({ name: "Line 1" }),
+      },
+    ]);
+  });
+
   it("preserves HTTP status for non-JSON API errors", async () => {
     const fetcher = vi.fn(
       async () =>

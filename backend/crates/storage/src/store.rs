@@ -3,8 +3,8 @@ use excalibur_domain::{
     Action, ActionDispatchTarget, ActionState, ActionStatusUpdate, ActionTargetStatusChange,
     ActionTargetTransition, AlertEvent, AlertEventState, AlertRule, ApiKey, AuditLog, Dashboard,
     Device, DeviceCertificate, DiagnosticsSession, FirmwareArtifact, FirmwareRollout, Id,
-    Membership, Org, Project, Role, StreamDefinition, TelemetryAggregateBucket, TelemetryPoint,
-    User, UserSession,
+    Membership, MembershipWithUser, Org, Project, Role, StreamDefinition, TelemetryAggregateBucket,
+    TelemetryPoint, User, UserSession,
 };
 use serde_json::Value;
 
@@ -49,6 +49,24 @@ impl Store {
         match self {
             Store::Memory(store) => store.get_user_by_email(email).await,
             Store::Postgres(store) => store.get_user_by_email(email).await,
+        }
+    }
+
+    pub async fn get_user(&self, user_id: Id) -> StoreResult<User> {
+        match self {
+            Store::Memory(store) => store.get_user(user_id).await,
+            Store::Postgres(store) => store.get_user(user_id).await,
+        }
+    }
+
+    pub async fn update_user_display_name(
+        &self,
+        user_id: Id,
+        display_name: String,
+    ) -> StoreResult<User> {
+        match self {
+            Store::Memory(store) => store.update_user_display_name(user_id, display_name).await,
+            Store::Postgres(store) => store.update_user_display_name(user_id, display_name).await,
         }
     }
 
@@ -156,6 +174,54 @@ impl Store {
         }
     }
 
+    pub async fn list_memberships(&self, org_id: Id) -> StoreResult<Vec<MembershipWithUser>> {
+        match self {
+            Store::Memory(store) => store.list_memberships(org_id).await,
+            Store::Postgres(store) => store.list_memberships(org_id).await,
+        }
+    }
+
+    pub async fn update_membership_role(
+        &self,
+        org_id: Id,
+        membership_id: Id,
+        expected_current_role: Role,
+        role: Role,
+    ) -> StoreResult<Membership> {
+        match self {
+            Store::Memory(store) => {
+                store
+                    .update_membership_role(org_id, membership_id, expected_current_role, role)
+                    .await
+            }
+            Store::Postgres(store) => {
+                store
+                    .update_membership_role(org_id, membership_id, expected_current_role, role)
+                    .await
+            }
+        }
+    }
+
+    pub async fn remove_membership(
+        &self,
+        org_id: Id,
+        membership_id: Id,
+        expected_current_role: Role,
+    ) -> StoreResult<Membership> {
+        match self {
+            Store::Memory(store) => {
+                store
+                    .remove_membership(org_id, membership_id, expected_current_role)
+                    .await
+            }
+            Store::Postgres(store) => {
+                store
+                    .remove_membership(org_id, membership_id, expected_current_role)
+                    .await
+            }
+        }
+    }
+
     pub async fn list_orgs_for_user(&self, user_id: Id) -> StoreResult<Vec<Org>> {
         match self {
             Store::Memory(store) => Ok(store.list_orgs_for_user(user_id).await),
@@ -167,6 +233,18 @@ impl Store {
         match self {
             Store::Memory(store) => Ok(store.user_role(org_id, user_id).await),
             Store::Postgres(store) => store.user_role(org_id, user_id).await,
+        }
+    }
+
+    pub async fn update_org(
+        &self,
+        org_id: Id,
+        name: Option<String>,
+        slug: Option<String>,
+    ) -> StoreResult<Org> {
+        match self {
+            Store::Memory(store) => store.update_org(org_id, name, slug).await,
+            Store::Postgres(store) => store.update_org(org_id, name, slug).await,
         }
     }
 
@@ -188,6 +266,18 @@ impl Store {
         match self {
             Store::Memory(store) => store.get_project(project_id).await,
             Store::Postgres(store) => store.get_project(project_id).await,
+        }
+    }
+
+    pub async fn update_project(
+        &self,
+        project_id: Id,
+        name: Option<String>,
+        slug: Option<String>,
+    ) -> StoreResult<Project> {
+        match self {
+            Store::Memory(store) => store.update_project(project_id, name, slug).await,
+            Store::Postgres(store) => store.update_project(project_id, name, slug).await,
         }
     }
 

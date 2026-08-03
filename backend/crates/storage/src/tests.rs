@@ -786,6 +786,199 @@ async fn mirrors_unique_constraints_for_user_project_stream_firmware_certificate
 }
 
 #[tokio::test]
+async fn manages_workspace_profiles_and_memberships_in_memory() {
+    let store = MemoryStore::new();
+    let owner = store
+        .create_user(User::new("owner-members@example.com", "Owner", "hash"))
+        .await
+        .unwrap();
+    let admin = store
+        .create_user(User::new("admin-members@example.com", "Admin", "hash"))
+        .await
+        .unwrap();
+    let viewer = store
+        .create_user(User::new("viewer-members@example.com", "Viewer", "hash"))
+        .await
+        .unwrap();
+    let org = store
+        .create_org(Org::new("Members Org", "members-org"), owner.id)
+        .await
+        .unwrap();
+    let project = store
+        .create_project(Project::new(org.id, "Factory", "factory"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .update_user_display_name(owner.id, "Primary Owner".to_owned())
+            .await
+            .unwrap()
+            .display_name,
+        "Primary Owner"
+    );
+    assert_eq!(store.get_user(owner.id).await.unwrap().email, owner.email);
+
+    let updated_org = store
+        .update_org(
+            org.id,
+            Some("Renamed Org".to_owned()),
+            Some("renamed-org".to_owned()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated_org.name, "Renamed Org");
+    assert_eq!(updated_org.slug, "renamed-org");
+
+    let updated_project = store
+        .update_project(
+            project.id,
+            Some("Renamed Factory".to_owned()),
+            Some("renamed-factory".to_owned()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated_project.name, "Renamed Factory");
+    assert_eq!(updated_project.slug, "renamed-factory");
+
+    let admin_membership = store
+        .add_membership(Membership::new(org.id, admin.id, Role::Admin))
+        .await
+        .unwrap();
+    let viewer_membership = store
+        .add_membership(Membership::new(org.id, viewer.id, Role::Viewer))
+        .await
+        .unwrap();
+    let memberships = store.list_memberships(org.id).await.unwrap();
+    assert_eq!(memberships.len(), 3);
+    assert!(
+        memberships
+            .iter()
+            .any(|membership| membership.email == admin.email
+                && membership.membership.role == Role::Admin)
+    );
+
+    let updated_membership = store
+        .update_membership_role(org.id, viewer_membership.id, Role::Viewer, Role::Operator)
+        .await
+        .unwrap();
+    assert_eq!(updated_membership.role, Role::Operator);
+    assert_eq!(
+        store
+            .update_membership_role(org.id, viewer_membership.id, Role::Viewer, Role::Admin)
+            .await
+            .unwrap_err(),
+        StoreError::Conflict("membership role changed")
+    );
+
+    let removed_membership = store
+        .remove_membership(org.id, admin_membership.id, Role::Admin)
+        .await
+        .unwrap();
+    assert_eq!(removed_membership.user_id, admin.id);
+    assert_eq!(store.list_memberships(org.id).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn protects_last_owner_membership_in_memory() {
+    let store = MemoryStore::new();
+    let owner = store
+        .create_user(User::new("last-owner@example.com", "Owner", "hash"))
+        .await
+        .unwrap();
+    let org = store
+        .create_org(Org::new("Last Owner Org", "last-owner"), owner.id)
+        .await
+        .unwrap();
+    let membership = store
+        .list_memberships(org.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|membership| membership.membership.user_id == owner.id)
+        .unwrap()
+        .membership;
+
+    assert_eq!(
+        store
+            .update_membership_role(org.id, membership.id, Role::Owner, Role::Admin)
+            .await
+            .unwrap_err(),
+        StoreError::Conflict("last owner")
+    );
+    assert_eq!(
+        store
+            .remove_membership(org.id, membership.id, Role::Owner)
+            .await
+            .unwrap_err(),
+        StoreError::Conflict("last owner")
+    );
+}
+
+#[tokio::test]
+async fn rejects_duplicate_workspace_slug_updates_in_memory() {
+    let store = MemoryStore::new();
+    let owner = store
+        .create_user(User::new("slug-owner@example.com", "Owner", "hash"))
+        .await
+        .unwrap();
+    let org = store
+        .create_org(Org::new("Slug Org", "slug-org"), owner.id)
+        .await
+        .unwrap();
+    let other_org = store
+        .create_org(Org::new("Other Slug Org", "other-slug-org"), owner.id)
+        .await
+        .unwrap();
+    let project = store
+        .create_project(Project::new(org.id, "Factory", "factory"))
+        .await
+        .unwrap();
+    let other_project = store
+        .create_project(Project::new(org.id, "Lab", "lab"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .update_org(org.id, None, Some(other_org.slug))
+            .await
+            .unwrap_err(),
+        StoreError::Conflict("org")
+    );
+    assert_eq!(
+        store
+            .update_org(Uuid::new_v4(), None, Some("other-slug-org".to_owned()))
+            .await
+            .unwrap_err(),
+        StoreError::NotFound("org")
+    );
+    assert_eq!(
+        store
+            .update_project(project.id, None, Some(other_project.slug))
+            .await
+            .unwrap_err(),
+        StoreError::Conflict("project")
+    );
+}
+
+#[tokio::test]
+async fn rejects_org_creation_for_missing_memory_owner() {
+    let store = MemoryStore::new();
+
+    assert_eq!(
+        store
+            .create_org(
+                Org::new("Missing Owner Org", "missing-owner-org"),
+                Uuid::new_v4()
+            )
+            .await
+            .unwrap_err(),
+        StoreError::NotFound("user")
+    );
+}
+
+#[tokio::test]
 async fn firmware_finalize_and_rollout_are_project_scoped() {
     let store = MemoryStore::new();
     let user = store
@@ -1404,6 +1597,14 @@ async fn pg_store_contract_runs_when_database_url_is_set() {
         ))
         .await
         .unwrap();
+    let admin = store
+        .create_user(User::new(
+            format!("admin-{suffix}@example.com"),
+            "SQL Admin",
+            "hash",
+        ))
+        .await
+        .unwrap();
     assert_eq!(
         store
             .create_user(User::new(
@@ -1537,8 +1738,50 @@ async fn pg_store_contract_runs_when_database_url_is_set() {
         )
         .await
         .unwrap();
+    assert_eq!(
+        store
+            .update_user_display_name(owner.id, "Renamed SQL Owner".to_owned())
+            .await
+            .unwrap()
+            .display_name,
+        "Renamed SQL Owner"
+    );
+    assert_eq!(store.get_user(owner.id).await.unwrap().email, owner.email);
+    assert_eq!(
+        store
+            .update_org(
+                org.id,
+                Some("Renamed SQL Contract Org".to_owned()),
+                Some(format!("renamed-sql-contract-{suffix}")),
+            )
+            .await
+            .unwrap()
+            .slug,
+        format!("renamed-sql-contract-{suffix}")
+    );
+    let conflicting_org = store
+        .create_org(
+            Org::new(
+                "SQL Contract Conflict Org",
+                format!("sql-contract-conflict-{suffix}"),
+            ),
+            owner.id,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .update_org(org.id, None, Some(conflicting_org.slug))
+            .await
+            .unwrap_err(),
+        StoreError::Conflict("org")
+    );
     store
         .add_membership(Membership::new(org.id, viewer.id, Role::Viewer))
+        .await
+        .unwrap();
+    let admin_membership = store
+        .add_membership(Membership::new(org.id, admin.id, Role::Admin))
         .await
         .unwrap();
     let project = store
@@ -1549,6 +1792,72 @@ async fn pg_store_contract_runs_when_database_url_is_set() {
         ))
         .await
         .unwrap();
+    let conflicting_project = store
+        .create_project(Project::new(
+            org.id,
+            "SQL Contract Conflict Project",
+            format!("sql-contract-conflict-{suffix}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .update_project(project.id, None, Some(conflicting_project.slug))
+            .await
+            .unwrap_err(),
+        StoreError::Conflict("project")
+    );
+    assert_eq!(
+        store
+            .update_project(
+                project.id,
+                Some("Renamed SQL Contract Project".to_owned()),
+                Some(format!("renamed-sql-project-{suffix}")),
+            )
+            .await
+            .unwrap()
+            .slug,
+        format!("renamed-sql-project-{suffix}")
+    );
+    assert_eq!(store.list_memberships(org.id).await.unwrap().len(), 3);
+    assert_eq!(
+        store
+            .update_membership_role(org.id, admin_membership.id, Role::Admin, Role::Operator)
+            .await
+            .unwrap()
+            .role,
+        Role::Operator
+    );
+    assert_eq!(
+        store
+            .remove_membership(org.id, admin_membership.id, Role::Operator)
+            .await
+            .unwrap()
+            .user_id,
+        admin.id
+    );
+    let owner_membership = store
+        .list_memberships(org.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|membership| membership.membership.user_id == owner.id)
+        .unwrap()
+        .membership;
+    assert_eq!(
+        store
+            .update_membership_role(org.id, owner_membership.id, Role::Owner, Role::Viewer)
+            .await
+            .unwrap_err(),
+        StoreError::Conflict("last owner")
+    );
+    assert_eq!(
+        store
+            .remove_membership(org.id, owner_membership.id, Role::Owner)
+            .await
+            .unwrap_err(),
+        StoreError::Conflict("last owner")
+    );
     let api_key = store
         .create_api_key(ApiKey::new(
             org.id,

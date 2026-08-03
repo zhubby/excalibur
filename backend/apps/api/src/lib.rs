@@ -14,7 +14,7 @@ use axum::{
         IntoResponse, Response,
         sse::{Event, Sse},
     },
-    routing::{get, post},
+    routing::{get, patch, post},
 };
 use chrono::{Duration, Utc};
 use excalibur_device_protocol::{
@@ -25,8 +25,8 @@ use excalibur_domain::{
     Action, ActionState, ActionStatusUpdate, ActionTargetTransition, AlertEventState, AlertKind,
     AlertRule, ApiKey, AuditLog, Dashboard, Device, DeviceCertificate, DiagnosticsSession,
     DiagnosticsSessionState, FirmwareArtifact, FirmwareRollout, FirmwareRolloutState, Id,
-    NewFirmwareRollout, Org, Project, Role, StreamDefinition, StreamField, StreamFieldType,
-    TelemetryAggregateBucket, TelemetryPoint, User, UserSession,
+    Membership, MembershipWithUser, NewFirmwareRollout, Org, Project, Role, StreamDefinition,
+    StreamField, StreamFieldType, TelemetryAggregateBucket, TelemetryPoint, User, UserSession,
 };
 use excalibur_object_storage::{
     ObjectStorageConfig, presigned_object_key_url as sign_object_key_url,
@@ -159,10 +159,22 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/api/v1/auth/login", post(login))
         .route("/api/v1/auth/refresh", post(refresh_session))
         .route("/api/v1/auth/logout", post(logout))
+        .route("/api/v1/me", get(get_me).patch(update_me))
         .route("/api/v1/api-keys", get(list_api_keys).post(create_api_key))
         .route("/api/v1/api-keys/{api_key_id}/revoke", post(revoke_api_key))
         .route("/api/v1/orgs", get(list_orgs).post(create_org))
+        .route("/api/v1/orgs/{org_id}", patch(update_org))
+        .route("/api/v1/orgs/{org_id}/role", get(get_org_role))
+        .route(
+            "/api/v1/orgs/{org_id}/memberships",
+            get(list_memberships).post(create_membership),
+        )
+        .route(
+            "/api/v1/orgs/{org_id}/memberships/{membership_id}",
+            patch(update_membership_role).delete(remove_membership),
+        )
         .route("/api/v1/projects", get(list_projects).post(create_project))
+        .route("/api/v1/projects/{project_id}", patch(update_project))
         .route("/api/v1/devices", get(list_devices).post(create_device))
         .route(
             "/api/v1/devices/{device_id}/provision",
@@ -250,7 +262,13 @@ fn cors_layer() -> CorsLayer {
                 .to_str()
                 .is_ok_and(|origin| allowed_origins.iter().any(|allowed| allowed == origin))
         }))
-        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
         .allow_headers([
             AUTHORIZATION,
             CONTENT_TYPE,
@@ -269,13 +287,22 @@ fn cors_layer() -> CorsLayer {
         login,
         refresh_session,
         logout,
+        get_me,
+        update_me,
         create_api_key,
         list_api_keys,
         revoke_api_key,
         create_org,
         list_orgs,
+        update_org,
+        get_org_role,
+        list_memberships,
+        create_membership,
+        update_membership_role,
+        remove_membership,
         create_project,
         list_projects,
+        update_project,
         create_device,
         list_devices,
         provision_device,
@@ -325,8 +352,17 @@ fn cors_layer() -> CorsLayer {
         RefreshRequest,
         AuthResponse,
         LogoutResponse,
+        UserResponse,
+        UpdateUserRequest,
         CreateApiKeyRequest,
         ApiKeyResponse,
+        RoleResponse,
+        OrgRoleResponse,
+        UpdateOrgRequest,
+        UpdateProjectRequest,
+        MembershipResponse,
+        CreateMembershipRequest,
+        UpdateMembershipRoleRequest,
         CertificateStatusResponse,
         DashboardResponse,
         DeviceResponse,
@@ -764,6 +800,9 @@ impl From<StoreError> for ApiError {
     fn from(error: StoreError) -> Self {
         match error {
             StoreError::NotFound(resource) => ApiError::NotFound(format!("{resource} not found")),
+            StoreError::Conflict("last owner") => {
+                ApiError::Conflict("last owner cannot be removed or downgraded".to_owned())
+            }
             StoreError::Conflict(resource) => {
                 ApiError::Conflict(format!("{resource} already exists"))
             }
@@ -1014,6 +1053,90 @@ fn api_key_has_scope(api_key: &ApiKey, required_scope: &str) -> bool {
     })
 }
 
+fn validate_workspace_name(value: String, field: &str) -> Result<String, ApiError> {
+    let value = value.trim().to_owned();
+    if value.is_empty() {
+        return Err(ApiError::BadRequest(format!("{field} is required")));
+    }
+    Ok(value)
+}
+
+fn validate_workspace_slug(value: String) -> Result<String, ApiError> {
+    let value = value.trim().to_owned();
+    if value.is_empty() {
+        return Err(ApiError::BadRequest("slug is required".to_owned()));
+    }
+    if value.len() > 48 {
+        return Err(ApiError::BadRequest(
+            "slug must be 48 characters or fewer".to_owned(),
+        ));
+    }
+    if value.starts_with('-') || value.ends_with('-') {
+        return Err(ApiError::BadRequest(
+            "slug cannot start or end with '-'".to_owned(),
+        ));
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(ApiError::BadRequest(
+            "slug must contain only lowercase letters, numbers, and '-'".to_owned(),
+        ));
+    }
+    Ok(value)
+}
+
+fn validate_email_lookup(value: String) -> Result<String, ApiError> {
+    let value = value.trim().to_owned();
+    if value.is_empty() {
+        return Err(ApiError::BadRequest("email is required".to_owned()));
+    }
+    Ok(value)
+}
+
+fn ensure_membership_actor_can_set_role(actor_role: Role, role: Role) -> Result<(), ApiError> {
+    if role == Role::Owner && actor_role != Role::Owner {
+        return Err(ApiError::Unauthorized("owner role required".to_owned()));
+    }
+    Ok(())
+}
+
+fn ensure_membership_actor_can_change_role(
+    actor_role: Role,
+    current_role: Role,
+    next_role: Role,
+) -> Result<(), ApiError> {
+    if actor_role != Role::Owner && (current_role == Role::Owner || next_role == Role::Owner) {
+        return Err(ApiError::Unauthorized("owner role required".to_owned()));
+    }
+    Ok(())
+}
+
+fn ensure_membership_actor_can_remove(
+    actor_role: Role,
+    current_role: Role,
+) -> Result<(), ApiError> {
+    if actor_role != Role::Owner && current_role == Role::Owner {
+        return Err(ApiError::Unauthorized("owner role required".to_owned()));
+    }
+    Ok(())
+}
+
+async fn find_membership(
+    state: &AppState,
+    org_id: Id,
+    membership_id: Id,
+) -> Result<MembershipWithUser, ApiError> {
+    state
+        .store
+        .list_memberships(org_id)
+        .await?
+        .into_iter()
+        .find(|membership| membership.membership.id == membership_id)
+        .ok_or_else(|| ApiError::NotFound("membership not found".to_owned()))
+}
+
 fn parse_bool_env(name: &str, default: bool) -> anyhow::Result<bool> {
     match std::env::var(name) {
         Ok(value) => match value.as_str() {
@@ -1098,6 +1221,55 @@ pub struct AuthResponse {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct LogoutResponse {
     pub status: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct UserResponse {
+    #[schema(value_type = String, format = Uuid)]
+    pub id: Id,
+    pub email: String,
+    pub display_name: String,
+    pub email_verified: bool,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateUserRequest {
+    pub display_name: String,
+}
+
+impl From<User> for UserResponse {
+    fn from(user: User) -> Self {
+        Self {
+            id: user.id,
+            email: user.email,
+            display_name: user.display_name,
+            email_verified: user.email_verified,
+        }
+    }
+}
+
+#[utoipa::path(get, path = "/api/v1/me", responses((status = 200, body = UserResponse)))]
+async fn get_me(headers: HeaderMap, State(state): State<AppState>) -> ApiResult<UserResponse> {
+    let user_id = require_user_actor(&headers, &state).await?;
+    Ok(Json(UserResponse::from(
+        state.store.get_user(user_id).await?,
+    )))
+}
+
+#[utoipa::path(patch, path = "/api/v1/me", request_body = UpdateUserRequest, responses((status = 200, body = UserResponse)))]
+async fn update_me(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<UpdateUserRequest>,
+) -> ApiResult<UserResponse> {
+    let user_id = require_user_actor(&headers, &state).await?;
+    let display_name = validate_workspace_name(request.display_name, "display_name")?;
+    Ok(Json(UserResponse::from(
+        state
+            .store
+            .update_user_display_name(user_id, display_name)
+            .await?,
+    )))
 }
 
 async fn issue_auth_response(state: &AppState, user_id: Id) -> Result<AuthResponse, ApiError> {
@@ -1374,6 +1546,97 @@ impl ApiKeyResponse {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub enum RoleResponse {
+    Owner,
+    Admin,
+    Operator,
+    Viewer,
+}
+
+impl From<Role> for RoleResponse {
+    fn from(role: Role) -> Self {
+        match role {
+            Role::Owner => Self::Owner,
+            Role::Admin => Self::Admin,
+            Role::Operator => Self::Operator,
+            Role::Viewer => Self::Viewer,
+        }
+    }
+}
+
+impl From<RoleResponse> for Role {
+    fn from(role: RoleResponse) -> Self {
+        match role {
+            RoleResponse::Owner => Self::Owner,
+            RoleResponse::Admin => Self::Admin,
+            RoleResponse::Operator => Self::Operator,
+            RoleResponse::Viewer => Self::Viewer,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct OrgRoleResponse {
+    #[schema(value_type = String, format = Uuid)]
+    pub org_id: Id,
+    pub role: RoleResponse,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct MembershipResponse {
+    #[schema(value_type = String, format = Uuid)]
+    pub id: Id,
+    #[schema(value_type = String, format = Uuid)]
+    pub org_id: Id,
+    #[schema(value_type = String, format = Uuid)]
+    pub user_id: Id,
+    pub role: RoleResponse,
+    pub email: String,
+    pub display_name: String,
+    pub email_verified: bool,
+    pub created_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateMembershipRequest {
+    pub email: String,
+    pub role: RoleResponse,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateMembershipRoleRequest {
+    pub role: RoleResponse,
+}
+
+impl MembershipResponse {
+    fn from_membership_with_user(membership: MembershipWithUser) -> Self {
+        Self {
+            id: membership.membership.id,
+            org_id: membership.membership.org_id,
+            user_id: membership.membership.user_id,
+            role: RoleResponse::from(membership.membership.role),
+            email: membership.email,
+            display_name: membership.display_name,
+            email_verified: membership.email_verified,
+            created_at: membership.membership.created_at,
+        }
+    }
+
+    fn from_membership_and_user(membership: Membership, user: User) -> Self {
+        Self {
+            id: membership.id,
+            org_id: membership.org_id,
+            user_id: membership.user_id,
+            role: RoleResponse::from(membership.role),
+            email: user.email,
+            display_name: user.display_name,
+            email_verified: user.email_verified,
+            created_at: membership.created_at,
+        }
+    }
+}
+
 #[utoipa::path(post, path = "/api/v1/api-keys", request_body = CreateApiKeyRequest, responses((status = 200, body = ApiKeyResponse)))]
 async fn create_api_key(
     headers: HeaderMap,
@@ -1500,9 +1763,11 @@ async fn create_org(
     Json(request): Json<CreateOrgRequest>,
 ) -> ApiResult<Org> {
     let actor_id = require_user_actor(&headers, &state).await?;
+    let name = validate_workspace_name(request.name, "name")?;
+    let slug = validate_workspace_slug(request.slug)?;
     let org = state
         .store
-        .create_org(Org::new(request.name, request.slug), actor_id)
+        .create_org(Org::new(name, slug), actor_id)
         .await?;
     record_audit(
         &state,
@@ -1523,6 +1788,194 @@ async fn create_org(
 async fn list_orgs(headers: HeaderMap, State(state): State<AppState>) -> ApiResult<Vec<Org>> {
     let actor_id = require_user_actor(&headers, &state).await?;
     Ok(Json(state.store.list_orgs_for_user(actor_id).await?))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateOrgRequest {
+    pub name: Option<String>,
+    pub slug: Option<String>,
+}
+
+#[utoipa::path(patch, path = "/api/v1/orgs/{org_id}", request_body = UpdateOrgRequest, params(("org_id" = String, Path)), responses((status = 200, body = OrgResponse)))]
+async fn update_org(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(org_id): Path<Id>,
+    Json(request): Json<UpdateOrgRequest>,
+) -> ApiResult<Org> {
+    let actor_id = require_user_actor(&headers, &state).await?;
+    let actor = AuthenticatedActor::User { user_id: actor_id };
+    require_org_role(&state, &actor, org_id, Role::Owner, "orgs:write").await?;
+    let name = request
+        .name
+        .map(|name| validate_workspace_name(name, "name"))
+        .transpose()?;
+    let slug = request.slug.map(validate_workspace_slug).transpose()?;
+    if name.is_none() && slug.is_none() {
+        return Err(ApiError::BadRequest(
+            "at least one field is required".to_owned(),
+        ));
+    }
+    let org = state.store.update_org(org_id, name, slug).await?;
+    record_audit(
+        &state,
+        AuditLog::new(
+            org.id,
+            None,
+            Some(actor_id),
+            "org.update",
+            format!("org:{}", org.id),
+            json!({ "name": org.name, "slug": org.slug }),
+        ),
+    )
+    .await;
+    Ok(Json(org))
+}
+
+#[utoipa::path(get, path = "/api/v1/orgs/{org_id}/role", params(("org_id" = String, Path)), responses((status = 200, body = OrgRoleResponse)))]
+async fn get_org_role(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(org_id): Path<Id>,
+) -> ApiResult<OrgRoleResponse> {
+    let actor_id = require_user_actor(&headers, &state).await?;
+    let actor = AuthenticatedActor::User { user_id: actor_id };
+    let role = require_org_access(&state, &actor, org_id, "orgs:read").await?;
+    Ok(Json(OrgRoleResponse {
+        org_id,
+        role: RoleResponse::from(role),
+    }))
+}
+
+#[utoipa::path(get, path = "/api/v1/orgs/{org_id}/memberships", params(("org_id" = String, Path)), responses((status = 200, body = Vec<MembershipResponse>)))]
+async fn list_memberships(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(org_id): Path<Id>,
+) -> ApiResult<Vec<MembershipResponse>> {
+    let actor_id = require_user_actor(&headers, &state).await?;
+    let actor = AuthenticatedActor::User { user_id: actor_id };
+    require_org_role(&state, &actor, org_id, Role::Admin, "memberships:read").await?;
+    Ok(Json(
+        state
+            .store
+            .list_memberships(org_id)
+            .await?
+            .into_iter()
+            .map(MembershipResponse::from_membership_with_user)
+            .collect(),
+    ))
+}
+
+#[utoipa::path(post, path = "/api/v1/orgs/{org_id}/memberships", request_body = CreateMembershipRequest, params(("org_id" = String, Path)), responses((status = 200, body = MembershipResponse)))]
+async fn create_membership(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(org_id): Path<Id>,
+    Json(request): Json<CreateMembershipRequest>,
+) -> ApiResult<MembershipResponse> {
+    let actor_id = require_user_actor(&headers, &state).await?;
+    let actor = AuthenticatedActor::User { user_id: actor_id };
+    let actor_role =
+        require_org_role(&state, &actor, org_id, Role::Admin, "memberships:write").await?;
+    let role = Role::from(request.role);
+    ensure_membership_actor_can_set_role(actor_role, role)?;
+    let email = validate_email_lookup(request.email)?;
+    let user = state.store.get_user_by_email(&email).await?;
+    let membership = state
+        .store
+        .add_membership(Membership::new(org_id, user.id, role))
+        .await?;
+    record_audit(
+        &state,
+        AuditLog::new(
+            org_id,
+            None,
+            Some(actor_id),
+            "membership.add",
+            format!("membership:{}", membership.id),
+            json!({ "user_id": user.id, "email": user.email, "role": RoleResponse::from(membership.role) }),
+        ),
+    )
+    .await;
+    Ok(Json(MembershipResponse::from_membership_and_user(
+        membership, user,
+    )))
+}
+
+#[utoipa::path(patch, path = "/api/v1/orgs/{org_id}/memberships/{membership_id}", request_body = UpdateMembershipRoleRequest, params(("org_id" = String, Path), ("membership_id" = String, Path)), responses((status = 200, body = MembershipResponse)))]
+async fn update_membership_role(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path((org_id, membership_id)): Path<(Id, Id)>,
+    Json(request): Json<UpdateMembershipRoleRequest>,
+) -> ApiResult<MembershipResponse> {
+    let actor_id = require_user_actor(&headers, &state).await?;
+    let actor = AuthenticatedActor::User { user_id: actor_id };
+    let actor_role =
+        require_org_role(&state, &actor, org_id, Role::Admin, "memberships:write").await?;
+    let before = find_membership(&state, org_id, membership_id).await?;
+    let role = Role::from(request.role);
+    ensure_membership_actor_can_change_role(actor_role, before.membership.role, role)?;
+    let membership = state
+        .store
+        .update_membership_role(org_id, membership_id, before.membership.role, role)
+        .await?;
+    let user = state.store.get_user(membership.user_id).await?;
+    record_audit(
+        &state,
+        AuditLog::new(
+            org_id,
+            None,
+            Some(actor_id),
+            "membership.role_update",
+            format!("membership:{}", membership.id),
+            json!({
+                "user_id": membership.user_id,
+                "email": user.email,
+                "previous_role": RoleResponse::from(before.membership.role),
+                "role": RoleResponse::from(membership.role)
+            }),
+        ),
+    )
+    .await;
+    Ok(Json(MembershipResponse::from_membership_and_user(
+        membership, user,
+    )))
+}
+
+#[utoipa::path(delete, path = "/api/v1/orgs/{org_id}/memberships/{membership_id}", params(("org_id" = String, Path), ("membership_id" = String, Path)), responses((status = 200, body = MembershipResponse)))]
+async fn remove_membership(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path((org_id, membership_id)): Path<(Id, Id)>,
+) -> ApiResult<MembershipResponse> {
+    let actor_id = require_user_actor(&headers, &state).await?;
+    let actor = AuthenticatedActor::User { user_id: actor_id };
+    let actor_role =
+        require_org_role(&state, &actor, org_id, Role::Admin, "memberships:write").await?;
+    let before = find_membership(&state, org_id, membership_id).await?;
+    ensure_membership_actor_can_remove(actor_role, before.membership.role)?;
+    let membership = state
+        .store
+        .remove_membership(org_id, membership_id, before.membership.role)
+        .await?;
+    let user = state.store.get_user(membership.user_id).await?;
+    record_audit(
+        &state,
+        AuditLog::new(
+            org_id,
+            None,
+            Some(actor_id),
+            "membership.remove",
+            format!("membership:{}", membership.id),
+            json!({ "user_id": membership.user_id, "email": user.email, "role": RoleResponse::from(membership.role) }),
+        ),
+    )
+    .await;
+    Ok(Json(MembershipResponse::from_membership_and_user(
+        membership, user,
+    )))
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1556,9 +2009,11 @@ async fn create_project(
         "projects:write",
     )
     .await?;
+    let name = validate_workspace_name(request.name, "name")?;
+    let slug = validate_workspace_slug(request.slug)?;
     let project = state
         .store
-        .create_project(Project::new(request.org_id, request.name, request.slug))
+        .create_project(Project::new(request.org_id, name, slug))
         .await?;
     record_audit(
         &state,
@@ -1587,6 +2042,48 @@ async fn list_projects(
         .ok_or_else(|| ApiError::BadRequest("org_id is required".to_owned()))?;
     require_org_access(&state, &actor, org_id, "projects:read").await?;
     Ok(Json(state.store.list_projects(org_id).await?))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateProjectRequest {
+    pub name: Option<String>,
+    pub slug: Option<String>,
+}
+
+#[utoipa::path(patch, path = "/api/v1/projects/{project_id}", request_body = UpdateProjectRequest, params(("project_id" = String, Path)), responses((status = 200, body = ProjectResponse)))]
+async fn update_project(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(project_id): Path<Id>,
+    Json(request): Json<UpdateProjectRequest>,
+) -> ApiResult<Project> {
+    let actor = require_actor(&headers, &state).await?;
+    let before =
+        require_project_role(&state, &actor, project_id, Role::Admin, "projects:write").await?;
+    let name = request
+        .name
+        .map(|name| validate_workspace_name(name, "name"))
+        .transpose()?;
+    let slug = request.slug.map(validate_workspace_slug).transpose()?;
+    if name.is_none() && slug.is_none() {
+        return Err(ApiError::BadRequest(
+            "at least one field is required".to_owned(),
+        ));
+    }
+    let project = state.store.update_project(project_id, name, slug).await?;
+    record_audit(
+        &state,
+        AuditLog::new(
+            project.org_id,
+            Some(project.id),
+            actor.audit_actor_id(),
+            "project.update",
+            format!("project:{}", project.id),
+            json!({ "name": project.name, "slug": project.slug, "previous_slug": before.slug }),
+        ),
+    )
+    .await;
+    Ok(Json(project))
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -3475,7 +3972,10 @@ mod tests {
     use super::*;
     use axum::{
         body::{Body, to_bytes},
-        http::{Request, StatusCode},
+        http::{
+            Request, StatusCode,
+            header::{ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN},
+        },
     };
     use tower::ServiceExt;
 
@@ -3554,6 +4054,43 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn management_routes_allow_patch_and_delete_preflight() {
+        for (path, requested_method) in [
+            ("/api/v1/me", "PATCH"),
+            (
+                "/api/v1/orgs/019fc701-0000-7000-8000-000000000001/memberships/019fc701-0000-7000-8000-000000000002",
+                "DELETE",
+            ),
+        ] {
+            let response = app_with_state(AppState::default())
+                .oneshot(
+                    Request::builder()
+                        .method(Method::OPTIONS)
+                        .uri(path)
+                        .header("origin", "http://localhost:3000")
+                        .header("access-control-request-method", requested_method)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers().get(ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
+                "http://localhost:3000"
+            );
+            let allow_methods = response
+                .headers()
+                .get(ACCESS_CONTROL_ALLOW_METHODS)
+                .unwrap()
+                .to_str()
+                .unwrap();
+            assert!(allow_methods.contains(requested_method));
+        }
     }
 
     #[tokio::test]
@@ -3993,6 +4530,467 @@ mod tests {
             .unwrap();
         assert!(audit.iter().any(|entry| entry.action == "api_key.create"));
         assert!(audit.iter().any(|entry| entry.action == "api_key.revoke"));
+    }
+
+    #[tokio::test]
+    async fn current_user_profile_can_be_read_and_updated() {
+        let state = AppState::default();
+        let user = state
+            .store
+            .create_user(User::new("me@example.com", "Original Me", "hash"))
+            .await
+            .unwrap();
+        seed_session(&state, "me-token", user.id).await;
+
+        let read_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/me")
+                    .header("authorization", "Bearer me-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read_response.status(), StatusCode::OK);
+        let body = to_bytes(read_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let current: UserResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(current.email, "me@example.com");
+        assert_eq!(current.display_name, "Original Me");
+
+        let update_response = app_with_state(state)
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/v1/me")
+                    .header("authorization", "Bearer me-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "display_name": "Renamed Me" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(update_response.status(), StatusCode::OK);
+        let body = to_bytes(update_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let updated: UserResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(updated.display_name, "Renamed Me");
+    }
+
+    #[tokio::test]
+    async fn org_and_project_updates_enforce_roles_and_audit() {
+        let state = AppState::default();
+        let owner = state
+            .store
+            .create_user(User::new("workspace-owner@example.com", "Owner", "hash"))
+            .await
+            .unwrap();
+        let admin = state
+            .store
+            .create_user(User::new("workspace-admin@example.com", "Admin", "hash"))
+            .await
+            .unwrap();
+        let viewer = state
+            .store
+            .create_user(User::new("workspace-viewer@example.com", "Viewer", "hash"))
+            .await
+            .unwrap();
+        let org = state
+            .store
+            .create_org(Org::new("Workspace Org", "workspace-org"), owner.id)
+            .await
+            .unwrap();
+        let conflicting_org = state
+            .store
+            .create_org(
+                Org::new("Workspace Conflict Org", "workspace-conflict-org"),
+                owner.id,
+            )
+            .await
+            .unwrap();
+        let project = state
+            .store
+            .create_project(Project::new(org.id, "Factory", "factory"))
+            .await
+            .unwrap();
+        let conflicting_project = state
+            .store
+            .create_project(Project::new(org.id, "Factory Conflict", "factory-conflict"))
+            .await
+            .unwrap();
+        state
+            .store
+            .add_membership(Membership::new(org.id, admin.id, Role::Admin))
+            .await
+            .unwrap();
+        state
+            .store
+            .add_membership(Membership::new(org.id, viewer.id, Role::Viewer))
+            .await
+            .unwrap();
+        seed_session(&state, "owner-workspace-token", owner.id).await;
+        seed_session(&state, "admin-workspace-token", admin.id).await;
+        seed_session(&state, "viewer-workspace-token", viewer.id).await;
+
+        let admin_org_update = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/v1/orgs/{}", org.id))
+                    .header("authorization", "Bearer admin-workspace-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "name": "Admin Rename" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(admin_org_update.status(), StatusCode::UNAUTHORIZED);
+
+        let owner_org_update = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/v1/orgs/{}", org.id))
+                    .header("authorization", "Bearer owner-workspace-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "name": "Renamed Workspace", "slug": "renamed-workspace" })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(owner_org_update.status(), StatusCode::OK);
+
+        let conflicting_org_update = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/v1/orgs/{}", org.id))
+                    .header("authorization", "Bearer owner-workspace-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "slug": conflicting_org.slug }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(conflicting_org_update.status(), StatusCode::CONFLICT);
+
+        let viewer_project_update = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/v1/projects/{}", project.id))
+                    .header("authorization", "Bearer viewer-workspace-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "name": "Viewer Rename" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(viewer_project_update.status(), StatusCode::UNAUTHORIZED);
+
+        let admin_project_update = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/v1/projects/{}", project.id))
+                    .header("authorization", "Bearer admin-workspace-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "name": "Renamed Factory", "slug": "renamed-factory" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(admin_project_update.status(), StatusCode::OK);
+
+        let conflicting_project_update = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/v1/projects/{}", project.id))
+                    .header("authorization", "Bearer admin-workspace-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "slug": conflicting_project.slug }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(conflicting_project_update.status(), StatusCode::CONFLICT);
+
+        let role_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/orgs/{}/role", org.id))
+                    .header("authorization", "Bearer admin-workspace-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(role_response.status(), StatusCode::OK);
+        let body = to_bytes(role_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let role: OrgRoleResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(role.role, RoleResponse::Admin);
+
+        let audit = state.store.list_audit(org.id, None).await.unwrap();
+        assert!(audit.iter().any(|entry| entry.action == "org.update"));
+        assert!(audit.iter().any(|entry| entry.action == "project.update"));
+    }
+
+    #[tokio::test]
+    async fn membership_management_enforces_role_boundaries_and_audits() {
+        let state = AppState::default();
+        let owner = state
+            .store
+            .create_user(User::new("membership-owner@example.com", "Owner", "hash"))
+            .await
+            .unwrap();
+        let admin = state
+            .store
+            .create_user(User::new("membership-admin@example.com", "Admin", "hash"))
+            .await
+            .unwrap();
+        let viewer = state
+            .store
+            .create_user(User::new("membership-viewer@example.com", "Viewer", "hash"))
+            .await
+            .unwrap();
+        let second_viewer = state
+            .store
+            .create_user(User::new(
+                "membership-viewer-2@example.com",
+                "Viewer 2",
+                "hash",
+            ))
+            .await
+            .unwrap();
+        let org = state
+            .store
+            .create_org(Org::new("Membership Org", "membership-org"), owner.id)
+            .await
+            .unwrap();
+        state
+            .store
+            .add_membership(Membership::new(org.id, admin.id, Role::Admin))
+            .await
+            .unwrap();
+        seed_session(&state, "membership-owner-token", owner.id).await;
+        seed_session(&state, "membership-admin-token", admin.id).await;
+        seed_session(&state, "membership-viewer-token", viewer.id).await;
+
+        let create_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/orgs/{}/memberships", org.id))
+                    .header("authorization", "Bearer membership-owner-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "email": viewer.email, "role": "Viewer" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_response.status(), StatusCode::OK);
+        let body = to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let membership: MembershipResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(membership.email, viewer.email);
+        assert_eq!(membership.role, RoleResponse::Viewer);
+
+        let list_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/orgs/{}/memberships", org.id))
+                    .header("authorization", "Bearer membership-admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_response.status(), StatusCode::OK);
+
+        let viewer_list_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/orgs/{}/memberships", org.id))
+                    .header("authorization", "Bearer membership-viewer-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(viewer_list_response.status(), StatusCode::UNAUTHORIZED);
+
+        let viewer_write_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/orgs/{}/memberships", org.id))
+                    .header("authorization", "Bearer membership-viewer-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "email": second_viewer.email, "role": "Viewer" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(viewer_write_response.status(), StatusCode::UNAUTHORIZED);
+
+        let update_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!(
+                        "/api/v1/orgs/{}/memberships/{}",
+                        org.id, membership.id
+                    ))
+                    .header("authorization", "Bearer membership-admin-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "role": "Operator" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(update_response.status(), StatusCode::OK);
+
+        let admin_grant_owner = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/orgs/{}/memberships", org.id))
+                    .header("authorization", "Bearer membership-admin-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "email": second_viewer.email, "role": "Owner" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(admin_grant_owner.status(), StatusCode::UNAUTHORIZED);
+
+        let owner_membership = state
+            .store
+            .list_memberships(org.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|membership| membership.membership.user_id == owner.id)
+            .unwrap()
+            .membership;
+        let admin_update_owner = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!(
+                        "/api/v1/orgs/{}/memberships/{}",
+                        org.id, owner_membership.id
+                    ))
+                    .header("authorization", "Bearer membership-admin-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "role": "Admin" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(admin_update_owner.status(), StatusCode::UNAUTHORIZED);
+
+        let admin_delete_owner = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!(
+                        "/api/v1/orgs/{}/memberships/{}",
+                        org.id, owner_membership.id
+                    ))
+                    .header("authorization", "Bearer membership-admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(admin_delete_owner.status(), StatusCode::UNAUTHORIZED);
+
+        let downgrade_last_owner = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!(
+                        "/api/v1/orgs/{}/memberships/{}",
+                        org.id, owner_membership.id
+                    ))
+                    .header("authorization", "Bearer membership-owner-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "role": "Admin" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(downgrade_last_owner.status(), StatusCode::CONFLICT);
+
+        let delete_last_owner = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!(
+                        "/api/v1/orgs/{}/memberships/{}",
+                        org.id, owner_membership.id
+                    ))
+                    .header("authorization", "Bearer membership-owner-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete_last_owner.status(), StatusCode::CONFLICT);
+
+        let remove_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!(
+                        "/api/v1/orgs/{}/memberships/{}",
+                        org.id, membership.id
+                    ))
+                    .header("authorization", "Bearer membership-admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(remove_response.status(), StatusCode::OK);
+
+        let audit = state.store.list_audit(org.id, None).await.unwrap();
+        assert!(audit.iter().any(|entry| entry.action == "membership.add"));
+        assert!(
+            audit
+                .iter()
+                .any(|entry| entry.action == "membership.role_update")
+        );
+        assert!(
+            audit
+                .iter()
+                .any(|entry| entry.action == "membership.remove")
+        );
     }
 
     #[tokio::test]
