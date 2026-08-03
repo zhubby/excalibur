@@ -8,8 +8,9 @@ use excalibur_domain::{
     Action, ActionDispatchTarget, ActionState, ActionStatusUpdate, ActionTargetStatusChange,
     ActionTargetTransition, AlertEvent, AlertEventState, AlertRule, ApiKey, AuditLog,
     CertificateStatus, Dashboard, Device, DeviceCertificate, DeviceStatus, DiagnosticsSession,
-    FirmwareArtifact, FirmwareRollout, Id, Membership, Org, Project, Role, StreamDefinition,
-    TelemetryAggregateBucket, TelemetryPoint, User, UserSession,
+    FirmwareArtifact, FirmwareRollout, Id, Membership, Org, Project, ProjectFeature,
+    RemoteShellSession, RemoteShellSessionState, Role, StreamDefinition, TelemetryAggregateBucket,
+    TelemetryPoint, User, UserSession,
 };
 use serde_json::Value;
 use tokio::sync::RwLock;
@@ -33,6 +34,7 @@ struct MemoryState {
     orgs: HashMap<Id, Org>,
     memberships: Vec<Membership>,
     projects: HashMap<Id, Project>,
+    project_features: HashMap<(Id, String), ProjectFeature>,
     devices: HashMap<Id, Device>,
     certificates: HashMap<Id, DeviceCertificate>,
     streams: HashMap<Id, StreamDefinition>,
@@ -40,6 +42,7 @@ struct MemoryState {
     telemetry_sequences: HashSet<TelemetryDedupeKey>,
     actions: HashMap<Id, Action>,
     action_targets: HashMap<(Id, Id), ActionTargetRecord>,
+    remote_shell_sessions: HashMap<Id, RemoteShellSession>,
     firmware: HashMap<Id, FirmwareArtifact>,
     firmware_rollouts: HashMap<Id, FirmwareRollout>,
     alerts: HashMap<Id, AlertRule>,
@@ -435,6 +438,72 @@ impl MemoryStore {
         } else {
             Err(StoreError::TenantScope)
         }
+    }
+
+    pub async fn list_project_features(&self, project_id: Id) -> Vec<ProjectFeature> {
+        let state = self.state.read().await;
+        state
+            .project_features
+            .values()
+            .filter(|feature| feature.project_id == project_id)
+            .cloned()
+            .collect()
+    }
+
+    pub async fn get_project_feature(
+        &self,
+        project_id: Id,
+        feature: &str,
+    ) -> StoreResult<Option<ProjectFeature>> {
+        let state = self.state.read().await;
+        if !state.projects.contains_key(&project_id) {
+            return Err(StoreError::NotFound("project"));
+        }
+        Ok(state
+            .project_features
+            .get(&(project_id, feature.to_owned()))
+            .cloned())
+    }
+
+    pub async fn set_project_feature(
+        &self,
+        project_id: Id,
+        feature: &str,
+        enabled: bool,
+        updated_by: Option<Id>,
+        ts: DateTime<Utc>,
+    ) -> StoreResult<ProjectFeature> {
+        if feature.trim().is_empty() {
+            return Err(StoreError::Conflict("project feature"));
+        }
+        let mut state = self.state.write().await;
+        if !state.projects.contains_key(&project_id) {
+            return Err(StoreError::NotFound("project"));
+        }
+        if let Some(user_id) = updated_by
+            && !state.users.contains_key(&user_id)
+        {
+            return Err(StoreError::NotFound("user"));
+        }
+        let key = (project_id, feature.to_owned());
+        let next = match state.project_features.get(&key) {
+            Some(existing) => ProjectFeature {
+                enabled,
+                updated_by,
+                updated_at: ts,
+                ..existing.clone()
+            },
+            None => ProjectFeature {
+                project_id,
+                feature: feature.to_owned(),
+                enabled,
+                updated_by,
+                created_at: ts,
+                updated_at: ts,
+            },
+        };
+        state.project_features.insert(key, next.clone());
+        Ok(next)
     }
 
     pub async fn create_device(&self, device: Device) -> StoreResult<Device> {
@@ -1071,6 +1140,188 @@ impl MemoryStore {
         }
 
         Ok(changes)
+    }
+
+    pub async fn create_remote_shell_session(
+        &self,
+        session: RemoteShellSession,
+    ) -> StoreResult<RemoteShellSession> {
+        let mut state = self.state.write().await;
+        if !state.projects.contains_key(&session.project_id) {
+            return Err(StoreError::NotFound("project"));
+        }
+        let device = state
+            .devices
+            .get(&session.device_id)
+            .ok_or(StoreError::NotFound("device"))?;
+        if device.project_id != session.project_id {
+            return Err(StoreError::NotFound("device"));
+        }
+        if session.is_open(Utc::now())
+            && state.remote_shell_sessions.values().any(|existing| {
+                existing.project_id == session.project_id
+                    && existing.device_id == session.device_id
+                    && existing.is_open(Utc::now())
+            })
+        {
+            return Err(StoreError::Conflict("remote shell session"));
+        }
+        if let Some(action_id) = session.action_id {
+            let action = state
+                .actions
+                .get(&action_id)
+                .ok_or(StoreError::NotFound("action"))?;
+            if action.project_id != session.project_id {
+                return Err(StoreError::NotFound("action"));
+            }
+        }
+        state
+            .remote_shell_sessions
+            .insert(session.id, session.clone());
+        Ok(session)
+    }
+
+    pub async fn attach_remote_shell_action(
+        &self,
+        project_id: Id,
+        session_id: Id,
+        action_id: Id,
+    ) -> StoreResult<RemoteShellSession> {
+        let mut state = self.state.write().await;
+        let action = state
+            .actions
+            .get(&action_id)
+            .ok_or(StoreError::NotFound("action"))?;
+        if action.project_id != project_id {
+            return Err(StoreError::NotFound("action"));
+        }
+        let session = state
+            .remote_shell_sessions
+            .get_mut(&session_id)
+            .ok_or(StoreError::NotFound("remote shell session"))?;
+        if session.project_id != project_id {
+            return Err(StoreError::NotFound("remote shell session"));
+        }
+        session.action_id = Some(action_id);
+        session.last_activity_at = Utc::now();
+        Ok(session.clone())
+    }
+
+    pub async fn get_remote_shell_session(
+        &self,
+        session_id: Id,
+    ) -> StoreResult<RemoteShellSession> {
+        let state = self.state.read().await;
+        state
+            .remote_shell_sessions
+            .get(&session_id)
+            .cloned()
+            .ok_or(StoreError::NotFound("remote shell session"))
+    }
+
+    pub async fn list_remote_shell_sessions(&self, project_id: Id) -> Vec<RemoteShellSession> {
+        let state = self.state.read().await;
+        state
+            .remote_shell_sessions
+            .values()
+            .filter(|session| session.project_id == project_id)
+            .cloned()
+            .collect()
+    }
+
+    pub async fn find_active_remote_shell_session_for_device(
+        &self,
+        project_id: Id,
+        device_id: Id,
+        now: DateTime<Utc>,
+    ) -> StoreResult<Option<RemoteShellSession>> {
+        let state = self.state.read().await;
+        let device = state
+            .devices
+            .get(&device_id)
+            .ok_or(StoreError::NotFound("device"))?;
+        if device.project_id != project_id {
+            return Err(StoreError::NotFound("device"));
+        }
+        Ok(state
+            .remote_shell_sessions
+            .values()
+            .find(|session| {
+                session.project_id == project_id
+                    && session.device_id == device_id
+                    && session.is_open(now)
+            })
+            .cloned())
+    }
+
+    pub async fn count_active_remote_shell_sessions(
+        &self,
+        project_id: Id,
+        now: DateTime<Utc>,
+    ) -> i64 {
+        let state = self.state.read().await;
+        state
+            .remote_shell_sessions
+            .values()
+            .filter(|session| session.project_id == project_id && session.is_open(now))
+            .count() as i64
+    }
+
+    pub async fn mark_remote_shell_session_active(
+        &self,
+        session_id: Id,
+        ts: DateTime<Utc>,
+    ) -> StoreResult<RemoteShellSession> {
+        let mut state = self.state.write().await;
+        let session = state
+            .remote_shell_sessions
+            .get_mut(&session_id)
+            .ok_or(StoreError::NotFound("remote shell session"))?;
+        if session.closed_at.is_some() {
+            return Err(StoreError::NotFound("remote shell session"));
+        }
+        session.state = RemoteShellSessionState::Active;
+        session.last_activity_at = ts;
+        Ok(session.clone())
+    }
+
+    pub async fn record_remote_shell_session_bytes(
+        &self,
+        session_id: Id,
+        bytes_from_operator: i64,
+        bytes_from_device: i64,
+        ts: DateTime<Utc>,
+    ) -> StoreResult<RemoteShellSession> {
+        let mut state = self.state.write().await;
+        let session = state
+            .remote_shell_sessions
+            .get_mut(&session_id)
+            .ok_or(StoreError::NotFound("remote shell session"))?;
+        session.bytes_from_operator += bytes_from_operator.max(0);
+        session.bytes_from_device += bytes_from_device.max(0);
+        session.last_activity_at = ts;
+        Ok(session.clone())
+    }
+
+    pub async fn close_remote_shell_session(
+        &self,
+        session_id: Id,
+        state_value: RemoteShellSessionState,
+        reason: &str,
+        ts: DateTime<Utc>,
+    ) -> StoreResult<RemoteShellSession> {
+        let mut state = self.state.write().await;
+        let session = state
+            .remote_shell_sessions
+            .get_mut(&session_id)
+            .ok_or(StoreError::NotFound("remote shell session"))?;
+        if session.closed_at.is_none() {
+            session.state = state_value;
+            session.closed_at = Some(ts);
+            session.close_reason = Some(reason.to_owned());
+        }
+        session.last_activity_at = ts;
+        Ok(session.clone())
     }
 
     pub async fn create_firmware(

@@ -227,6 +227,15 @@ describe("Excalibur API client", () => {
     });
     await api.listProjects("org-1");
     await api.provisionDevAuth("device-1", "project-1");
+    await api.listProjectFeatures("project-1");
+    await api.setRemoteShellFeature("project-1", true);
+    await api.createRemoteShellSession({
+      project_id: "project-1",
+      device_id: "device-1",
+      ttl_seconds: 600,
+    });
+    await api.listRemoteShellSessions("project-1");
+    await api.closeRemoteShellSession("shell-1");
     await api.createFirmware({
       project_id: "project-1",
       component: "main",
@@ -316,6 +325,32 @@ describe("Excalibur API client", () => {
         url: "http://api.example/api/v1/devices/device-1/provision/dev-auth",
         method: "POST",
         body: JSON.stringify({ project_id: "project-1" }),
+      },
+      {
+        url: "http://api.example/api/v1/projects/project-1/features",
+        method: "GET",
+      },
+      {
+        url: "http://api.example/api/v1/projects/project-1/features/remote-shell",
+        method: "POST",
+        body: JSON.stringify({ enabled: true }),
+      },
+      {
+        url: "http://api.example/api/v1/remote-shell/sessions",
+        method: "POST",
+        body: JSON.stringify({
+          project_id: "project-1",
+          device_id: "device-1",
+          ttl_seconds: 600,
+        }),
+      },
+      {
+        url: "http://api.example/api/v1/remote-shell/sessions?project_id=project-1",
+        method: "GET",
+      },
+      {
+        url: "http://api.example/api/v1/remote-shell/sessions/shell-1/close",
+        method: "POST",
       },
       {
         url: "http://api.example/api/v1/firmware",

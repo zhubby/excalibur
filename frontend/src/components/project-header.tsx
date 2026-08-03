@@ -1,4 +1,5 @@
 import { ChevronDown, LogOut, PlayCircle, RefreshCw, Search, ShieldCheck, SunMoon } from "lucide-react";
+import Link from "next/link";
 
 type ProjectHeaderProps = {
   orgName: string;
@@ -8,8 +9,6 @@ type ProjectHeaderProps = {
   busy?: boolean;
   onSearch: (value: string) => void;
   onToggleTheme: () => void;
-  onOpenProjects: () => void;
-  onOpenPermissions: () => void;
   onRefresh: () => void;
   onBootstrapDemo: () => void;
   onLogout: () => void;
@@ -23,8 +22,6 @@ export function ProjectHeader({
   busy = false,
   onSearch,
   onToggleTheme,
-  onOpenProjects,
-  onOpenPermissions,
   onRefresh,
   onBootstrapDemo,
   onLogout,
@@ -41,14 +38,13 @@ export function ProjectHeader({
           </div>
           <div className="mt-1 flex flex-wrap items-center gap-3">
             <h1 className="text-2xl font-semibold tracking-normal text-ink">{projectName}</h1>
-            <button
+            <Link
               className="inline-flex h-8 items-center gap-1 rounded-md border border-line bg-elevated px-2 text-sm text-muted transition hover:bg-line hover:text-ink"
-              type="button"
-              onClick={onOpenProjects}
+              href="/projects"
             >
               <span>Project</span>
               <ChevronDown className="h-4 w-4" aria-hidden="true" />
-            </button>
+            </Link>
           </div>
         </div>
 
@@ -64,14 +60,13 @@ export function ProjectHeader({
               onChange={(event) => onSearch(event.target.value)}
             />
           </label>
-          <button
+          <Link
             className="inline-flex h-10 items-center justify-center gap-2 rounded-md border border-line bg-elevated px-3 text-sm text-muted transition hover:bg-line hover:text-ink"
-            type="button"
-            onClick={onOpenPermissions}
+            href="/permissions"
           >
             <ShieldCheck className="h-4 w-4 text-success" aria-hidden="true" />
             <span>RBAC</span>
-          </button>
+          </Link>
           <button
             className="inline-flex h-10 items-center justify-center gap-2 rounded-md bg-brand px-3 text-sm font-medium text-ink transition hover:bg-brand-hover disabled:cursor-not-allowed disabled:bg-elevated disabled:text-faint"
             type="button"

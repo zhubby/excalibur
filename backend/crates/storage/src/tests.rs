@@ -4,8 +4,8 @@ use excalibur_domain::{
     AlertKind, AlertRule, ApiKey, AuditLog, CertificateStatus, Dashboard, Device,
     DeviceCertificate, DeviceStatus, DiagnosticsSession, DiagnosticsSessionState, FirmwareArtifact,
     FirmwareRollout, FirmwareRolloutState, Membership, NewAlertEvent, NewFirmwareRollout, Org,
-    Project, Role, StreamDefinition, StreamField, StreamFieldType, TelemetryPoint, User,
-    UserSession,
+    Project, RemoteShellSession, RemoteShellSessionState, Role, StreamDefinition, StreamField,
+    StreamFieldType, TelemetryPoint, User, UserSession,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -43,6 +43,134 @@ async fn enforces_project_scope_for_devices() {
     assert_eq!(
         store.get_device(other.id, device.id).await.unwrap_err(),
         StoreError::NotFound("device")
+    );
+}
+
+#[tokio::test]
+async fn stores_project_feature_flags() {
+    let store = MemoryStore::new();
+    let user = store
+        .create_user(User::new("features@example.com", "Features", "hash"))
+        .await
+        .unwrap();
+    let org = store
+        .create_org(Org::new("Feature Org", "feature-org"), user.id)
+        .await
+        .unwrap();
+    let project = store
+        .create_project(Project::new(org.id, "Plant", "plant"))
+        .await
+        .unwrap();
+    let ts = Utc::now();
+
+    let enabled = store
+        .set_project_feature(project.id, "remote_shell", true, Some(user.id), ts)
+        .await
+        .unwrap();
+    assert!(enabled.enabled);
+    assert_eq!(enabled.updated_by, Some(user.id));
+
+    let listed = store.list_project_features(project.id).await;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].feature, "remote_shell");
+
+    let disabled = store
+        .set_project_feature(
+            project.id,
+            "remote_shell",
+            false,
+            Some(user.id),
+            ts + chrono::Duration::seconds(1),
+        )
+        .await
+        .unwrap();
+    assert!(!disabled.enabled);
+    assert_eq!(disabled.created_at, enabled.created_at);
+    assert!(disabled.updated_at > enabled.updated_at);
+}
+
+#[tokio::test]
+async fn remote_shell_session_lifecycle_enforces_active_device_limit() {
+    let store = MemoryStore::new();
+    let user = store
+        .create_user(User::new("shell@example.com", "Shell", "hash"))
+        .await
+        .unwrap();
+    let org = store
+        .create_org(Org::new("Shell Org", "shell-org"), user.id)
+        .await
+        .unwrap();
+    let project = store
+        .create_project(Project::new(org.id, "Plant", "plant"))
+        .await
+        .unwrap();
+    let device = store
+        .create_device(Device::new(project.id, "press-1", json!({})))
+        .await
+        .unwrap();
+    let session = RemoteShellSession::new(
+        project.id,
+        device.id,
+        "operator-hash",
+        "device-hash",
+        Utc::now() + chrono::Duration::minutes(10),
+        Some(user.id),
+    );
+
+    let session = store.create_remote_shell_session(session).await.unwrap();
+    assert_eq!(session.state, RemoteShellSessionState::Opening);
+    assert_eq!(
+        store
+            .count_active_remote_shell_sessions(project.id, Utc::now())
+            .await,
+        1
+    );
+
+    let duplicate = RemoteShellSession::new(
+        project.id,
+        device.id,
+        "operator-hash-2",
+        "device-hash-2",
+        Utc::now() + chrono::Duration::minutes(10),
+        Some(user.id),
+    );
+    assert_eq!(
+        store
+            .create_remote_shell_session(duplicate)
+            .await
+            .unwrap_err(),
+        StoreError::Conflict("remote shell session")
+    );
+
+    let active = store
+        .mark_remote_shell_session_active(session.id, Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(active.state, RemoteShellSessionState::Active);
+
+    let counted = store
+        .record_remote_shell_session_bytes(session.id, 4, 7, Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(counted.bytes_from_operator, 4);
+    assert_eq!(counted.bytes_from_device, 7);
+
+    let closed = store
+        .close_remote_shell_session(
+            session.id,
+            RemoteShellSessionState::Closed,
+            "closed by test",
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(closed.state, RemoteShellSessionState::Closed);
+    assert_eq!(closed.close_reason.as_deref(), Some("closed by test"));
+    assert_eq!(
+        store
+            .count_active_remote_shell_sessions(project.id, Utc::now())
+            .await,
+        0
     );
 }
 

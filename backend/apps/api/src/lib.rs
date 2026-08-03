@@ -5,7 +5,10 @@ use std::{collections::HashMap, convert::Infallible, sync::Arc};
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{
+        Path, Query, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    },
     http::{
         HeaderMap, HeaderName, HeaderValue, Method, StatusCode,
         header::{AUTHORIZATION, CONTENT_TYPE, COOKIE, SET_COOKIE},
@@ -19,20 +22,22 @@ use axum::{
 use chrono::{Duration, Utc};
 use excalibur_device_protocol::{
     DeviceAgentAuthentication, DeviceConfig, DiagnosticsCollectPayload, ProvisioningMode,
-    PublishTopic, decode_command_status_payload, decode_telemetry_payload, parse_publish_topic,
+    PublishTopic, RemoteShellOpenPayload, decode_command_status_payload, decode_telemetry_payload,
+    parse_publish_topic,
 };
 use excalibur_domain::{
     Action, ActionState, ActionStatusUpdate, ActionTargetTransition, AlertEventState, AlertKind,
     AlertRule, ApiKey, AuditLog, Dashboard, Device, DeviceCertificate, DiagnosticsSession,
     DiagnosticsSessionState, FirmwareArtifact, FirmwareRollout, FirmwareRolloutState, Id,
-    NewFirmwareRollout, Org, Project, Role, StreamDefinition, StreamField, StreamFieldType,
-    TelemetryAggregateBucket, TelemetryPoint, User, UserSession,
+    NewFirmwareRollout, Org, Project, ProjectFeature, RemoteShellSession, RemoteShellSessionState,
+    Role, StreamDefinition, StreamField, StreamFieldType, TelemetryAggregateBucket, TelemetryPoint,
+    User, UserSession,
 };
 use excalibur_object_storage::{
     ObjectStorageConfig, presigned_object_key_url as sign_object_key_url,
 };
 use excalibur_storage::{Store, StoreError, parse_reported_action_state};
-use futures_util::stream;
+use futures_util::{SinkExt, StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tower_http::{
@@ -45,6 +50,11 @@ use uuid::Uuid;
 const ACCESS_TOKEN_PREFIX: &str = "excs_";
 const REFRESH_TOKEN_PREFIX: &str = "excr_";
 const API_KEY_PREFIX: &str = "excak_";
+const REMOTE_SHELL_TOKEN_PREFIX: &str = "excrsh_";
+const REMOTE_SHELL_FEATURE: &str = "remote_shell";
+const REMOTE_SHELL_DEFAULT_TTL_SECONDS: i64 = 600;
+const REMOTE_SHELL_MIN_TTL_SECONDS: i64 = 60;
+const REMOTE_SHELL_MAX_TTL_SECONDS: i64 = 1800;
 const ACCESS_TOKEN_TTL_HOURS: i64 = 1;
 const REFRESH_TOKEN_TTL_DAYS: i64 = 30;
 const ACCESS_COOKIE_NAME: &str = "excalibur_access";
@@ -55,12 +65,91 @@ const DEFAULT_CORS_ALLOWED_ORIGINS: &str =
 const COOKIE_ACCESS_MAX_AGE_SECONDS: i64 = ACCESS_TOKEN_TTL_HOURS * 60 * 60;
 const COOKIE_REFRESH_MAX_AGE_SECONDS: i64 = REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteShellPeer {
+    Operator,
+    Device,
+}
+
+#[derive(Debug, Default)]
+struct RemoteShellTunnelPeers {
+    operator: Option<tokio::sync::mpsc::UnboundedSender<Message>>,
+    device: Option<tokio::sync::mpsc::UnboundedSender<Message>>,
+}
+
+#[derive(Debug, Default)]
+struct RemoteShellHub {
+    peers: tokio::sync::Mutex<HashMap<Id, RemoteShellTunnelPeers>>,
+}
+
+impl RemoteShellHub {
+    async fn register(
+        &self,
+        session_id: Id,
+        peer: RemoteShellPeer,
+        sender: tokio::sync::mpsc::UnboundedSender<Message>,
+    ) -> Result<(), ()> {
+        let mut peers = self.peers.lock().await;
+        let entry = peers.entry(session_id).or_default();
+        let slot = match peer {
+            RemoteShellPeer::Operator => &mut entry.operator,
+            RemoteShellPeer::Device => &mut entry.device,
+        };
+        if slot.is_some() {
+            return Err(());
+        }
+        *slot = Some(sender);
+        Ok(())
+    }
+
+    async fn unregister(&self, session_id: Id, peer: RemoteShellPeer) {
+        let mut peers = self.peers.lock().await;
+        let Some(entry) = peers.get_mut(&session_id) else {
+            return;
+        };
+        match peer {
+            RemoteShellPeer::Operator => entry.operator = None,
+            RemoteShellPeer::Device => entry.device = None,
+        }
+        if entry.operator.is_none() && entry.device.is_none() {
+            peers.remove(&session_id);
+        }
+    }
+
+    async fn forward(&self, session_id: Id, from: RemoteShellPeer, message: Message) -> bool {
+        let sender = {
+            let peers = self.peers.lock().await;
+            let Some(entry) = peers.get(&session_id) else {
+                return false;
+            };
+            match from {
+                RemoteShellPeer::Operator => entry.device.clone(),
+                RemoteShellPeer::Device => entry.operator.clone(),
+            }
+        };
+        sender.is_some_and(|sender| sender.send(message).is_ok())
+    }
+
+    async fn close(&self, session_id: Id) {
+        let peers = self.peers.lock().await.remove(&session_id);
+        if let Some(peers) = peers {
+            if let Some(sender) = peers.operator {
+                let _ = sender.send(Message::Close(None));
+            }
+            if let Some(sender) = peers.device {
+                let _ = sender.send(Message::Close(None));
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub store: Store,
     config: AppConfig,
     started_at: chrono::DateTime<Utc>,
     auth_rate_limits: Arc<tokio::sync::Mutex<HashMap<String, Vec<chrono::DateTime<Utc>>>>>,
+    remote_shell_hub: Arc<RemoteShellHub>,
 }
 
 impl Default for AppState {
@@ -70,6 +159,7 @@ impl Default for AppState {
             config: AppConfig::development(),
             started_at: Utc::now(),
             auth_rate_limits: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            remote_shell_hub: Arc::new(RemoteShellHub::default()),
         }
     }
 }
@@ -81,6 +171,7 @@ impl AppState {
             config: AppConfig::development(),
             started_at: Utc::now(),
             auth_rate_limits: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            remote_shell_hub: Arc::new(RemoteShellHub::default()),
         }
     }
 
@@ -90,6 +181,7 @@ impl AppState {
             config,
             started_at: Utc::now(),
             auth_rate_limits: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            remote_shell_hub: Arc::new(RemoteShellHub::default()),
         }
     }
 }
@@ -101,6 +193,8 @@ pub struct AppConfig {
     object_storage: ObjectStorageConfig,
     auth_rate_limit_max_attempts: usize,
     auth_rate_limit_window_seconds: i64,
+    remote_shell_public_ws_base_url: String,
+    remote_shell_project_session_limit: usize,
 }
 
 impl AppConfig {
@@ -111,6 +205,8 @@ impl AppConfig {
             object_storage: ObjectStorageConfig::development(),
             auth_rate_limit_max_attempts: 20,
             auth_rate_limit_window_seconds: 60,
+            remote_shell_public_ws_base_url: "ws://localhost:8080".to_owned(),
+            remote_shell_project_session_limit: 5,
         }
     }
 
@@ -132,6 +228,12 @@ impl AppConfig {
             auth_rate_limit_window_seconds: parse_env_i64(
                 "API_AUTH_RATE_LIMIT_WINDOW_SECONDS",
                 60,
+            )?,
+            remote_shell_public_ws_base_url: std::env::var("REMOTE_SHELL_PUBLIC_WS_BASE_URL")
+                .unwrap_or_else(|_| "ws://localhost:8080".to_owned()),
+            remote_shell_project_session_limit: parse_env_usize(
+                "REMOTE_SHELL_PROJECT_SESSION_LIMIT",
+                5,
             )?,
         })
     }
@@ -163,6 +265,14 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/api/v1/api-keys/{api_key_id}/revoke", post(revoke_api_key))
         .route("/api/v1/orgs", get(list_orgs).post(create_org))
         .route("/api/v1/projects", get(list_projects).post(create_project))
+        .route(
+            "/api/v1/projects/{project_id}/features",
+            get(list_project_features),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/features/remote-shell",
+            post(set_remote_shell_feature),
+        )
         .route("/api/v1/devices", get(list_devices).post(create_device))
         .route(
             "/api/v1/devices/{device_id}/provision",
@@ -193,6 +303,22 @@ pub fn app_with_state(state: AppState) -> Router {
         .route(
             "/api/v1/actions/{action_id}/status",
             post(update_action_status),
+        )
+        .route(
+            "/api/v1/remote-shell/sessions",
+            get(list_remote_shell_sessions).post(create_remote_shell_session),
+        )
+        .route(
+            "/api/v1/remote-shell/sessions/{session_id}/close",
+            post(close_remote_shell_session),
+        )
+        .route(
+            "/api/v1/remote-shell/sessions/{session_id}/operator",
+            get(remote_shell_operator_ws),
+        )
+        .route(
+            "/api/v1/remote-shell/sessions/{session_id}/device",
+            get(remote_shell_device_ws),
         )
         .route("/api/v1/firmware", get(list_firmware).post(create_firmware))
         .route(
@@ -276,6 +402,8 @@ fn cors_layer() -> CorsLayer {
         list_orgs,
         create_project,
         list_projects,
+        list_project_features,
+        set_remote_shell_feature,
         create_device,
         list_devices,
         provision_device,
@@ -293,6 +421,9 @@ fn cors_layer() -> CorsLayer {
         retry_action,
         cancel_action,
         update_action_status,
+        create_remote_shell_session,
+        list_remote_shell_sessions,
+        close_remote_shell_session,
         create_firmware,
         list_firmware,
         create_firmware_upload_url,
@@ -342,7 +473,13 @@ fn cors_layer() -> CorsLayer {
         FirmwareRolloutStateResponse,
         OrgResponse,
         ProjectResponse,
+        ProjectFeatureResponse,
+        ProjectFeatureToggleRequest,
         ProvisioningModeResponse,
+        RemoteShellSessionResponse,
+        RemoteShellSessionStateResponse,
+        RemoteShellSessionCreateRequest,
+        RemoteShellSessionCreateResponse,
         StreamDefinitionResponse,
         StreamFieldResponse,
         StreamFieldTypeResponse,
@@ -402,6 +539,21 @@ mod openapi_schemas {
         pub name: String,
         pub slug: String,
         pub created_at: DateTime<Utc>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, ToSchema)]
+    pub struct ProjectFeatureResponse {
+        pub project_id: String,
+        pub feature: String,
+        pub enabled: bool,
+        pub updated_by: Option<String>,
+        pub created_at: DateTime<Utc>,
+        pub updated_at: DateTime<Utc>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, ToSchema)]
+    pub struct ProjectFeatureToggleRequest {
+        pub enabled: bool,
     }
 
     #[derive(Debug, ToSchema)]
@@ -548,6 +700,46 @@ mod openapi_schemas {
         pub updated_at: DateTime<Utc>,
     }
 
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+    pub enum RemoteShellSessionStateResponse {
+        Opening,
+        Active,
+        Closed,
+        Expired,
+        Failed,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, ToSchema)]
+    pub struct RemoteShellSessionResponse {
+        pub id: String,
+        pub project_id: String,
+        pub device_id: String,
+        pub action_id: Option<String>,
+        pub state: RemoteShellSessionStateResponse,
+        pub expires_at: DateTime<Utc>,
+        pub opened_by: Option<String>,
+        pub opened_at: DateTime<Utc>,
+        pub closed_at: Option<DateTime<Utc>>,
+        pub close_reason: Option<String>,
+        pub bytes_from_operator: i64,
+        pub bytes_from_device: i64,
+        pub last_activity_at: DateTime<Utc>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, ToSchema)]
+    pub struct RemoteShellSessionCreateRequest {
+        pub project_id: String,
+        pub device_id: String,
+        pub ttl_seconds: Option<i64>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, ToSchema)]
+    pub struct RemoteShellSessionCreateResponse {
+        pub session: RemoteShellSessionResponse,
+        pub action: ActionResponse,
+        pub operator_websocket_url: String,
+    }
+
     impl From<super::ActionState> for ActionStateResponse {
         fn from(value: super::ActionState) -> Self {
             match value {
@@ -580,6 +772,38 @@ mod openapi_schemas {
                 created_by: action.created_by.map(|id| id.to_string()),
                 created_at: action.created_at,
                 updated_at: action.updated_at,
+            }
+        }
+    }
+
+    impl From<super::RemoteShellSessionState> for RemoteShellSessionStateResponse {
+        fn from(value: super::RemoteShellSessionState) -> Self {
+            match value {
+                super::RemoteShellSessionState::Opening => Self::Opening,
+                super::RemoteShellSessionState::Active => Self::Active,
+                super::RemoteShellSessionState::Closed => Self::Closed,
+                super::RemoteShellSessionState::Expired => Self::Expired,
+                super::RemoteShellSessionState::Failed => Self::Failed,
+            }
+        }
+    }
+
+    impl From<super::RemoteShellSession> for RemoteShellSessionResponse {
+        fn from(session: super::RemoteShellSession) -> Self {
+            Self {
+                id: session.id.to_string(),
+                project_id: session.project_id.to_string(),
+                device_id: session.device_id.to_string(),
+                action_id: session.action_id.map(|id| id.to_string()),
+                state: session.state.into(),
+                expires_at: session.expires_at,
+                opened_by: session.opened_by.map(|id| id.to_string()),
+                opened_at: session.opened_at,
+                closed_at: session.closed_at,
+                close_reason: session.close_reason,
+                bytes_from_operator: session.bytes_from_operator,
+                bytes_from_device: session.bytes_from_device,
+                last_activity_at: session.last_activity_at,
             }
         }
     }
@@ -731,8 +955,9 @@ use openapi_schemas::{
     DashboardResponse, DeviceAgentAuthenticationResponse, DeviceCertificateResponse,
     DeviceConfigResponse, DeviceResponse, DeviceStatusResponse, DiagnosticsSessionCreateResponse,
     DiagnosticsSessionResponse, DiagnosticsSessionStateResponse, FirmwareArtifactResponse,
-    FirmwareRolloutResponse, FirmwareRolloutStateResponse, OrgResponse, ProjectResponse,
-    ProvisioningModeResponse, StreamDefinitionResponse, StreamFieldResponse,
+    FirmwareRolloutResponse, FirmwareRolloutStateResponse, OrgResponse, ProjectFeatureResponse,
+    ProjectResponse, ProvisioningModeResponse, RemoteShellSessionResponse,
+    RemoteShellSessionStateResponse, StreamDefinitionResponse, StreamFieldResponse,
     StreamFieldTypeResponse, TelemetryAggregateBucketResponse, TelemetryPointResponse,
 };
 
@@ -1541,6 +1766,24 @@ pub struct ProjectQuery {
     pub project_id: Option<Id>,
 }
 
+impl From<ProjectFeature> for ProjectFeatureResponse {
+    fn from(feature: ProjectFeature) -> Self {
+        Self {
+            project_id: feature.project_id.to_string(),
+            feature: feature.feature,
+            enabled: feature.enabled,
+            updated_by: feature.updated_by.map(|id| id.to_string()),
+            created_at: feature.created_at,
+            updated_at: feature.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ProjectFeatureToggleRequest {
+    pub enabled: bool,
+}
+
 #[utoipa::path(post, path = "/api/v1/projects", request_body = CreateProjectRequest, responses((status = 200, body = ProjectResponse)))]
 async fn create_project(
     headers: HeaderMap,
@@ -1587,6 +1830,79 @@ async fn list_projects(
         .ok_or_else(|| ApiError::BadRequest("org_id is required".to_owned()))?;
     require_org_access(&state, &actor, org_id, "projects:read").await?;
     Ok(Json(state.store.list_projects(org_id).await?))
+}
+
+#[utoipa::path(get, path = "/api/v1/projects/{project_id}/features", params(("project_id" = String, Path)), responses((status = 200, body = Vec<ProjectFeatureResponse>)))]
+async fn list_project_features(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(project_id): Path<Id>,
+) -> ApiResult<Vec<ProjectFeatureResponse>> {
+    let actor = require_actor(&headers, &state).await?;
+    require_project_access(&state, &actor, project_id, "remote_shell:read").await?;
+    let mut features = state
+        .store
+        .list_project_features(project_id)
+        .await?
+        .into_iter()
+        .map(ProjectFeatureResponse::from)
+        .collect::<Vec<_>>();
+    if !features
+        .iter()
+        .any(|feature| feature.feature == REMOTE_SHELL_FEATURE)
+    {
+        let now = Utc::now();
+        features.push(ProjectFeatureResponse {
+            project_id: project_id.to_string(),
+            feature: REMOTE_SHELL_FEATURE.to_owned(),
+            enabled: false,
+            updated_by: None,
+            created_at: now,
+            updated_at: now,
+        });
+    }
+    Ok(Json(features))
+}
+
+#[utoipa::path(post, path = "/api/v1/projects/{project_id}/features/remote-shell", request_body = ProjectFeatureToggleRequest, params(("project_id" = String, Path)), responses((status = 200, body = ProjectFeatureResponse)))]
+async fn set_remote_shell_feature(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(project_id): Path<Id>,
+    Json(request): Json<ProjectFeatureToggleRequest>,
+) -> ApiResult<ProjectFeatureResponse> {
+    let actor = require_actor(&headers, &state).await?;
+    let project = require_project_role(
+        &state,
+        &actor,
+        project_id,
+        Role::Admin,
+        "remote_shell:admin",
+    )
+    .await?;
+    let feature = state
+        .store
+        .set_project_feature(
+            project_id,
+            REMOTE_SHELL_FEATURE,
+            request.enabled,
+            actor.audit_actor_id(),
+            Utc::now(),
+        )
+        .await?;
+    record_audit(
+        &state,
+        AuditLog::new(
+            project.org_id,
+            Some(project.id),
+            actor.audit_actor_id(),
+            "project_feature.remote_shell",
+            format!("project:{}", project.id),
+            json!({ "enabled": request.enabled }),
+        ),
+    )
+    .await;
+    Ok(Json(feature.into()))
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -2308,9 +2624,17 @@ async fn validate_device_action(
                     ApiError::BadRequest(format!("invalid diagnostics.collect payload: {error}"))
                 })
         }
-        "remote_shell.open" => Err(ApiError::BadRequest(
-            "remote shell beta is disabled for this project".to_owned(),
-        )),
+        "remote_shell.open" => {
+            if project_feature_enabled(state, project_id, REMOTE_SHELL_FEATURE).await? {
+                Err(ApiError::BadRequest(
+                    "use the remote shell sessions endpoint to open a shell".to_owned(),
+                ))
+            } else {
+                Err(ApiError::BadRequest(
+                    "remote shell beta is disabled for this project".to_owned(),
+                ))
+            }
+        }
         _ => Err(ApiError::BadRequest(format!(
             "unsupported device-agent action: {name}"
         ))),
@@ -2609,6 +2933,462 @@ async fn update_action_status(
     Ok(Json(action.into()))
 }
 
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct RemoteShellSessionsQuery {
+    #[param(value_type = String, format = Uuid)]
+    pub project_id: Id,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct RemoteShellSessionCreateRequest {
+    #[schema(value_type = String, format = Uuid)]
+    pub project_id: Id,
+    #[schema(value_type = String, format = Uuid)]
+    pub device_id: Id,
+    pub ttl_seconds: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct RemoteShellSessionCreateResponse {
+    pub session: RemoteShellSessionResponse,
+    pub action: ActionResponse,
+    pub operator_websocket_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RemoteShellTokenQuery {
+    pub token: String,
+}
+
+#[utoipa::path(get, path = "/api/v1/remote-shell/sessions", params(RemoteShellSessionsQuery), responses((status = 200, body = Vec<RemoteShellSessionResponse>)))]
+async fn list_remote_shell_sessions(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(query): Query<RemoteShellSessionsQuery>,
+) -> ApiResult<Vec<RemoteShellSessionResponse>> {
+    let actor = require_actor(&headers, &state).await?;
+    require_project_access(&state, &actor, query.project_id, "remote_shell:read").await?;
+    Ok(Json(
+        state
+            .store
+            .list_remote_shell_sessions(query.project_id)
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+    ))
+}
+
+#[utoipa::path(post, path = "/api/v1/remote-shell/sessions", request_body = RemoteShellSessionCreateRequest, responses((status = 200, body = RemoteShellSessionCreateResponse)))]
+async fn create_remote_shell_session(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<RemoteShellSessionCreateRequest>,
+) -> ApiResult<RemoteShellSessionCreateResponse> {
+    let actor = require_actor(&headers, &state).await?;
+    let project = require_project_role(
+        &state,
+        &actor,
+        request.project_id,
+        Role::Operator,
+        "remote_shell:open",
+    )
+    .await?;
+    if !project_feature_enabled(&state, request.project_id, REMOTE_SHELL_FEATURE).await? {
+        return Err(ApiError::BadRequest(
+            "remote shell beta is disabled for this project".to_owned(),
+        ));
+    }
+    state
+        .store
+        .get_device(request.project_id, request.device_id)
+        .await?;
+
+    let ttl_seconds = validate_remote_shell_ttl(request.ttl_seconds)?;
+    let now = Utc::now();
+    if state
+        .store
+        .find_active_remote_shell_session_for_device(request.project_id, request.device_id, now)
+        .await?
+        .is_some()
+    {
+        return Err(ApiError::Conflict(
+            "active remote shell session already exists for this device".to_owned(),
+        ));
+    }
+    let active_count = state
+        .store
+        .count_active_remote_shell_sessions(request.project_id, now)
+        .await?;
+    if active_count >= state.config.remote_shell_project_session_limit.max(1) as i64 {
+        return Err(ApiError::Conflict(
+            "remote shell project session limit reached".to_owned(),
+        ));
+    }
+
+    let operator_token = auth::generate_secret(REMOTE_SHELL_TOKEN_PREFIX);
+    let device_token = auth::generate_secret(REMOTE_SHELL_TOKEN_PREFIX);
+    let expires_at = now + Duration::seconds(ttl_seconds);
+    let session = RemoteShellSession::new(
+        request.project_id,
+        request.device_id,
+        auth::hash_secret(&operator_token),
+        auth::hash_secret(&device_token),
+        expires_at,
+        actor.audit_actor_id(),
+    );
+    let session = state.store.create_remote_shell_session(session).await?;
+    let device_websocket_url =
+        remote_shell_ws_url(&state, session.id, RemoteShellPeer::Device, &device_token);
+    let operator_websocket_url = remote_shell_ws_url(
+        &state,
+        session.id,
+        RemoteShellPeer::Operator,
+        &operator_token,
+    );
+    let payload = serde_json::to_value(RemoteShellOpenPayload {
+        session_id: session.id,
+        websocket_url: device_websocket_url,
+        expires_at,
+    })
+    .map_err(|_| ApiError::Internal("failed to encode remote shell payload".to_owned()))?;
+    let action = Action::new(
+        request.project_id,
+        vec![request.device_id],
+        "remote_shell.open",
+        payload,
+        actor.audit_actor_id(),
+    );
+    let action = match state.store.create_action(action).await {
+        Ok(action) => action,
+        Err(error) => {
+            let _ = state
+                .store
+                .close_remote_shell_session(
+                    session.id,
+                    RemoteShellSessionState::Failed,
+                    "failed to create remote shell action",
+                    Utc::now(),
+                )
+                .await;
+            return Err(ApiError::from(error));
+        }
+    };
+    let session = state
+        .store
+        .attach_remote_shell_action(request.project_id, session.id, action.id)
+        .await?;
+    record_audit(
+        &state,
+        AuditLog::new(
+            project.org_id,
+            Some(project.id),
+            actor.audit_actor_id(),
+            "remote_shell.open",
+            format!("remote_shell_session:{}", session.id),
+            json!({ "device_id": request.device_id, "action_id": action.id, "ttl_seconds": ttl_seconds }),
+        ),
+    )
+    .await;
+    Ok(Json(RemoteShellSessionCreateResponse {
+        session: session.into(),
+        action: action.into(),
+        operator_websocket_url,
+    }))
+}
+
+#[utoipa::path(post, path = "/api/v1/remote-shell/sessions/{session_id}/close", params(("session_id" = String, Path)), responses((status = 200, body = RemoteShellSessionResponse)))]
+async fn close_remote_shell_session(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(session_id): Path<Id>,
+) -> ApiResult<RemoteShellSessionResponse> {
+    let actor = require_actor(&headers, &state).await?;
+    let session = state.store.get_remote_shell_session(session_id).await?;
+    let project = require_project_role(
+        &state,
+        &actor,
+        session.project_id,
+        Role::Operator,
+        "remote_shell:open",
+    )
+    .await?;
+    let closed = close_remote_shell_session_with_action(
+        &state,
+        session,
+        RemoteShellSessionState::Closed,
+        "closed by operator",
+        Some(ActionState::Cancelled),
+    )
+    .await?;
+    state.remote_shell_hub.close(session_id).await;
+    record_audit(
+        &state,
+        AuditLog::new(
+            project.org_id,
+            Some(project.id),
+            actor.audit_actor_id(),
+            "remote_shell.close",
+            format!("remote_shell_session:{session_id}"),
+            json!({ "reason": "closed by operator" }),
+        ),
+    )
+    .await;
+    Ok(Json(closed.into()))
+}
+
+async fn remote_shell_operator_ws(
+    State(state): State<AppState>,
+    Path(session_id): Path<Id>,
+    Query(query): Query<RemoteShellTokenQuery>,
+    ws: WebSocketUpgrade,
+) -> Result<Response, ApiError> {
+    validate_remote_shell_ws(&state, session_id, RemoteShellPeer::Operator, &query.token).await?;
+    Ok(ws.on_upgrade(move |socket| {
+        handle_remote_shell_socket(state, session_id, RemoteShellPeer::Operator, socket)
+    }))
+}
+
+async fn remote_shell_device_ws(
+    State(state): State<AppState>,
+    Path(session_id): Path<Id>,
+    Query(query): Query<RemoteShellTokenQuery>,
+    ws: WebSocketUpgrade,
+) -> Result<Response, ApiError> {
+    validate_remote_shell_ws(&state, session_id, RemoteShellPeer::Device, &query.token).await?;
+    Ok(ws.on_upgrade(move |socket| {
+        handle_remote_shell_socket(state, session_id, RemoteShellPeer::Device, socket)
+    }))
+}
+
+async fn project_feature_enabled(
+    state: &AppState,
+    project_id: Id,
+    feature: &str,
+) -> Result<bool, ApiError> {
+    Ok(state
+        .store
+        .get_project_feature(project_id, feature)
+        .await?
+        .is_some_and(|feature| feature.enabled))
+}
+
+fn validate_remote_shell_ttl(ttl_seconds: Option<i64>) -> Result<i64, ApiError> {
+    let ttl_seconds = ttl_seconds.unwrap_or(REMOTE_SHELL_DEFAULT_TTL_SECONDS);
+    if !(REMOTE_SHELL_MIN_TTL_SECONDS..=REMOTE_SHELL_MAX_TTL_SECONDS).contains(&ttl_seconds) {
+        return Err(ApiError::BadRequest(format!(
+            "ttl_seconds must be between {REMOTE_SHELL_MIN_TTL_SECONDS} and {REMOTE_SHELL_MAX_TTL_SECONDS}"
+        )));
+    }
+    Ok(ttl_seconds)
+}
+
+fn remote_shell_ws_url(
+    state: &AppState,
+    session_id: Id,
+    peer: RemoteShellPeer,
+    token: &str,
+) -> String {
+    let peer_path = match peer {
+        RemoteShellPeer::Operator => "operator",
+        RemoteShellPeer::Device => "device",
+    };
+    let base = state
+        .config
+        .remote_shell_public_ws_base_url
+        .trim()
+        .trim_end_matches('/');
+    let base = if base.is_empty() {
+        "ws://localhost:8080"
+    } else {
+        base
+    };
+    format!("{base}/api/v1/remote-shell/sessions/{session_id}/{peer_path}?token={token}")
+}
+
+async fn validate_remote_shell_ws(
+    state: &AppState,
+    session_id: Id,
+    peer: RemoteShellPeer,
+    token: &str,
+) -> Result<RemoteShellSession, ApiError> {
+    let session = state.store.get_remote_shell_session(session_id).await?;
+    let now = Utc::now();
+    if session.expires_at <= now {
+        let expired = close_remote_shell_session_with_action(
+            state,
+            session,
+            RemoteShellSessionState::Expired,
+            "remote shell session expired",
+            Some(ActionState::TimedOut),
+        )
+        .await?;
+        state.remote_shell_hub.close(session_id).await;
+        return Err(ApiError::Unauthorized(format!(
+            "remote shell session expired at {}",
+            expired.expires_at
+        )));
+    }
+    if session.closed_at.is_some()
+        || !matches!(
+            session.state,
+            RemoteShellSessionState::Opening | RemoteShellSessionState::Active
+        )
+    {
+        return Err(ApiError::Unauthorized(
+            "remote shell session is closed".to_owned(),
+        ));
+    }
+    let token_hash = auth::hash_secret(token);
+    let expected_hash = match peer {
+        RemoteShellPeer::Operator => &session.operator_token_hash,
+        RemoteShellPeer::Device => &session.device_token_hash,
+    };
+    if &token_hash != expected_hash {
+        return Err(ApiError::Unauthorized(
+            "invalid remote shell token".to_owned(),
+        ));
+    }
+    if peer == RemoteShellPeer::Device {
+        return Ok(state
+            .store
+            .mark_remote_shell_session_active(session_id, now)
+            .await?);
+    }
+    Ok(session)
+}
+
+async fn close_remote_shell_session_with_action(
+    state: &AppState,
+    session: RemoteShellSession,
+    next_state: RemoteShellSessionState,
+    reason: &str,
+    action_state: Option<ActionState>,
+) -> Result<RemoteShellSession, ApiError> {
+    let ts = Utc::now();
+    let closed = state
+        .store
+        .close_remote_shell_session(session.id, next_state, reason, ts)
+        .await?;
+    if let (Some(action_id), Some(action_state)) = (session.action_id, action_state) {
+        let _ = state
+            .store
+            .transition_action_targets(ActionTargetTransition {
+                project_id: session.project_id,
+                action_id,
+                device_ids: Some(vec![session.device_id]),
+                allowed_source_states: vec![
+                    ActionState::Queued,
+                    ActionState::WaitingApproval,
+                    ActionState::Running,
+                ],
+                next_state: action_state,
+                progress: None,
+                errors: Some(vec![reason.to_owned()]),
+                ts,
+            })
+            .await;
+    }
+    Ok(closed)
+}
+
+async fn handle_remote_shell_socket(
+    state: AppState,
+    session_id: Id,
+    peer: RemoteShellPeer,
+    socket: WebSocket,
+) {
+    let (mut ws_sender, mut ws_receiver) = socket.split();
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<Message>();
+    if state
+        .remote_shell_hub
+        .register(session_id, peer, sender)
+        .await
+        .is_err()
+    {
+        let _ = ws_sender.send(Message::Close(None)).await;
+        return;
+    }
+
+    let writer = tokio::spawn(async move {
+        while let Some(message) = receiver.recv().await {
+            if ws_sender.send(message).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut close_reason = match peer {
+        RemoteShellPeer::Operator => "operator websocket disconnected",
+        RemoteShellPeer::Device => "device websocket disconnected",
+    };
+
+    while let Some(message) = ws_receiver.next().await {
+        match message {
+            Ok(message @ (Message::Text(_) | Message::Binary(_))) => {
+                let byte_count = remote_shell_message_len(&message);
+                let (operator_bytes, device_bytes) = match peer {
+                    RemoteShellPeer::Operator => (byte_count, 0),
+                    RemoteShellPeer::Device => (0, byte_count),
+                };
+                let _ = state
+                    .store
+                    .record_remote_shell_session_bytes(
+                        session_id,
+                        operator_bytes,
+                        device_bytes,
+                        Utc::now(),
+                    )
+                    .await;
+                let _ = state
+                    .remote_shell_hub
+                    .forward(session_id, peer, message)
+                    .await;
+            }
+            Ok(Message::Close(_)) => {
+                close_reason = match peer {
+                    RemoteShellPeer::Operator => "operator websocket closed",
+                    RemoteShellPeer::Device => "device websocket closed",
+                };
+                break;
+            }
+            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {}
+            Err(error) => {
+                tracing::warn!(?error, %session_id, ?peer, "remote shell websocket error");
+                close_reason = match peer {
+                    RemoteShellPeer::Operator => "operator websocket error",
+                    RemoteShellPeer::Device => "device websocket error",
+                };
+                break;
+            }
+        }
+    }
+
+    writer.abort();
+    state.remote_shell_hub.unregister(session_id, peer).await;
+    if let Ok(session) = state.store.get_remote_shell_session(session_id).await
+        && session.closed_at.is_none()
+    {
+        let _ = close_remote_shell_session_with_action(
+            &state,
+            session,
+            RemoteShellSessionState::Closed,
+            close_reason,
+            None,
+        )
+        .await;
+        state.remote_shell_hub.close(session_id).await;
+    }
+}
+
+fn remote_shell_message_len(message: &Message) -> i64 {
+    match message {
+        Message::Text(text) => text.len() as i64,
+        Message::Binary(bytes) => bytes.len() as i64,
+        _ => 0,
+    }
+}
+
 fn redacted_action_payload(mut payload: Value) -> Value {
     redact_signed_url_fields(&mut payload);
     payload
@@ -2617,7 +3397,7 @@ fn redacted_action_payload(mut payload: Value) -> Value {
 fn redact_signed_url_fields(value: &mut Value) {
     match value {
         Value::Object(map) => {
-            for key in ["signed_url", "upload_url"] {
+            for key in ["signed_url", "upload_url", "websocket_url"] {
                 if map.contains_key(key) {
                     map.insert(key.to_owned(), Value::String("<redacted>".to_owned()));
                 }
@@ -4695,6 +5475,216 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(remote_shell_response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn remote_shell_feature_toggle_and_session_lifecycle_are_guarded() {
+        let state = AppState::default();
+        let user = state
+            .store
+            .create_user(User::new("shell-owner@example.com", "Shell Owner", "hash"))
+            .await
+            .unwrap();
+        let org = state
+            .store
+            .create_org(Org::new("Shell Org", "shell-org"), user.id)
+            .await
+            .unwrap();
+        let project = state
+            .store
+            .create_project(Project::new(org.id, "Factory", "factory"))
+            .await
+            .unwrap();
+        let device = state
+            .store
+            .create_device(Device::new(project.id, "press-1", json!({})))
+            .await
+            .unwrap();
+        seed_session(&state, "owner-token", user.id).await;
+
+        let default_features_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/projects/{}/features", project.id))
+                    .header("authorization", "Bearer owner-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(default_features_response.status(), StatusCode::OK);
+        let body = to_bytes(default_features_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let features: Vec<ProjectFeatureResponse> = serde_json::from_slice(&body).unwrap();
+        assert!(
+            features
+                .iter()
+                .any(|feature| { feature.feature == REMOTE_SHELL_FEATURE && !feature.enabled })
+        );
+
+        let disabled_create_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/remote-shell/sessions")
+                    .header("authorization", "Bearer owner-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "project_id": project.id,
+                            "device_id": device.id
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(disabled_create_response.status(), StatusCode::BAD_REQUEST);
+
+        let toggle_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/v1/projects/{}/features/remote-shell",
+                        project.id
+                    ))
+                    .header("authorization", "Bearer owner-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "enabled": true }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(toggle_response.status(), StatusCode::OK);
+        let body = to_bytes(toggle_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let feature: ProjectFeatureResponse = serde_json::from_slice(&body).unwrap();
+        assert!(feature.enabled);
+
+        let direct_action_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/actions")
+                    .header("authorization", "Bearer owner-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "project_id": project.id,
+                            "device_ids": [device.id],
+                            "name": "remote_shell.open",
+                            "payload": {}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(direct_action_response.status(), StatusCode::BAD_REQUEST);
+
+        let create_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/remote-shell/sessions")
+                    .header("authorization", "Bearer owner-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "project_id": project.id,
+                            "device_id": device.id,
+                            "ttl_seconds": 600
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_response.status(), StatusCode::OK);
+        let body = to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let created: RemoteShellSessionCreateResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            created.session.state,
+            RemoteShellSessionStateResponse::Opening
+        );
+        assert_eq!(created.action.name, "remote_shell.open");
+        assert!(created.operator_websocket_url.contains("/operator?token="));
+        assert_eq!(created.action.payload["websocket_url"], "<redacted>");
+
+        let duplicate_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/remote-shell/sessions")
+                    .header("authorization", "Bearer owner-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "project_id": project.id,
+                            "device_id": device.id
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(duplicate_response.status(), StatusCode::CONFLICT);
+
+        let close_response = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/v1/remote-shell/sessions/{}/close",
+                        created.session.id
+                    ))
+                    .header("authorization", "Bearer owner-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(close_response.status(), StatusCode::OK);
+        let body = to_bytes(close_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let closed: RemoteShellSessionResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(closed.state, RemoteShellSessionStateResponse::Closed);
+
+        let action = state
+            .store
+            .list_actions(project.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|action| action.id.to_string() == created.action.id)
+            .unwrap();
+        assert_eq!(action.state, ActionState::Cancelled);
+
+        let audit = state
+            .store
+            .list_audit(org.id, Some(project.id))
+            .await
+            .unwrap();
+        assert!(
+            audit
+                .iter()
+                .any(|entry| entry.action == "remote_shell.open")
+        );
+        assert!(
+            audit
+                .iter()
+                .any(|entry| entry.action == "remote_shell.close")
+        );
     }
 
     #[tokio::test]

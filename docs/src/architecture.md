@@ -35,8 +35,8 @@ flowchart LR
 
 ## 设备数据路径
 
-1. 设备通过 CSR 或 dev auth JSON 获得 broker、project_id、device_id、CA、device cert 和私钥路径。
-2. `device-agent` 使用 mTLS 连接 MQTT broker。
+1. 设备通过 CSR 或 dev auth JSON 获得 project_id、device_id、CA、device cert、私钥路径，以及可选静态 broker fallback。
+2. `device-agent` 默认通过本机 Tailscale LocalAPI 发现带 `tag:excalibur-server` 的上游节点，再使用 mTLS 连接 MQTT broker；关闭 discovery 时直接使用静态 broker。
 3. 设备向 `v1/p/{project_id}/d/{device_id}/telemetry/{stream}` 发布 JSON array。
 4. MQTT runtime 调用 `mqtt-ingest` ingest path；本地 runtime 会按 topic 查 device，生产身份模式要求稳定非空 ClientId，并确认 topic project/device 与证书身份一致。
 5. ingest 解码 payload，触发 heartbeat；telemetry 在 NATS buffer 模式下先拿 JetStream PubAck，再允许 broker ack 设备 publish；随后由 worker durable consumer batch 写入 TimescaleDB hypertable。

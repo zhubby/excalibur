@@ -1,7 +1,7 @@
 import type { LucideIcon } from "lucide-react";
-import { Activity, Building2, FolderKanban, Gauge, KeyRound, ScrollText, ShieldCheck, UploadCloud, Zap } from "lucide-react";
+import { Activity, Building2, FolderKanban, Gauge, KeyRound, LayoutDashboard, ScrollText, ShieldCheck, UploadCloud, Zap } from "lucide-react";
 
-export type PrimaryNavSectionId = "fleet" | "streams" | "actions" | "firmware" | "security";
+export type PrimaryNavSectionId = "dashboard" | "fleet" | "streams" | "actions" | "firmware" | "security";
 export type ManagementSectionId = "organization" | "projects" | "permissions" | "audit";
 export type NavSectionId = PrimaryNavSectionId | ManagementSectionId;
 
@@ -52,24 +52,27 @@ export type AlertSummary = {
 };
 
 export const navItems = [
-  { id: "fleet", label: "Fleet", icon: Gauge },
-  { id: "streams", label: "Streams", icon: Activity },
-  { id: "actions", label: "Actions", icon: Zap },
-  { id: "firmware", label: "Firmware", icon: UploadCloud },
-  { id: "security", label: "Security", icon: ShieldCheck },
+  { id: "dashboard", label: "Dashboard", href: "/", icon: LayoutDashboard },
+  { id: "fleet", label: "Fleet", href: "/fleet", icon: Gauge },
+  { id: "streams", label: "Streams", href: "/streams", icon: Activity },
+  { id: "actions", label: "Actions", href: "/actions", icon: Zap },
+  { id: "firmware", label: "Firmware", href: "/firmware", icon: UploadCloud },
+  { id: "security", label: "Security", href: "/security", icon: ShieldCheck },
 ] satisfies Array<{
   id: PrimaryNavSectionId;
   label: string;
+  href: string;
   icon: LucideIcon;
 }>;
 
 export const managementNavItems = [
-  { id: "organization", label: "Organization", icon: Building2 },
-  { id: "projects", label: "Projects", icon: FolderKanban },
-  { id: "permissions", label: "Permissions", icon: KeyRound },
-  { id: "audit", label: "Audit log", icon: ScrollText },
+  { id: "organization", label: "Organization", href: "/organization", icon: Building2 },
+  { id: "projects", label: "Projects", href: "/projects", icon: FolderKanban },
+  { id: "permissions", label: "Permissions", href: "/permissions", icon: KeyRound },
+  { id: "audit", label: "Audit log", href: "/audit", icon: ScrollText },
 ] satisfies Array<{
   id: ManagementSectionId;
   label: string;
+  href: string;
   icon: LucideIcon;
 }>;

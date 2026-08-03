@@ -26,8 +26,12 @@ import type {
   LoginRequest,
   LogoutResponse,
   OrgResponse,
+  ProjectFeatureResponse,
   ProjectResponse,
   RefreshRequest,
+  RemoteShellSessionCreateRequest,
+  RemoteShellSessionCreateResponse,
+  RemoteShellSessionResponse,
   RegisterRequest,
   SignedObjectUrl,
   StreamDefinitionResponse,
@@ -53,6 +57,7 @@ export type {
   LoginRequest,
   LogoutResponse,
   RefreshRequest,
+  RemoteShellSessionCreateRequest,
   RegisterRequest,
   SignedObjectUrl,
 } from "./generated/api-types";
@@ -72,6 +77,9 @@ export type FirmwareArtifact = FirmwareArtifactResponse;
 export type FirmwareRollout = FirmwareRolloutResponse;
 export type Org = OrgResponse;
 export type Project = ProjectResponse;
+export type ProjectFeature = ProjectFeatureResponse;
+export type RemoteShellSession = RemoteShellSessionResponse;
+export type RemoteShellSessionCreate = RemoteShellSessionCreateResponse;
 export type StreamDefinition = StreamDefinitionResponse;
 export type StreamField = StreamFieldDto;
 export type StreamFieldType = StreamFieldTypeDto;
@@ -198,6 +206,13 @@ export function createExcaliburApi(options: ApiClientOptions = {}) {
       request<Project[]>("/api/v1/projects", { query: { org_id: orgId } }),
     createProject: (body: { org_id: string; name: string; slug: string }) =>
       request<Project>("/api/v1/projects", { method: "POST", bodyJson: body }),
+    listProjectFeatures: (projectId: string) =>
+      request<ProjectFeature[]>(`/api/v1/projects/${projectId}/features`),
+    setRemoteShellFeature: (projectId: string, enabled: boolean) =>
+      request<ProjectFeature>(`/api/v1/projects/${projectId}/features/remote-shell`, {
+        method: "POST",
+        bodyJson: { enabled },
+      }),
     listDevices: (projectId: string) =>
       request<Device[]>("/api/v1/devices", { query: { project_id: projectId } }),
     createDevice: (body: { project_id: string; name: string; metadata: JsonValue }) =>
@@ -275,6 +290,19 @@ export function createExcaliburApi(options: ApiClientOptions = {}) {
       request<Action>(`/api/v1/actions/${actionId}/status`, {
         method: "POST",
         bodyJson: body,
+      }),
+    createRemoteShellSession: (body: RemoteShellSessionCreateRequest) =>
+      request<RemoteShellSessionCreate>("/api/v1/remote-shell/sessions", {
+        method: "POST",
+        bodyJson: body,
+      }),
+    listRemoteShellSessions: (projectId: string) =>
+      request<RemoteShellSession[]>("/api/v1/remote-shell/sessions", {
+        query: { project_id: projectId },
+      }),
+    closeRemoteShellSession: (sessionId: string) =>
+      request<RemoteShellSession>(`/api/v1/remote-shell/sessions/${sessionId}/close`, {
+        method: "POST",
       }),
     listFirmware: (projectId: string) =>
       request<FirmwareArtifact[]>("/api/v1/firmware", { query: { project_id: projectId } }),

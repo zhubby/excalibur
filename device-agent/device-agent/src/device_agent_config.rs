@@ -40,6 +40,34 @@ fn default_download_path() -> PathBuf {
     path
 }
 
+fn default_upstream_discovery_enabled() -> bool {
+    true
+}
+
+fn default_upstream_discovery_tag() -> String {
+    "tag:excalibur-server".to_owned()
+}
+
+fn default_upstream_api_ready_port() -> u16 {
+    8080
+}
+
+fn default_upstream_mqtt_plaintext_port() -> u16 {
+    1883
+}
+
+fn default_upstream_mqtt_tls_port() -> u16 {
+    8883
+}
+
+fn default_upstream_probe_timeout_ms() -> u64 {
+    2000
+}
+
+fn default_remote_shell_path() -> PathBuf {
+    PathBuf::from("/bin/sh")
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, PartialEq, Eq, PartialOrd)]
 pub enum Compression {
     #[default]
@@ -207,6 +235,50 @@ pub struct MqttConfig {
     pub network_timeout: u64,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpstreamDiscoveryConfig {
+    #[serde(default = "default_upstream_discovery_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_upstream_discovery_tag")]
+    pub server_tag: String,
+    #[serde(default)]
+    pub socket_path: Option<PathBuf>,
+    #[serde(default = "default_upstream_api_ready_port")]
+    pub api_ready_port: u16,
+    #[serde(default = "default_upstream_mqtt_plaintext_port")]
+    pub mqtt_plaintext_port: u16,
+    #[serde(default = "default_upstream_mqtt_tls_port")]
+    pub mqtt_tls_port: u16,
+    #[serde(default = "default_upstream_probe_timeout_ms")]
+    pub probe_timeout_ms: u64,
+}
+
+impl Default for UpstreamDiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_upstream_discovery_enabled(),
+            server_tag: default_upstream_discovery_tag(),
+            socket_path: None,
+            api_ready_port: default_upstream_api_ready_port(),
+            mqtt_plaintext_port: default_upstream_mqtt_plaintext_port(),
+            mqtt_tls_port: default_upstream_mqtt_tls_port(),
+            probe_timeout_ms: default_upstream_probe_timeout_ms(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RemoteShellConfig {
+    #[serde(default = "default_remote_shell_path")]
+    pub shell: PathBuf,
+}
+
+impl Default for RemoteShellConfig {
+    fn default() -> Self {
+        Self { shell: default_remote_shell_path() }
+    }
+}
+
 #[serde_as]
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ActionRoute {
@@ -237,7 +309,9 @@ pub struct PreconditionCheckerConfig {
 pub struct DeviceConfig {
     pub project_id: String,
     pub device_id: String,
+    #[serde(default)]
     pub broker: String,
+    #[serde(default)]
     pub port: u16,
     pub certificate_fingerprint_sha256: Option<String>,
     pub authentication: Option<Authentication>,
@@ -248,6 +322,8 @@ pub struct Config {
     pub console: ConsoleConfig,
     pub tcpapps: HashMap<String, AppConfig>,
     pub mqtt: MqttConfig,
+    #[serde(default)]
+    pub upstream_discovery: UpstreamDiscoveryConfig,
     pub max_stream_count: usize,
     pub processes: Vec<ActionRoute>,
     pub script_runner: Vec<ActionRoute>,
@@ -272,6 +348,8 @@ pub struct Config {
     pub logging: Option<LogcatConfig>,
     pub precondition_checks: Option<PreconditionCheckerConfig>,
     pub prioritize_live_data: bool,
+    #[serde(default)]
+    pub remote_shell: RemoteShellConfig,
     pub enable_remote_shell: bool,
     pub wait_for_disk: bool,
     pub enable_stdin_collector: bool,

@@ -205,6 +205,35 @@ impl Project {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectFeature {
+    pub project_id: Id,
+    pub feature: String,
+    pub enabled: bool,
+    pub updated_by: Option<Id>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl ProjectFeature {
+    pub fn new(
+        project_id: Id,
+        feature: impl Into<String>,
+        enabled: bool,
+        updated_by: Option<Id>,
+    ) -> Self {
+        let now = Utc::now();
+        Self {
+            project_id,
+            feature: feature.into(),
+            enabled,
+            updated_by,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DeviceStatus {
     Provisioned,
     Online,
@@ -444,6 +473,73 @@ pub struct ActionDispatchTarget {
     pub device_id: Id,
     pub name: String,
     pub payload: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RemoteShellSessionState {
+    Opening,
+    Active,
+    Closed,
+    Expired,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteShellSession {
+    pub id: Id,
+    pub project_id: Id,
+    pub device_id: Id,
+    pub action_id: Option<Id>,
+    pub state: RemoteShellSessionState,
+    pub operator_token_hash: String,
+    pub device_token_hash: String,
+    pub expires_at: DateTime<Utc>,
+    pub opened_by: Option<Id>,
+    pub opened_at: DateTime<Utc>,
+    pub closed_at: Option<DateTime<Utc>>,
+    pub close_reason: Option<String>,
+    pub bytes_from_operator: i64,
+    pub bytes_from_device: i64,
+    pub last_activity_at: DateTime<Utc>,
+}
+
+impl RemoteShellSession {
+    pub fn new(
+        project_id: Id,
+        device_id: Id,
+        operator_token_hash: impl Into<String>,
+        device_token_hash: impl Into<String>,
+        expires_at: DateTime<Utc>,
+        opened_by: Option<Id>,
+    ) -> Self {
+        let now = Utc::now();
+        Self {
+            id: Uuid::now_v7(),
+            project_id,
+            device_id,
+            action_id: None,
+            state: RemoteShellSessionState::Opening,
+            operator_token_hash: operator_token_hash.into(),
+            device_token_hash: device_token_hash.into(),
+            expires_at,
+            opened_by,
+            opened_at: now,
+            closed_at: None,
+            close_reason: None,
+            bytes_from_operator: 0,
+            bytes_from_device: 0,
+            last_activity_at: now,
+        }
+    }
+
+    pub fn is_open(&self, now: DateTime<Utc>) -> bool {
+        self.closed_at.is_none()
+            && self.expires_at > now
+            && matches!(
+                self.state,
+                RemoteShellSessionState::Opening | RemoteShellSessionState::Active
+            )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

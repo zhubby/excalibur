@@ -17,6 +17,7 @@ It is not Bytebeam protocol compatible. The agent publishes and subscribes only 
 - OTA/download handoff for `ota.install`.
 - Diagnostics/log/system-stat streams.
 - Remote shell code retained as a gated beta path; it is disabled by default.
+- Tailscale LocalAPI upstream discovery for tagged Excalibur server nodes.
 - TLS auth JSON with inline private key for development or `device_private_key_path` for CSR provisioning.
 
 ## Auth JSON
@@ -25,10 +26,9 @@ Production devices should generate their keypair locally, submit a CSR to Excali
 
 ```json
 {
-  "broker": "mqtt.local.excalibur.dev",
-  "port": 8883,
   "project_id": "018f4c5c-9b4d-7cc2-a62a-44590f671001",
   "device_id": "018f4c5c-9b4d-7cc2-a62a-44590f671101",
+  "certificate_fingerprint_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "authentication": {
     "ca_certificate": "-----BEGIN CERTIFICATE-----\\n...\\n-----END CERTIFICATE-----",
     "device_certificate": "-----BEGIN CERTIFICATE-----\\n...\\n-----END CERTIFICATE-----",
@@ -36,6 +36,8 @@ Production devices should generate their keypair locally, submit a CSR to Excali
   }
 }
 ```
+
+By default, the agent resolves MQTT upstream through the local `tailscaled` LocalAPI and selects the online peer tagged `tag:excalibur-server`. Static `broker` and `port` may still be included as fallback, and are required when `[upstream_discovery] enabled = false`.
 
 Development and batch experiments may use `/api/v1/devices/{device_id}/provision/dev-auth`, which returns an inline `device_private_key`. Do not use that path for production fleets.
 

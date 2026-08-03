@@ -388,6 +388,32 @@ fn _get_certs(key_path: &Path, ca_path: &Path) -> (Vec<u8>, Vec<u8>) {
 /// Command to remotely trigger `Mqtt` shutdown
 pub(crate) struct MqttShutdown;
 
+#[cfg(test)]
+mod tests {
+    use super::mqttoptions;
+    use crate::device_agent_config::{Config, DeviceConfig};
+
+    #[test]
+    fn mqtt_options_use_resolved_broker_and_fingerprint_username() {
+        let config = Config::default();
+        let device_config = DeviceConfig {
+            project_id: "project-a".to_owned(),
+            device_id: "device-1".to_owned(),
+            broker: "100.66.211.65".to_owned(),
+            port: 1883,
+            certificate_fingerprint_sha256: Some("a".repeat(64)),
+            authentication: None,
+        };
+
+        let options = mqttoptions(&config, &device_config);
+
+        assert_eq!(options.broker_address(), ("100.66.211.65".to_owned(), 1883));
+        let credentials = options.credentials().expect("fingerprint username is set");
+        assert_eq!(credentials.username, "a".repeat(64));
+        assert_eq!(credentials.password, "");
+    }
+}
+
 /// Handle to send control messages to `Mqtt`
 #[derive(Debug, Clone)]
 pub struct CtrlTx {

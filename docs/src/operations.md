@@ -147,4 +147,5 @@ scripts/api-load-smoke.sh
 - 最近一次 restore drill 完成，能恢复 Timescale schema、telemetry hypertable 和 object metadata。
 - Auth rate limit、API key scope、mTLS ACL、OTA/diagnostics audit 在 staging 验证通过。
 - Load smoke 和 MQTT simulator 压测记录 p95/p99、consumer lag、Timescale write duration 和恢复时间。
+- Device-agent Tailscale discovery smoke 在 staging 验证通过：agent 可读本机 tailscaled socket，`tailscale status` 中只有一个在线 `tag:excalibur-server` peer，`curl http://<tailscale-ip>:8080/ready` 成功，MQTT TCP port 可连接，discovery-only auth JSON 能启动；legacy auth JSON 的 `broker`/`port` fallback 也被验证。
 - 所有生产 secret 来自 Kubernetes Secret/ExternalSecret，values 中没有真实凭证。

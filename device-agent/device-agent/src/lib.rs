@@ -12,6 +12,7 @@ pub mod console;
 pub mod collector;
 pub mod device_agent_config;
 pub mod mock;
+mod upstream_discovery;
 pub mod utils;
 
 use self::device_agent_config::{ActionRoute, Config, DeviceConfig};
@@ -33,6 +34,7 @@ use collector::journalctl::JournalCtl;
 use collector::logcat::Logcat;
 use collector::preconditions::PreconditionChecker;
 use collector::process::ProcessHandler;
+use collector::remote_shell::RemoteShellClient;
 use collector::script_runner::ScriptRunner;
 use collector::systemstats::StatCollector;
 use collector::tunshell::TunshellClient;
@@ -244,6 +246,15 @@ impl DeviceAgent {
             let actions_rx = bridge.register_action_route(route)?;
             let tunshell_client = TunshellClient::new(actions_rx, bridge_tx.clone());
             spawn_named_thread("Tunshell Client", move || tunshell_client.start());
+
+            let route = ActionRoute { name: "remote_shell.open".to_owned() };
+            let actions_rx = bridge.register_action_route(route)?;
+            let remote_shell_client = RemoteShellClient::new(
+                self.config.remote_shell.clone(),
+                actions_rx,
+                bridge_tx.clone(),
+            );
+            spawn_named_thread("Remote Shell Client", move || remote_shell_client.start());
         }
 
         if self.config.enable_stdin_collector {
@@ -348,6 +359,7 @@ pub fn entrypoint(
     actions_callback: Option<ActionCallback>,
 ) -> Result<DeviceAgentController, Error> {
     let (config, device_config) = parse_config(device_json.as_str(), config_toml.as_str())?;
+    let device_config = upstream_discovery::resolve_upstream(&config, device_config)?;
     banner(&config, &device_config);
 
     let config = Arc::new(config);
@@ -470,6 +482,10 @@ fn banner(config: &Config, device_config: &DeviceConfig) {
     println!("    project_id: {}", device_config.project_id);
     println!("    device_id: {}", device_config.device_id);
     println!("    remote: {}:{}", device_config.broker, device_config.port);
+    println!(
+        "    upstream_discovery: {}",
+        if config.upstream_discovery.enabled { "enabled" } else { "disabled" }
+    );
     println!("    persistence_path: {}", config.persistence_path.display());
     if !config.action_redirections.is_empty() {
         println!("    action redirections:");
@@ -528,6 +544,17 @@ const DEFAULT_CONFIG: &str = r#"
     max_inflight = 100
     keep_alive = 30
     network_timeout = 30
+
+    [upstream_discovery]
+    enabled = true
+    server_tag = "tag:excalibur-server"
+    api_ready_port = 8080
+    mqtt_plaintext_port = 1883
+    mqtt_tls_port = 8883
+    probe_timeout_ms = 2000
+
+    [remote_shell]
+    shell = "/bin/sh"
 
     [stream_metrics]
     enabled = false
@@ -597,6 +624,14 @@ fn parse_config(device_json: &str, config_toml: &str) -> Result<(Config, DeviceC
         .add_source(Environment::default())
         .build()?
         .try_deserialize::<DeviceConfig>()?;
+
+    if !config.upstream_discovery.enabled
+        && !upstream_discovery::has_static_upstream(&device_config)
+    {
+        return Err(Error::msg(
+            "auth JSON broker and port are required when upstream discovery is disabled",
+        ));
+    }
 
     let project_id = device_config.project_id.as_str();
     let device_id = device_config.device_id.as_str();
@@ -711,5 +746,121 @@ mod tests {
             device_config.certificate_fingerprint_sha256.as_deref(),
             Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         );
+        assert!(!config.enable_remote_shell);
+        assert_eq!(config.remote_shell.shell.to_string_lossy(), "/bin/sh");
+    }
+
+    #[test]
+    fn discovery_enabled_allows_missing_static_upstream() {
+        let temp_dir = tempdir::TempDir::new("device_agent").unwrap();
+        let device_json = r#"{
+            "project_id": "project-a",
+            "device_id": "device-1"
+        }"#;
+        let config_toml = format!(r#"persistence_path = "{}""#, temp_dir.path().display());
+
+        let (config, device_config) = parse_config(device_json, &config_toml).unwrap();
+
+        assert!(config.upstream_discovery.enabled);
+        assert_eq!(device_config.broker, "");
+        assert_eq!(device_config.port, 0);
+    }
+
+    #[test]
+    fn discovery_disabled_requires_static_upstream() {
+        let temp_dir = tempdir::TempDir::new("device_agent").unwrap();
+        let device_json = r#"{
+            "project_id": "project-a",
+            "device_id": "device-1"
+        }"#;
+        let config_toml = format!(
+            r#"
+            persistence_path = "{}"
+
+            [upstream_discovery]
+            enabled = false
+            "#,
+            temp_dir.path().display()
+        );
+
+        let error = parse_config(device_json, &config_toml).unwrap_err();
+
+        assert!(error.to_string().contains("broker and port are required"));
+    }
+
+    #[test]
+    fn discovery_disabled_accepts_static_upstream() {
+        let temp_dir = tempdir::TempDir::new("device_agent").unwrap();
+        let device_json = r#"{
+            "project_id": "project-a",
+            "device_id": "device-1",
+            "broker": "mqtt.local",
+            "port": 1883
+        }"#;
+        let config_toml = format!(
+            r#"
+            persistence_path = "{}"
+
+            [upstream_discovery]
+            enabled = false
+            "#,
+            temp_dir.path().display()
+        );
+
+        let (_, device_config) = parse_config(device_json, &config_toml).unwrap();
+
+        assert_eq!(device_config.broker, "mqtt.local");
+        assert_eq!(device_config.port, 1883);
+    }
+
+    #[test]
+    fn discovery_disabled_rejects_partial_static_upstream() {
+        let cases = [
+            (
+                "broker-only",
+                r#"{
+                    "project_id": "project-a",
+                    "device_id": "device-1",
+                    "broker": "mqtt.local"
+                }"#,
+            ),
+            (
+                "port-only",
+                r#"{
+                    "project_id": "project-a",
+                    "device_id": "device-1",
+                    "port": 1883
+                }"#,
+            ),
+            (
+                "blank-broker",
+                r#"{
+                    "project_id": "project-a",
+                    "device_id": "device-1",
+                    "broker": "   ",
+                    "port": 1883
+                }"#,
+            ),
+        ];
+
+        for (case, device_json) in cases {
+            let temp_dir = tempdir::TempDir::new("device_agent").unwrap();
+            let config_toml = format!(
+                r#"
+                persistence_path = "{}"
+
+                [upstream_discovery]
+                enabled = false
+                "#,
+                temp_dir.path().display()
+            );
+
+            let error = parse_config(device_json, &config_toml).unwrap_err();
+
+            assert!(
+                error.to_string().contains("broker and port are required"),
+                "{case} should reject missing static upstream: {error}"
+            );
+        }
     }
 }

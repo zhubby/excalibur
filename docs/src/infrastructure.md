@@ -96,8 +96,8 @@ docker compose up --build
 | `WORKER_ALERT_DEFAULT_OFFLINE_AFTER_SECONDS` | worker | offline alert 未单独配置时的默认离线阈值。 |
 | `WORKER_ALERT_DEFAULT_WINDOW_SECONDS` | worker | threshold/window alert 默认查询窗口。 |
 | `WORKER_ALERT_NOTIFICATION_SUBJECT` | worker | alert notification stub 发布 subject。 |
-| `DEVICE_MQTT_BROKER` | api | provisioning auth JSON 返回给设备的 broker host。 |
-| `DEVICE_MQTT_PORT` | api | provisioning auth JSON 返回给设备的 broker port。 |
+| `DEVICE_MQTT_BROKER` | api | provisioning auth JSON 返回给设备的静态 broker fallback host。 |
+| `DEVICE_MQTT_PORT` | api | provisioning auth JSON 返回给设备的静态 broker fallback port。 |
 | `NEXT_PUBLIC_API_BASE_URL` | frontend | Console 调用 API 的 base URL。 |
 
 生产必须把数据库密码、RustFS/S3 凭证、CA key、JWT/session secrets 放入 secret manager，而不是明文 values。`docker-compose.yml` 为本地开发显式启用 `EXCALIBUR_ALLOW_DEV_CA=true` 和 `EXCALIBUR_ENABLE_DEV_AUTH=true`；Helm 默认关闭这两个开关，未配置真实 CA Secret 时 API 会 fail closed。
@@ -128,11 +128,13 @@ helm lint infra/helm/excalibur
 默认 values：
 
 - API replicas: 1。
-- MQTT ingest replicas: 1，Service port: 1883。当前本地 rumqttd broker + command bridge 只能安全默认单副本；多副本需要 sticky/device ownership routing 或外部共享 broker 后再开启。
+- MQTT ingest replicas: 1，默认 Service port: 1883。当前本地 rumqttd broker + command bridge 只能安全默认单副本；多副本需要 sticky/device ownership routing 或外部共享 broker 后再开启。
 - Worker replicas: 1。
 - Frontend replicas: 2。
 - Migrations enabled。
 - `STORAGE_BACKEND=timescale` 默认启用持久化 SQL repository；快速临时开发可改为 `memory`。
+
+如果生产 agent 使用 mTLS auth 并省略静态 `broker`/`port`，Tailscale discovery 会默认探测 MQTT `8883`。此时被标记为 `tag:excalibur-server` 的 server 节点必须暴露 TLS MQTT listener，并配置 `MQTT_TLS_*`、Service/防火墙/ACL 允许 tailnet 设备访问 `8883`。broker server certificate 也需要覆盖该节点的 Tailscale IPv4 SAN，或部署侧需要提供与证书匹配的 TLS server name 策略。如果生产环境暂时只暴露 `1883`，必须在 agent TOML 中显式设置 `upstream_discovery.mqtt_tls_port = 1883`，同时明确这是 mTLS 部署前的过渡配置。
 
 Command bus rolling upgrade 注意：worker 和 mqtt-ingest 会在启动时校验 JetStream command stream subjects、consumer delivery subject、deliver group 和 explicit ack policy。已有环境如果手工创建过不兼容的 `EXCALIBUR_COMMANDS` stream 或 `excalibur-mqtt-command-bridge` durable consumer，启动会 fail closed；升级前应通过 JetStream API/CLI update 对应 stream subjects 和 consumer config，或在确认无待处理 command 后删除旧 consumer 让应用重建。
 
@@ -172,7 +174,7 @@ Helm chart 的 migration job 使用 `postgres:16-alpine` 执行版本化 SQL。J
 生产 chart 应增加：
 
 - Ingress 和 TLS。
-- MQTT listener Service，区分 8883 TLS。
+- MQTT listener Service，区分并暴露 8883 TLS，供 discovery-only mTLS agent 使用。
 - PodDisruptionBudget。
 - HPA 或 KEDA。
 - NetworkPolicy。

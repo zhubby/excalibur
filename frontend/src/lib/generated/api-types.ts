@@ -350,10 +350,49 @@ export type ProjectResponse = {
   "slug": string;
 };
 
+export type ProjectFeatureResponse = {
+  "created_at": DateTime;
+  "enabled": boolean;
+  "feature": string;
+  "project_id": string;
+  "updated_at": DateTime;
+  "updated_by"?: string | null;
+};
+
 export type ProvisioningModeResponse = "Csr" | "DevGeneratedKeypair";
 
 export type RefreshRequest = {
   "refresh_token"?: string | null;
+};
+
+export type RemoteShellSessionStateResponse = "Opening" | "Active" | "Closed" | "Expired" | "Failed";
+
+export type RemoteShellSessionResponse = {
+  "action_id"?: string | null;
+  "bytes_from_device": number;
+  "bytes_from_operator": number;
+  "close_reason"?: string | null;
+  "closed_at"?: DateTime | null;
+  "device_id": string;
+  "expires_at": DateTime;
+  "id": string;
+  "last_activity_at": DateTime;
+  "opened_at": DateTime;
+  "opened_by"?: string | null;
+  "project_id": string;
+  "state": RemoteShellSessionStateResponse;
+};
+
+export type RemoteShellSessionCreateRequest = {
+  "device_id": Uuid;
+  "project_id": Uuid;
+  "ttl_seconds"?: number | null;
+};
+
+export type RemoteShellSessionCreateResponse = {
+  "action": ActionResponse;
+  "operator_websocket_url": string;
+  "session": RemoteShellSessionResponse;
 };
 
 export type RegisterRequest = {

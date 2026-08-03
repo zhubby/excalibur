@@ -25,6 +25,8 @@ type DeviceTableProps = {
   onSelectDevice: (deviceId: string) => void;
   onDownloadDevAuth: (deviceId: string) => void;
   onIngestSample: (deviceId: string) => void;
+  onOpenRemoteShell: (deviceId: string) => void;
+  getRemoteShellDisabledReason: (deviceId?: string) => string | null;
 };
 
 export function DeviceTable({
@@ -35,6 +37,8 @@ export function DeviceTable({
   onSelectDevice,
   onDownloadDevAuth,
   onIngestSample,
+  onOpenRemoteShell,
+  getRemoteShellDisabledReason,
 }: DeviceTableProps) {
   const columns = useMemo<ColumnDef<DeviceRow>[]>(
     () => [
@@ -81,8 +85,10 @@ export function DeviceTable({
       {
         id: "actions",
         header: "",
-        cell: ({ row }) => (
-          <div className="flex justify-end gap-1">
+        cell: ({ row }) => {
+          const shellDisabledReason = getRemoteShellDisabledReason(row.original.id);
+          return (
+            <div className="flex justify-end gap-1">
             <button
               className="grid h-8 w-8 place-items-center rounded-md text-muted transition hover:bg-line hover:text-ink disabled:cursor-not-allowed disabled:text-faint"
               type="button"
@@ -108,10 +114,15 @@ export function DeviceTable({
               <RadioTower className="h-4 w-4" aria-hidden="true" />
             </button>
             <button
-              className="grid h-8 w-8 place-items-center rounded-md bg-elevated text-faint"
+              className="grid h-8 w-8 place-items-center rounded-md text-muted transition hover:bg-line hover:text-ink disabled:cursor-not-allowed disabled:bg-elevated disabled:text-faint"
               type="button"
-              aria-label="Remote shell disabled"
-              disabled
+              aria-label={`Open remote shell for ${row.original.name}`}
+              title={shellDisabledReason ?? `Open remote shell for ${row.original.name}`}
+              disabled={Boolean(shellDisabledReason)}
+              onClick={(event) => {
+                event.stopPropagation();
+                onOpenRemoteShell(row.original.id);
+              }}
             >
               <Terminal className="h-4 w-4" aria-hidden="true" />
             </button>
@@ -127,10 +138,11 @@ export function DeviceTable({
               <MoreHorizontal className="h-4 w-4" aria-hidden="true" />
             </button>
           </div>
-        ),
+          );
+        },
       },
     ],
-    [busy, onDownloadDevAuth, onIngestSample, onSelectDevice],
+    [busy, getRemoteShellDisabledReason, onDownloadDevAuth, onIngestSample, onOpenRemoteShell, onSelectDevice],
   );
   const table = useReactTable({
     data,
@@ -155,7 +167,7 @@ export function DeviceTable({
         </button>
       </div>
       <div className="overflow-x-auto">
-        <table className="min-w-[920px] table-fixed border-collapse text-left text-sm">
+        <table className="w-full min-w-[920px] table-fixed border-collapse text-left text-sm">
           <thead className="bg-rail text-xs uppercase text-faint">
             {table.getHeaderGroups().map((headerGroup) => (
               <tr key={headerGroup.id}>

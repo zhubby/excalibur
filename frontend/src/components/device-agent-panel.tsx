@@ -27,6 +27,8 @@ type DeviceAgentPanelProps = {
   onIngestSample: () => void;
   onCreateDiagnostics: () => void;
   onCreateOta: () => void;
+  onOpenRemoteShell: () => void;
+  getRemoteShellDisabledReason: (deviceId?: string) => string | null;
 };
 
 export function DeviceAgentPanel({
@@ -38,6 +40,8 @@ export function DeviceAgentPanel({
   onIngestSample,
   onCreateDiagnostics,
   onCreateOta,
+  onOpenRemoteShell,
+  getRemoteShellDisabledReason,
 }: DeviceAgentPanelProps) {
   const hasDevice = Boolean(device && projectId);
   const telemetry = hasDevice ? telemetryTopic(projectId!, device!.id, "device_agent_system_stats") : "-";
@@ -45,6 +49,7 @@ export function DeviceAgentPanel({
   const commands = hasDevice ? commandTopic(projectId!, device!.id) : "-";
   const commandStatus = hasDevice ? commandStatusTopic(projectId!, device!.id) : "-";
   const authReady = devAuthConfig?.device_id === device?.id;
+  const shellDisabledReason = getRemoteShellDisabledReason(device?.id);
 
   return (
     <section className="panel-in rounded-md border border-line bg-panel shadow-panel">
@@ -117,7 +122,9 @@ export function DeviceAgentPanel({
             </div>
             <div className="flex items-center justify-between gap-3">
               <dt className="text-faint">Remote shell</dt>
-              <dd className="font-medium text-warning">beta off</dd>
+              <dd className={`font-medium ${shellDisabledReason ? "text-warning" : "text-success"}`}>
+                {shellDisabledReason ?? "ready"}
+              </dd>
             </div>
           </dl>
 
@@ -140,7 +147,14 @@ export function DeviceAgentPanel({
             >
               <Wrench className="h-4 w-4" aria-hidden="true" />
             </button>
-            <button className="grid h-10 place-items-center rounded-md border border-line bg-rail text-faint" type="button" aria-label="Remote shell disabled" disabled>
+            <button
+              className="grid h-10 place-items-center rounded-md border border-line bg-panel text-muted transition hover:bg-line hover:text-ink disabled:cursor-not-allowed disabled:bg-rail disabled:text-faint"
+              type="button"
+              aria-label="Open remote shell"
+              title={shellDisabledReason ?? "Open remote shell"}
+              disabled={Boolean(shellDisabledReason)}
+              onClick={onOpenRemoteShell}
+            >
               <Terminal className="h-4 w-4" aria-hidden="true" />
             </button>
           </div>

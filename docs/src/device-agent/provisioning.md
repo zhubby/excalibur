@@ -49,9 +49,27 @@ POST /api/v1/devices/{device_id}/provision/csr
 ```
 
 5. 设备将 auth JSON 保存为 `/etc/excalibur/auth.json`。
-6. `device-agent` 启动并使用 mTLS 连接 broker。
+6. `device-agent` 启动后默认先通过 Tailscale 上游发现定位 Excalibur server，再使用 mTLS 连接 MQTT；如果 discovery 不可用且 auth JSON 包含 `broker`/`port`，则回退到该静态地址。
 
 当前 API 会解析 CSR SubjectPublicKeyInfo，签发真实可解析 X.509 设备证书，计算 certificate fingerprint，并把 active certificate 记录持久化。生产必须通过 `EXCALIBUR_CA_PRIVATE_KEY_PEM` 或 Helm Secret 注入真实 CA key；只有显式设置 `EXCALIBUR_ALLOW_DEV_CA=true` 时才会使用内置 dev CA。
+
+API 可以继续在 auth JSON 中返回 `broker` 和 `port`，用于旧 agent 或 discovery 失败时的 fallback。启用 `[upstream_discovery] enabled = true` 的新 agent 允许省略这两个字段，并会用发现到的 Tailscale IPv4 地址覆盖内存中的 broker host。
+
+## Tailscale 上游发现要求
+
+生产 tailnet 需要给 Excalibur server 节点配置 Tailscale tag：
+
+```text
+tag:excalibur-server
+```
+
+agent 只选择同一 tailnet 中在线、非本机、带该 tag 的 peer，并要求：
+
+- 本机 `tailscaled` backend state 为 `Running`。
+- server peer 的 `http://<tailscale-ip>:8080/ready` 返回成功。
+- server peer 的 MQTT TCP port 可连接。
+
+mTLS auth 存在时，agent 默认探测 MQTT `8883`；没有 mTLS auth 时默认探测 `1883`。若没有 tagged peer 通过探测但 auth JSON 提供了 `broker`/`port`，agent 会按旧行为连接静态 broker。若多个 tagged peer 同时通过探测，v1 会启动失败，即使存在静态 fallback 也不继续，以避免掩盖错误 tag 或 split-brain 拓扑；后续 HA/failover 再单独设计。由于 discovery 使用 Tailscale IPv4 作为 broker host，mTLS server certificate 需要包含该 IPv4 SAN，或部署侧需要提供与证书匹配的 TLS server name 策略。
 
 ## Dev auth 路径
 
@@ -114,4 +132,4 @@ Linux 设备上推荐：
 /var/lib/excalibur-agent/      device-agent user writable
 ```
 
-systemd service 应以最小权限用户运行，只给需要访问的设备文件、日志和 OTA 路径授权。
+systemd service 应以最小权限用户运行，只给需要访问的设备文件、日志、OTA 路径和本机 tailscaled socket 授权。常见 socket 路径是 `/var/run/tailscale/tailscaled.sock` 或 `/run/tailscale/tailscaled.sock`。

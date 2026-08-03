@@ -4,7 +4,7 @@
 
 ## 核心职责
 
-- 读取 auth JSON，使用 mTLS 连接 broker。
+- 读取 auth JSON，通过 Tailscale discovery 或静态 fallback 解析 MQTT broker，并使用 mTLS 连接。
 - 从本机应用、系统 collector、日志 collector、stdin、模拟器等来源采集数据。
 - 按 stream 批量序列化 telemetry JSON array。
 - 对网络故障和慢 event loop 做本地缓冲和恢复。

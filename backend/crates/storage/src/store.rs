@@ -3,8 +3,8 @@ use excalibur_domain::{
     Action, ActionDispatchTarget, ActionState, ActionStatusUpdate, ActionTargetStatusChange,
     ActionTargetTransition, AlertEvent, AlertEventState, AlertRule, ApiKey, AuditLog, Dashboard,
     Device, DeviceCertificate, DiagnosticsSession, FirmwareArtifact, FirmwareRollout, Id,
-    Membership, Org, Project, Role, StreamDefinition, TelemetryAggregateBucket, TelemetryPoint,
-    User, UserSession,
+    Membership, Org, Project, ProjectFeature, RemoteShellSession, RemoteShellSessionState, Role,
+    StreamDefinition, TelemetryAggregateBucket, TelemetryPoint, User, UserSession,
 };
 use serde_json::Value;
 
@@ -195,6 +195,46 @@ impl Store {
         match self {
             Store::Memory(store) => store.get_project_for_user(project_id, user_id).await,
             Store::Postgres(store) => store.get_project_for_user(project_id, user_id).await,
+        }
+    }
+
+    pub async fn list_project_features(&self, project_id: Id) -> StoreResult<Vec<ProjectFeature>> {
+        match self {
+            Store::Memory(store) => Ok(store.list_project_features(project_id).await),
+            Store::Postgres(store) => store.list_project_features(project_id).await,
+        }
+    }
+
+    pub async fn get_project_feature(
+        &self,
+        project_id: Id,
+        feature: &str,
+    ) -> StoreResult<Option<ProjectFeature>> {
+        match self {
+            Store::Memory(store) => store.get_project_feature(project_id, feature).await,
+            Store::Postgres(store) => store.get_project_feature(project_id, feature).await,
+        }
+    }
+
+    pub async fn set_project_feature(
+        &self,
+        project_id: Id,
+        feature: &str,
+        enabled: bool,
+        updated_by: Option<Id>,
+        ts: DateTime<Utc>,
+    ) -> StoreResult<ProjectFeature> {
+        match self {
+            Store::Memory(store) => {
+                store
+                    .set_project_feature(project_id, feature, enabled, updated_by, ts)
+                    .await
+            }
+            Store::Postgres(store) => {
+                store
+                    .set_project_feature(project_id, feature, enabled, updated_by, ts)
+                    .await
+            }
         }
     }
 
@@ -455,6 +495,156 @@ impl Store {
             Store::Postgres(store) => {
                 store
                     .timeout_running_action_targets(older_than, limit, ts)
+                    .await
+            }
+        }
+    }
+
+    pub async fn create_remote_shell_session(
+        &self,
+        session: RemoteShellSession,
+    ) -> StoreResult<RemoteShellSession> {
+        match self {
+            Store::Memory(store) => store.create_remote_shell_session(session).await,
+            Store::Postgres(store) => store.create_remote_shell_session(session).await,
+        }
+    }
+
+    pub async fn attach_remote_shell_action(
+        &self,
+        project_id: Id,
+        session_id: Id,
+        action_id: Id,
+    ) -> StoreResult<RemoteShellSession> {
+        match self {
+            Store::Memory(store) => {
+                store
+                    .attach_remote_shell_action(project_id, session_id, action_id)
+                    .await
+            }
+            Store::Postgres(store) => {
+                store
+                    .attach_remote_shell_action(project_id, session_id, action_id)
+                    .await
+            }
+        }
+    }
+
+    pub async fn get_remote_shell_session(
+        &self,
+        session_id: Id,
+    ) -> StoreResult<RemoteShellSession> {
+        match self {
+            Store::Memory(store) => store.get_remote_shell_session(session_id).await,
+            Store::Postgres(store) => store.get_remote_shell_session(session_id).await,
+        }
+    }
+
+    pub async fn list_remote_shell_sessions(
+        &self,
+        project_id: Id,
+    ) -> StoreResult<Vec<RemoteShellSession>> {
+        match self {
+            Store::Memory(store) => Ok(store.list_remote_shell_sessions(project_id).await),
+            Store::Postgres(store) => store.list_remote_shell_sessions(project_id).await,
+        }
+    }
+
+    pub async fn find_active_remote_shell_session_for_device(
+        &self,
+        project_id: Id,
+        device_id: Id,
+        now: DateTime<Utc>,
+    ) -> StoreResult<Option<RemoteShellSession>> {
+        match self {
+            Store::Memory(store) => {
+                store
+                    .find_active_remote_shell_session_for_device(project_id, device_id, now)
+                    .await
+            }
+            Store::Postgres(store) => {
+                store
+                    .find_active_remote_shell_session_for_device(project_id, device_id, now)
+                    .await
+            }
+        }
+    }
+
+    pub async fn count_active_remote_shell_sessions(
+        &self,
+        project_id: Id,
+        now: DateTime<Utc>,
+    ) -> StoreResult<i64> {
+        match self {
+            Store::Memory(store) => Ok(store
+                .count_active_remote_shell_sessions(project_id, now)
+                .await),
+            Store::Postgres(store) => {
+                store
+                    .count_active_remote_shell_sessions(project_id, now)
+                    .await
+            }
+        }
+    }
+
+    pub async fn mark_remote_shell_session_active(
+        &self,
+        session_id: Id,
+        ts: DateTime<Utc>,
+    ) -> StoreResult<RemoteShellSession> {
+        match self {
+            Store::Memory(store) => store.mark_remote_shell_session_active(session_id, ts).await,
+            Store::Postgres(store) => store.mark_remote_shell_session_active(session_id, ts).await,
+        }
+    }
+
+    pub async fn record_remote_shell_session_bytes(
+        &self,
+        session_id: Id,
+        bytes_from_operator: i64,
+        bytes_from_device: i64,
+        ts: DateTime<Utc>,
+    ) -> StoreResult<RemoteShellSession> {
+        match self {
+            Store::Memory(store) => {
+                store
+                    .record_remote_shell_session_bytes(
+                        session_id,
+                        bytes_from_operator,
+                        bytes_from_device,
+                        ts,
+                    )
+                    .await
+            }
+            Store::Postgres(store) => {
+                store
+                    .record_remote_shell_session_bytes(
+                        session_id,
+                        bytes_from_operator,
+                        bytes_from_device,
+                        ts,
+                    )
+                    .await
+            }
+        }
+    }
+
+    pub async fn close_remote_shell_session(
+        &self,
+        session_id: Id,
+        state: RemoteShellSessionState,
+        reason: &str,
+        ts: DateTime<Utc>,
+    ) -> StoreResult<RemoteShellSession> {
+        match self {
+            Store::Memory(store) => {
+                store
+                    .close_remote_shell_session(session_id, state, reason, ts)
+                    .await
+            }
+            Store::Postgres(store) => {
+                store
+                    .close_remote_shell_session(session_id, state, reason, ts)
                     .await
             }
         }

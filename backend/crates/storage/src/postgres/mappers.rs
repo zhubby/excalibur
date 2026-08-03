@@ -2,7 +2,8 @@ use excalibur_domain::{
     Action, ActionState, AlertEvent, AlertEventState, AlertRule, ApiKey, AuditLog,
     CertificateStatus, Dashboard, Device, DeviceCertificate, DeviceStatus, DiagnosticsSession,
     DiagnosticsSessionState, FirmwareArtifact, FirmwareRollout, FirmwareRolloutState, Id,
-    Membership, Org, Project, Role, StreamDefinition, TelemetryPoint, User, UserSession,
+    Membership, Org, Project, ProjectFeature, RemoteShellSession, RemoteShellSessionState, Role,
+    StreamDefinition, TelemetryPoint, User, UserSession,
 };
 use serde_json::Value;
 use sqlx::{Row, postgres::PgRow};
@@ -96,6 +97,31 @@ pub(super) fn action_state_from_db(value: &str) -> StoreResult<ActionState> {
         "timed_out" => Ok(ActionState::TimedOut),
         _ => Err(StoreError::Database(format!(
             "unknown action state: {value}"
+        ))),
+    }
+}
+
+pub(super) fn remote_shell_session_state_to_db(state: &RemoteShellSessionState) -> &'static str {
+    match state {
+        RemoteShellSessionState::Opening => "opening",
+        RemoteShellSessionState::Active => "active",
+        RemoteShellSessionState::Closed => "closed",
+        RemoteShellSessionState::Expired => "expired",
+        RemoteShellSessionState::Failed => "failed",
+    }
+}
+
+pub(super) fn remote_shell_session_state_from_db(
+    value: &str,
+) -> StoreResult<RemoteShellSessionState> {
+    match value {
+        "opening" => Ok(RemoteShellSessionState::Opening),
+        "active" => Ok(RemoteShellSessionState::Active),
+        "closed" => Ok(RemoteShellSessionState::Closed),
+        "expired" => Ok(RemoteShellSessionState::Expired),
+        "failed" => Ok(RemoteShellSessionState::Failed),
+        _ => Err(StoreError::Database(format!(
+            "unknown remote shell session state: {value}"
         ))),
     }
 }
@@ -265,6 +291,17 @@ pub(super) fn map_project(row: &PgRow) -> StoreResult<Project> {
     })
 }
 
+pub(super) fn map_project_feature(row: &PgRow) -> StoreResult<ProjectFeature> {
+    Ok(ProjectFeature {
+        project_id: row.try_get("project_id").map_err(map_decode_error)?,
+        feature: row.try_get("feature").map_err(map_decode_error)?,
+        enabled: row.try_get("enabled").map_err(map_decode_error)?,
+        updated_by: row.try_get("updated_by").map_err(map_decode_error)?,
+        created_at: row.try_get("created_at").map_err(map_decode_error)?,
+        updated_at: row.try_get("updated_at").map_err(map_decode_error)?,
+    })
+}
+
 pub(super) fn map_device(row: &PgRow) -> StoreResult<Device> {
     let status: String = row.try_get("status").map_err(map_decode_error)?;
     Ok(Device {
@@ -333,6 +370,31 @@ pub(super) fn map_action_row(row: &PgRow, device_ids: Vec<Id>) -> StoreResult<Ac
         created_by: row.try_get("created_by").map_err(map_decode_error)?,
         created_at: row.try_get("created_at").map_err(map_decode_error)?,
         updated_at: row.try_get("updated_at").map_err(map_decode_error)?,
+    })
+}
+
+pub(super) fn map_remote_shell_session(row: &PgRow) -> StoreResult<RemoteShellSession> {
+    let state: String = row.try_get("state").map_err(map_decode_error)?;
+    Ok(RemoteShellSession {
+        id: row.try_get("id").map_err(map_decode_error)?,
+        project_id: row.try_get("project_id").map_err(map_decode_error)?,
+        device_id: row.try_get("device_id").map_err(map_decode_error)?,
+        action_id: row.try_get("action_id").map_err(map_decode_error)?,
+        state: remote_shell_session_state_from_db(&state)?,
+        operator_token_hash: row
+            .try_get("operator_token_hash")
+            .map_err(map_decode_error)?,
+        device_token_hash: row.try_get("device_token_hash").map_err(map_decode_error)?,
+        expires_at: row.try_get("expires_at").map_err(map_decode_error)?,
+        opened_by: row.try_get("opened_by").map_err(map_decode_error)?,
+        opened_at: row.try_get("opened_at").map_err(map_decode_error)?,
+        closed_at: row.try_get("closed_at").map_err(map_decode_error)?,
+        close_reason: row.try_get("close_reason").map_err(map_decode_error)?,
+        bytes_from_operator: row
+            .try_get("bytes_from_operator")
+            .map_err(map_decode_error)?,
+        bytes_from_device: row.try_get("bytes_from_device").map_err(map_decode_error)?,
+        last_activity_at: row.try_get("last_activity_at").map_err(map_decode_error)?,
     })
 }
 

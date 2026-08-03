@@ -1,87 +1,150 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Bell, Boxes, RadioTower, SunMoon, Wifi, Zap } from "lucide-react";
-import { ActionQueuePanel, AlertPanel } from "@/components/action-alert-panels";
-import { DeviceAgentPanel } from "@/components/device-agent-panel";
-import { DeviceTable } from "@/components/device-table";
-import { MetricStrip } from "@/components/metric-strip";
-import { ProjectHeader } from "@/components/project-header";
-import { Sidebar } from "@/components/sidebar";
-import { TelemetryPanel } from "@/components/telemetry-panel";
-import { WorkspaceManagement, type ApiKeyCreateInput } from "@/components/workspace-management";
+import {
+  createContext,
+  type FormEvent,
+  type ReactNode,
+  type SetStateAction,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { Bell, RadioTower, Wifi, Zap } from "lucide-react";
 import {
   ExcaliburApiError,
   createExcaliburApi,
-  type Action,
-  type AlertRule,
   type ApiKey,
-  type AuditLog,
   type AuthResponse,
-  type Device,
   type DeviceConfig,
-  type FirmwareArtifact,
   type JsonValue,
   type Org,
   type Project,
-  type StreamDefinition,
-  type TelemetryPoint,
+  type ProjectFeature,
+  type RemoteShellSession,
 } from "@/lib/api";
-import type {
-  ActionSummary,
-  AlertSummary,
-  DeviceRow,
-  DeviceStatus,
-  ManagementSectionId,
-  MetricItem,
-  NavSectionId,
-  StreamSummary,
-} from "@/lib/data";
+import {
+  SYSTEM_STREAM,
+  emptyProjectData,
+  formatCount,
+  isRecord,
+  isTerminalAction,
+  telemetryValue,
+  toActionSummaries,
+  toAlertSummaries,
+  toDashboardStats,
+  toDeviceRows,
+  toStreamSummaries,
+  type DashboardStats,
+  type ProjectData,
+} from "@/lib/console-model";
+import type { ActionSummary, AlertSummary, DeviceRow, MetricItem, StreamSummary } from "@/lib/data";
 import { commandStatusTopic, commandTopic, shadowTopic, telemetryTopic } from "@/lib/protocol";
 import { getApiKeyScopePreset, slugifyWorkspaceName } from "@/lib/workspace-management";
+import type { ApiKeyCreateInput } from "@/components/workspace-management-panels";
 
-type Session = {
+export type Session = {
   expiresAt: string;
   refreshExpiresAt: string;
   userId: string;
 };
 
-type ThemeMode = "dark" | "light";
+export type ThemeMode = "dark" | "light";
 
-type Workspace = {
+export type Workspace = {
   org: Org;
   project: Project;
 };
 
-type ProjectData = {
-  devices: Device[];
-  streams: StreamDefinition[];
-  telemetry: TelemetryPoint[];
-  actions: Action[];
-  firmware: FirmwareArtifact[];
-  alerts: AlertRule[];
-  audit: AuditLog[];
+export type RemoteShellTerminalSession = {
+  session: RemoteShellSession;
+  websocketUrl: string;
+  deviceName: string;
+  deviceId: string;
 };
 
 type Api = ReturnType<typeof createExcaliburApi>;
+
+type ConsoleRuntimeValue = {
+  theme: ThemeMode;
+  apiBaseUrl: string;
+  authMode: "login" | "register";
+  email: string;
+  password: string;
+  displayName: string;
+  session: Session | null;
+  workspace: Workspace | null;
+  orgs: Org[];
+  projects: Project[];
+  projectFeatures: ProjectFeature[];
+  remoteShellSessions: RemoteShellSession[];
+  remoteShellEnabled: boolean;
+  activeRemoteShell: RemoteShellTerminalSession | null;
+  apiKeys: ApiKey[];
+  apiKeyError: string | null;
+  createdApiKey: ApiKey | null;
+  projectData: ProjectData;
+  selectedDeviceId: string | undefined;
+  selectedDeviceRow: DeviceRow | undefined;
+  deviceRows: DeviceRow[];
+  filteredDeviceRows: DeviceRow[];
+  telemetryValues: number[];
+  streamSummaries: StreamSummary[];
+  actionSummaries: ActionSummary[];
+  allActionSummaries: ActionSummary[];
+  alertSummaries: AlertSummary[];
+  dashboardStats: DashboardStats;
+  metrics: MetricItem[];
+  devAuthConfig: DeviceConfig | null;
+  search: string;
+  busy: boolean;
+  error: string | null;
+  notice: string | null;
+  protocolDeviceName: string | undefined;
+  protocolTopics: Array<[string, string]>;
+  sidebarUserLabel: string;
+  setApiBaseUrl: (value: SetStateAction<string>) => void;
+  setAuthMode: (value: SetStateAction<"login" | "register">) => void;
+  setEmail: (value: SetStateAction<string>) => void;
+  setPassword: (value: SetStateAction<string>) => void;
+  setDisplayName: (value: SetStateAction<string>) => void;
+  setSearch: (value: SetStateAction<string>) => void;
+  setSelectedDeviceId: (value: SetStateAction<string | undefined>) => void;
+  getRemoteShellDisabledReason: (deviceId?: string) => string | null;
+  handleAuthenticate: (event: FormEvent<HTMLFormElement>) => Promise<void>;
+  handleToggleTheme: () => void;
+  handleLogout: () => void;
+  handleRefresh: () => void;
+  handleBootstrapDemo: () => void;
+  handleCreateOrg: (name: string) => void;
+  handleSelectOrg: (orgId: string) => void;
+  handleCreateProject: (name: string) => void;
+  handleSelectProject: (projectId: string) => void;
+  handleCreateApiKey: (input: ApiKeyCreateInput) => void;
+  handleRevokeApiKey: (apiKeyId: string) => void;
+  handleCreateDevice: () => void;
+  handleDownloadDevAuth: (deviceId?: string) => void;
+  handleIngestSample: (deviceId?: string) => void;
+  handleCreateDiagnostics: () => void;
+  handleCreateOta: () => void;
+  handleToggleRemoteShellFeature: (enabled: boolean) => void;
+  handleOpenRemoteShell: (deviceId?: string) => void;
+  handleCloseRemoteShell: () => void;
+  handleDismissRemoteShell: () => void;
+  handleCompleteLatest: () => void;
+  handleCreateDefaultAlert: () => void;
+};
 
 const SESSION_KEY = "excalibur.console.session.v2";
 const API_BASE_KEY = "excalibur.console.apiBaseUrl.v1";
 const THEME_KEY = "excalibur.console.theme.v1";
 const DEFAULT_API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8080";
-const SYSTEM_STREAM = "device_agent_system_stats";
 const DEFAULT_SHA256 = "a".repeat(64);
 const SESSION_REFRESH_SKEW_MS = 60_000;
 
-const emptyProjectData: ProjectData = {
-  devices: [],
-  streams: [],
-  telemetry: [],
-  actions: [],
-  firmware: [],
-  alerts: [],
-  audit: [],
-};
+const ConsoleRuntimeContext = createContext<ConsoleRuntimeValue | null>(null);
 
 function formatError(error: unknown) {
   if (error instanceof ExcaliburApiError) {
@@ -122,177 +185,12 @@ function expiresBefore(iso: string, cutoffMs: number) {
   return !Number.isFinite(expiresAt) || expiresAt <= cutoffMs;
 }
 
-function isRecord(value: JsonValue | undefined): value is Record<string, JsonValue> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
-function getString(record: Record<string, JsonValue> | null, key: string) {
-  const value = record?.[key];
-  return typeof value === "string" ? value : null;
-}
-
-function getNumber(record: Record<string, JsonValue> | null, key: string) {
-  const value = record?.[key];
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
-
-function nestedRecord(record: Record<string, JsonValue> | null, key: string) {
-  const value = record?.[key];
-  return isRecord(value) ? value : null;
-}
-
-function humanizeEnum(value: string) {
-  return value
-    .replace(/([a-z])([A-Z])/g, "$1 $2")
-    .replace(/_/g, " ")
-    .trim()
-    .toLowerCase();
-}
-
-function normalizeDeviceStatus(status: string): DeviceStatus {
-  const value = humanizeEnum(status);
-  if (value === "online" || value === "offline" || value === "disabled") {
-    return value;
-  }
-  return "provisioned";
-}
-
-function isTerminalAction(action: Action) {
-  const state = humanizeEnum(action.state);
-  return state === "completed" || state === "failed" || state === "cancelled" || state === "timed out";
-}
-
-function formatRelativeTime(iso: string | null) {
-  if (!iso) {
-    return "never";
-  }
-  const timestamp = Date.parse(iso);
-  if (!Number.isFinite(timestamp)) {
-    return "unknown";
-  }
-  const seconds = Math.max(0, Math.round((Date.now() - timestamp) / 1000));
-  if (seconds < 60) {
-    return `${seconds}s ago`;
-  }
-  const minutes = Math.round(seconds / 60);
-  if (minutes < 60) {
-    return `${minutes}m ago`;
-  }
-  const hours = Math.round(minutes / 60);
-  if (hours < 24) {
-    return `${hours}h ago`;
-  }
-  return `${Math.round(hours / 24)}d ago`;
-}
-
-function formatCount(value: number) {
-  if (value >= 1_000_000) {
-    return `${(value / 1_000_000).toFixed(1)}M`;
-  }
-  if (value >= 1_000) {
-    return `${(value / 1_000).toFixed(1)}k`;
-  }
-  return String(value);
-}
-
-function telemetryValue(point: TelemetryPoint) {
-  const payload = isRecord(point.payload) ? point.payload : null;
+function isActiveRemoteShellSession(session: RemoteShellSession, nowMs = Date.now()) {
   return (
-    getNumber(payload, "cpu_percent") ??
-    getNumber(payload, "temperature_c") ??
-    getNumber(payload, "disk_used_percent") ??
-    getNumber(payload, "memory_mb") ??
-    0
+    !session.closed_at &&
+    (session.state === "Opening" || session.state === "Active") &&
+    Date.parse(session.expires_at) > nowMs
   );
-}
-
-function toDeviceRows(devices: Device[], streams: StreamDefinition[], telemetry: TelemetryPoint[]) {
-  const latestTelemetry = new Map<string, TelemetryPoint>();
-  telemetry.forEach((point) => {
-    if (!latestTelemetry.has(point.device_id)) {
-      latestTelemetry.set(point.device_id, point);
-    }
-  });
-  const defaultStream = streams[0]?.name ?? SYSTEM_STREAM;
-
-  return devices.map<DeviceRow>((device) => {
-    const metadata = isRecord(device.metadata) ? device.metadata : null;
-    const shadow = isRecord(device.latest_shadow) ? device.latest_shadow : null;
-    const firmware = nestedRecord(shadow, "firmware") ?? nestedRecord(metadata, "firmware");
-    const agent = nestedRecord(shadow, "agent") ?? nestedRecord(metadata, "agent");
-    const latest = latestTelemetry.get(device.id);
-    const payload = latest && isRecord(latest.payload) ? latest.payload : null;
-    const firmwareVersion =
-      getString(firmware, "main") ??
-      getString(firmware, "version") ??
-      getString(agent, "version") ??
-      getString(metadata, "firmware") ??
-      "-";
-    const shadowLabel =
-      getString(shadow, "state") ??
-      getString(shadow, "status") ??
-      getString(shadow, "mode") ??
-      (shadow && Object.keys(shadow).length > 0 ? "reported" : "empty");
-
-    return {
-      id: device.id,
-      name: device.name,
-      status: normalizeDeviceStatus(device.status),
-      stream: latest?.stream ?? defaultStream,
-      firmware: firmwareVersion,
-      lastSeen: formatRelativeTime(device.last_seen_at ?? null),
-      rssi: getNumber(payload, "rssi_dbm") ?? getNumber(metadata, "rssi_dbm"),
-      shadow: shadowLabel,
-    };
-  });
-}
-
-function toStreamSummaries(streams: StreamDefinition[], telemetry: TelemetryPoint[]): StreamSummary[] {
-  const counts = new Map<string, number>();
-  telemetry.forEach((point) => {
-    counts.set(point.stream, (counts.get(point.stream) ?? 0) + 1);
-  });
-  const streamNames = new Set([...streams.map((stream) => stream.name), ...counts.keys()]);
-  return [...streamNames].map((name) => ({
-    name,
-    rows: formatCount(counts.get(name) ?? 0),
-    p95: "local query",
-    retention: name === SYSTEM_STREAM ? "90d" : "180d",
-  }));
-}
-
-function toActionSummaries(actions: Action[], devices: Device[]): ActionSummary[] {
-  const devicesById = new Map(devices.map((device) => [device.id, device.name]));
-  return actions.slice(0, 6).map((action) => {
-    const state = humanizeEnum(action.state);
-    const target =
-      action.device_ids.length === 1
-        ? devicesById.get(action.device_ids[0]) ?? action.device_ids[0]
-        : `${action.device_ids.length} devices`;
-    return {
-      id: action.id,
-      name: action.name,
-      target,
-      progress: action.progress,
-      state,
-    };
-  });
-}
-
-function toAlertSummaries(alerts: AlertRule[], devices: Device[]): AlertSummary[] {
-  const offlineCount = devices.filter((device) => normalizeDeviceStatus(device.status) === "offline").length;
-  return alerts.map((alert) => {
-    const expression = isRecord(alert.expression) ? alert.expression : null;
-    const kind = humanizeEnum(alert.kind);
-    const state = kind === "offline" && offlineCount > 0 ? "firing" : "quiet";
-    return {
-      id: alert.id,
-      name: alert.name,
-      kind,
-      state,
-      target: getString(expression, "stream") ?? getString(expression, "window") ?? "project scope",
-    };
-  });
 }
 
 function downloadJsonFile(filename: string, value: unknown) {
@@ -469,7 +367,7 @@ function makeSampleTelemetry(sequence: number) {
   };
 }
 
-export function ConsoleApp() {
+export function ConsoleRuntimeProvider({ children }: { children: ReactNode }) {
   const [theme, setTheme] = useState<ThemeMode>(() => {
     if (typeof window === "undefined") {
       return "dark";
@@ -486,6 +384,9 @@ export function ConsoleApp() {
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
   const [orgs, setOrgs] = useState<Org[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
+  const [projectFeatures, setProjectFeatures] = useState<ProjectFeature[]>([]);
+  const [remoteShellSessions, setRemoteShellSessions] = useState<RemoteShellSession[]>([]);
+  const [activeRemoteShell, setActiveRemoteShell] = useState<RemoteShellTerminalSession | null>(null);
   const [apiKeys, setApiKeys] = useState<ApiKey[]>([]);
   const [apiKeyError, setApiKeyError] = useState<string | null>(null);
   const [createdApiKey, setCreatedApiKey] = useState<ApiKey | null>(null);
@@ -496,40 +397,9 @@ export function ConsoleApp() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const [activeSection, setActiveSection] = useState<NavSectionId>("fleet");
   const initializedSessionKey = useRef<string | null>(null);
   const workspaceSessionKey = session && workspace ? `${session.userId}:${session.expiresAt}:${workspace.org.id}:${workspace.project.id}` : null;
   const workspaceSessionKeyRef = useRef<string | null>(null);
-  const sectionRefs = useRef<Record<NavSectionId, HTMLElement | null>>({
-    fleet: null,
-    streams: null,
-    actions: null,
-    firmware: null,
-    security: null,
-    organization: null,
-    projects: null,
-    permissions: null,
-    audit: null,
-  });
-
-  const setSectionRef = useCallback(
-    (section: NavSectionId) => (node: HTMLElement | null) => {
-      sectionRefs.current[section] = node;
-    },
-    [],
-  );
-
-  const setManagementSectionRef = useCallback(
-    (section: ManagementSectionId) => (node: HTMLElement | null) => {
-      sectionRefs.current[section] = node;
-    },
-    [],
-  );
-
-  const handleNavigate = useCallback((section: NavSectionId) => {
-    setActiveSection(section);
-    sectionRefs.current[section]?.scrollIntoView({ behavior: "smooth", block: "start" });
-  }, []);
 
   useEffect(() => {
     workspaceSessionKeyRef.current = workspaceSessionKey;
@@ -568,17 +438,33 @@ export function ConsoleApp() {
   );
 
   const loadProjectData = useCallback(async (api: Api, orgId: string, projectId: string) => {
-    const [devices, streams, telemetry, actions, firmware, alerts, audit] = await Promise.all([
+    const [
+      devices,
+      streams,
+      telemetry,
+      actions,
+      firmware,
+      firmwareRollouts,
+      alerts,
+      audit,
+      features,
+      shellSessions,
+    ] = await Promise.all([
       api.listDevices(projectId),
       api.listStreams(projectId),
       api.queryTelemetry({ projectId, limit: 200 }),
       api.listActions(projectId),
       api.listFirmware(projectId),
+      api.listFirmwareRollouts(projectId),
       api.listAlerts(projectId),
       api.listAudit(orgId, projectId),
+      api.listProjectFeatures(projectId),
+      api.listRemoteShellSessions(projectId),
     ]);
 
-    setProjectData({ devices, streams, telemetry, actions, firmware, alerts, audit });
+    setProjectData({ devices, streams, telemetry, actions, firmware, firmwareRollouts, alerts, audit });
+    setProjectFeatures(features);
+    setRemoteShellSessions(shellSessions);
     setSelectedDeviceId((current) =>
       current && devices.some((device) => device.id === current) ? current : devices[0]?.id,
     );
@@ -676,6 +562,9 @@ export function ConsoleApp() {
       setWorkspace(null);
       setOrgs([]);
       setProjects([]);
+      setProjectFeatures([]);
+      setRemoteShellSessions([]);
+      setActiveRemoteShell(null);
       setApiKeys([]);
       setApiKeyError(null);
       setCreatedApiKey(null);
@@ -716,6 +605,7 @@ export function ConsoleApp() {
       setWorkspace(nextWorkspace);
       setCreatedApiKey(null);
       setDevAuthConfig(null);
+      setActiveRemoteShell(null);
       await Promise.all([
         refreshWorkspaceManagement(api, nextWorkspace),
         loadProjectData(api, nextWorkspace.org.id, nextWorkspace.project.id),
@@ -728,6 +618,10 @@ export function ConsoleApp() {
   const selectedDevice = useMemo(
     () => projectData.devices.find((device) => device.id === selectedDeviceId),
     [projectData.devices, selectedDeviceId],
+  );
+  const remoteShellEnabled = useMemo(
+    () => projectFeatures.some((feature) => feature.feature === "remote_shell" && feature.enabled),
+    [projectFeatures],
   );
 
   const deviceRows = useMemo(
@@ -763,6 +657,10 @@ export function ConsoleApp() {
     [projectData.streams, projectData.telemetry],
   );
   const actionSummaries = useMemo(
+    () => toActionSummaries(projectData.actions, projectData.devices, 6),
+    [projectData.actions, projectData.devices],
+  );
+  const allActionSummaries = useMemo(
     () => toActionSummaries(projectData.actions, projectData.devices),
     [projectData.actions, projectData.devices],
   );
@@ -770,41 +668,68 @@ export function ConsoleApp() {
     () => toAlertSummaries(projectData.alerts, projectData.devices),
     [projectData.alerts, projectData.devices],
   );
-  const metrics = useMemo<MetricItem[]>(() => {
-    const online = deviceRows.filter((device) => device.status === "online").length;
-    const openActions = projectData.actions.filter((action) => !isTerminalAction(action)).length;
-    const firingAlerts = alertSummaries.filter((alert) => alert.state === "firing").length;
-    return [
+  const dashboardStats = useMemo(
+    () => toDashboardStats(projectData, deviceRows, alertSummaries),
+    [alertSummaries, deviceRows, projectData],
+  );
+  const metrics = useMemo<MetricItem[]>(
+    () => [
       {
         label: "Connected devices",
-        value: `${online}/${deviceRows.length}`,
-        delta: deviceRows.length === 0 ? "no devices" : `${Math.round((online / deviceRows.length) * 100)}% online`,
+        value: `${dashboardStats.onlineDevices}/${dashboardStats.totalDevices}`,
+        delta:
+          dashboardStats.totalDevices === 0 ? "no devices" : `${dashboardStats.onlinePercent}% online`,
         tone: "teal",
         icon: Wifi,
       },
       {
         label: "Telemetry rows",
-        value: formatCount(projectData.telemetry.length),
+        value: formatCount(dashboardStats.telemetryRows),
         delta: `${streamSummaries.length} streams`,
         tone: "signal",
         icon: RadioTower,
       },
       {
         label: "Open actions",
-        value: String(openActions),
-        delta: `${projectData.actions.length} total`,
+        value: String(dashboardStats.openActions),
+        delta: `${dashboardStats.totalActions} total`,
         tone: "amber",
         icon: Zap,
       },
       {
         label: "Alert pressure",
-        value: String(firingAlerts),
-        delta: `${projectData.alerts.length} rules`,
-        tone: firingAlerts > 0 ? "danger" : "teal",
+        value: String(dashboardStats.firingAlerts),
+        delta: `${dashboardStats.totalAlerts} rules`,
+        tone: dashboardStats.firingAlerts > 0 ? "danger" : "teal",
         icon: Bell,
       },
-    ];
-  }, [alertSummaries, deviceRows, projectData.actions, projectData.alerts.length, projectData.telemetry.length, streamSummaries.length]);
+    ],
+    [dashboardStats, streamSummaries.length],
+  );
+
+  const getRemoteShellDisabledReason = useCallback(
+    (deviceId?: string) => {
+      const targetDeviceId = deviceId ?? selectedDeviceId;
+      if (!targetDeviceId) {
+        return "No device selected";
+      }
+      if (!remoteShellEnabled) {
+        return "Remote shell beta is off";
+      }
+      if (busy) {
+        return "Console is busy";
+      }
+      if (
+        remoteShellSessions.some(
+          (session) => session.device_id === targetDeviceId && isActiveRemoteShellSession(session),
+        )
+      ) {
+        return "Active session already exists";
+      }
+      return null;
+    },
+    [busy, remoteShellEnabled, remoteShellSessions, selectedDeviceId],
+  );
 
   const handleAuthenticate = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -1177,6 +1102,121 @@ export function ConsoleApp() {
     });
   }, [projectData.alerts.length, runProjectMutation]);
 
+  const handleToggleRemoteShellFeature = useCallback(
+    (enabled: boolean) => {
+      void runProjectMutation(`Remote shell ${enabled ? "enabled" : "disabled"}`, async (api, activeWorkspace) => {
+        const feature = await api.setRemoteShellFeature(activeWorkspace.project.id, enabled);
+        setProjectFeatures((current) => [
+          feature,
+          ...current.filter((candidate) => candidate.feature !== feature.feature),
+        ]);
+      });
+    },
+    [runProjectMutation],
+  );
+
+  const handleOpenRemoteShell = useCallback(
+    (deviceId?: string) => {
+      if (!session || !workspace) {
+        return;
+      }
+      const targetDeviceId = deviceId ?? selectedDeviceId;
+      const disabledReason = getRemoteShellDisabledReason(targetDeviceId);
+      if (disabledReason) {
+        setError(disabledReason);
+        return;
+      }
+      const targetDevice = projectData.devices.find((device) => device.id === targetDeviceId);
+      if (!targetDevice) {
+        setError("Device not found");
+        return;
+      }
+      if (
+        !window.confirm(
+          `Open a 10 minute remote shell for ${targetDevice.name} (${targetDevice.id})?`,
+        )
+      ) {
+        return;
+      }
+      setBusy(true);
+      setError(null);
+      setNotice(null);
+      void (async () => {
+        try {
+          const api = await getApiForSession(session);
+          const created = await api.createRemoteShellSession({
+            project_id: workspace.project.id,
+            device_id: targetDevice.id,
+            ttl_seconds: 600,
+          });
+          setRemoteShellSessions((current) => [
+            created.session,
+            ...current.filter((candidate) => candidate.id !== created.session.id),
+          ]);
+          setProjectData((current) => ({
+            ...current,
+            actions: [
+              created.action,
+              ...current.actions.filter((candidate) => candidate.id !== created.action.id),
+            ],
+          }));
+          setActiveRemoteShell({
+            session: created.session,
+            websocketUrl: created.operator_websocket_url,
+            deviceName: targetDevice.name,
+            deviceId: targetDevice.id,
+          });
+          await loadProjectData(api, workspace.org.id, workspace.project.id);
+          setNotice("Remote shell session opened");
+        } catch (remoteShellError) {
+          setError(formatError(remoteShellError));
+        } finally {
+          setBusy(false);
+        }
+      })();
+    },
+    [
+      getApiForSession,
+      getRemoteShellDisabledReason,
+      loadProjectData,
+      projectData.devices,
+      selectedDeviceId,
+      session,
+      workspace,
+    ],
+  );
+
+  const handleCloseRemoteShell = useCallback(() => {
+    if (!session || !workspace || !activeRemoteShell) {
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    void (async () => {
+      try {
+        const api = await getApiForSession(session);
+        const closed = await api.closeRemoteShellSession(activeRemoteShell.session.id);
+        setRemoteShellSessions((current) => [
+          closed,
+          ...current.filter((candidate) => candidate.id !== closed.id),
+        ]);
+        setActiveRemoteShell((current) =>
+          current && current.session.id === closed.id ? { ...current, session: closed } : current,
+        );
+        await loadProjectData(api, workspace.org.id, workspace.project.id);
+        setNotice("Remote shell session closed");
+      } catch (remoteShellError) {
+        setError(formatError(remoteShellError));
+      } finally {
+        setBusy(false);
+      }
+    })();
+  }, [activeRemoteShell, getApiForSession, loadProjectData, session, workspace]);
+
+  const handleDismissRemoteShell = useCallback(() => {
+    setActiveRemoteShell(null);
+  }, []);
+
   const handleBootstrapDemo = useCallback(() => {
     void runProjectMutation("Closed-loop demo data created", async (api, activeWorkspace) => {
       await ensureDefaultControlPlane(api, activeWorkspace.project.id);
@@ -1225,256 +1265,158 @@ export function ConsoleApp() {
   }, [runProjectMutation]);
 
   const protocolDevice = selectedDevice ?? projectData.devices[0];
+  const protocolTopics = useMemo<Array<[string, string]>>(() => {
+    if (!protocolDevice || !workspace) {
+      return [];
+    }
+    return [
+      ["telemetry publish", telemetryTopic(workspace.project.id, protocolDevice.id, SYSTEM_STREAM)],
+      ["shadow publish", shadowTopic(workspace.project.id, protocolDevice.id)],
+      ["commands subscribe", commandTopic(workspace.project.id, protocolDevice.id)],
+      ["command status", commandStatusTopic(workspace.project.id, protocolDevice.id)],
+    ];
+  }, [protocolDevice, workspace]);
   const sidebarUserLabel = session?.userId.slice(0, 8) ?? "User";
 
-  if (!session) {
-    return (
-      <main className="grid min-h-screen place-items-center bg-paper px-4 py-10">
-        <form className="w-full max-w-md rounded-md border border-line bg-panel p-5 shadow-panel" onSubmit={handleAuthenticate}>
-          <div className="flex items-start justify-between gap-3">
-            <div className="flex items-center gap-3">
-              <div className="grid h-10 w-10 place-items-center rounded-md bg-brand text-ink">
-                <Boxes className="h-5 w-5" aria-hidden="true" />
-              </div>
-              <div>
-                <h1 className="text-lg font-semibold text-ink">Excalibur Console</h1>
-                <p className="text-sm text-muted">Control plane sign-in</p>
-              </div>
-            </div>
-            <button
-              className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-line bg-elevated text-muted transition hover:bg-line hover:text-ink"
-              type="button"
-              aria-label="Toggle theme"
-              title="Toggle theme"
-              onClick={handleToggleTheme}
-            >
-              <SunMoon className="h-4 w-4" aria-hidden="true" />
-            </button>
-          </div>
-
-          <div className="mt-5 grid grid-cols-2 gap-2 rounded-md bg-rail p-1">
-            <button
-              className={`h-9 rounded-sm text-sm font-medium transition ${authMode === "register" ? "bg-elevated text-ink" : "text-muted hover:text-ink"}`}
-              type="button"
-              onClick={() => setAuthMode("register")}
-            >
-              Register
-            </button>
-            <button
-              className={`h-9 rounded-sm text-sm font-medium transition ${authMode === "login" ? "bg-elevated text-ink" : "text-muted hover:text-ink"}`}
-              type="button"
-              onClick={() => setAuthMode("login")}
-            >
-              Login
-            </button>
-          </div>
-
-          <label className="mt-4 block text-sm font-medium text-muted">
-            API base URL
-            <input
-              className="mt-1 h-10 w-full rounded-md border border-line bg-elevated px-3 text-sm text-ink transition hover:border-faint"
-              value={apiBaseUrl}
-              onChange={(event) => setApiBaseUrl(event.target.value)}
-              type="url"
-            />
-          </label>
-          <label className="mt-3 block text-sm font-medium text-muted">
-            Email
-            <input
-              className="mt-1 h-10 w-full rounded-md border border-line bg-elevated px-3 text-sm text-ink transition hover:border-faint"
-              value={email}
-              onChange={(event) => setEmail(event.target.value)}
-              type="email"
-              required
-            />
-          </label>
-          {authMode === "register" ? (
-            <label className="mt-3 block text-sm font-medium text-muted">
-              Display name
-              <input
-                className="mt-1 h-10 w-full rounded-md border border-line bg-elevated px-3 text-sm text-ink transition hover:border-faint"
-                value={displayName}
-                onChange={(event) => setDisplayName(event.target.value)}
-                type="text"
-              />
-            </label>
-          ) : null}
-          <label className="mt-3 block text-sm font-medium text-muted">
-            Password
-            <input
-              className="mt-1 h-10 w-full rounded-md border border-line bg-elevated px-3 text-sm text-ink transition hover:border-faint"
-              value={password}
-              onChange={(event) => setPassword(event.target.value)}
-              type="password"
-              minLength={12}
-              required
-            />
-          </label>
-
-          {error ? <p className="mt-3 rounded-sm bg-danger/10 px-3 py-2 text-sm text-danger">{error}</p> : null}
-
-          <button
-            className="mt-5 h-10 w-full rounded-md bg-brand text-sm font-semibold text-ink transition hover:bg-brand-hover disabled:cursor-not-allowed disabled:bg-elevated disabled:text-faint"
-            type="submit"
-            disabled={busy}
-          >
-            {busy ? "Working..." : authMode === "register" ? "Create account" : "Sign in"}
-          </button>
-        </form>
-      </main>
-    );
-  }
-
-  return (
-    <main className="min-h-screen bg-paper pb-20 text-ink lg:flex lg:pb-0">
-      <Sidebar
-        activeSection={activeSection}
-        orgName={workspace?.org.name ?? "Loading org"}
-        projectName={workspace?.project.name ?? "Loading project"}
-        userLabel={sidebarUserLabel}
-        onNavigate={handleNavigate}
-        onLogout={handleLogout}
-      />
-      <div className="min-w-0 flex-1">
-        <ProjectHeader
-          orgName={workspace?.org.name ?? "Loading org"}
-          projectName={workspace?.project.name ?? "Loading project"}
-          apiBaseUrl={apiBaseUrl}
-          search={search}
-          busy={busy}
-          onSearch={setSearch}
-          onToggleTheme={handleToggleTheme}
-          onOpenProjects={() => handleNavigate("projects")}
-          onOpenPermissions={() => handleNavigate("permissions")}
-          onRefresh={handleRefresh}
-          onBootstrapDemo={handleBootstrapDemo}
-          onLogout={handleLogout}
-        />
-        <div className="space-y-5 px-4 py-5 md:px-6">
-          {error || notice ? (
-            <div
-              className={`rounded-md border px-4 py-3 text-sm ${
-                error ? "border-danger/25 bg-danger/10 text-danger" : "border-success/25 bg-success/10 text-success"
-              }`}
-            >
-              {error ?? notice}
-            </div>
-          ) : null}
-
-          <div id="fleet" ref={setSectionRef("fleet")} className="scroll-mt-5">
-            <MetricStrip metrics={metrics} />
-          </div>
-
-          <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_360px]">
-            <div className="min-w-0 space-y-5">
-              <div id="streams" ref={setSectionRef("streams")} className="scroll-mt-5">
-                <TelemetryPanel
-                  values={telemetryValues}
-                  streams={streamSummaries}
-                  rowRateLabel={`${formatCount(projectData.telemetry.length)} rows`}
-                  selectedDeviceName={selectedDeviceRow?.name}
-                  busy={busy}
-                  onIngestSample={() => handleIngestSample()}
-                />
-              </div>
-              <DeviceTable
-                data={filteredDeviceRows}
-                selectedDeviceId={selectedDeviceId}
-                busy={busy}
-                onCreateDevice={handleCreateDevice}
-                onSelectDevice={setSelectedDeviceId}
-                onDownloadDevAuth={handleDownloadDevAuth}
-                onIngestSample={handleIngestSample}
-              />
-              <div id="firmware" ref={setSectionRef("firmware")} className="scroll-mt-5">
-                <DeviceAgentPanel
-                  device={selectedDeviceRow}
-                  projectId={workspace?.project.id}
-                  devAuthConfig={devAuthConfig}
-                  busy={busy}
-                  onDownloadDevAuth={() => handleDownloadDevAuth()}
-                  onIngestSample={() => handleIngestSample()}
-                  onCreateDiagnostics={handleCreateDiagnostics}
-                  onCreateOta={handleCreateOta}
-                />
-              </div>
-            </div>
-
-            <aside className="min-w-0 space-y-5">
-              <div id="actions" ref={setSectionRef("actions")} className="scroll-mt-5">
-                <ActionQueuePanel
-                  actions={actionSummaries}
-                  busy={busy}
-                  canRunDeviceAction={Boolean(selectedDeviceId)}
-                  onCreateDiagnostics={handleCreateDiagnostics}
-                  onCreateOta={handleCreateOta}
-                  onCompleteLatest={handleCompleteLatest}
-                />
-              </div>
-              <AlertPanel rules={alertSummaries} busy={busy} onCreateDefault={handleCreateDefaultAlert} />
-              <div id="security" ref={setSectionRef("security")} className="scroll-mt-5 space-y-5">
-                <section className="panel-in rounded-md border border-line bg-rail p-4 text-ink">
-                  <h2 className="text-base font-semibold">Protocol</h2>
-                  <div className="mt-3 space-y-3 text-xs text-muted">
-                    {protocolDevice && workspace ? (
-                      [
-                        ["telemetry publish", telemetryTopic(workspace.project.id, protocolDevice.id, SYSTEM_STREAM)],
-                        ["shadow publish", shadowTopic(workspace.project.id, protocolDevice.id)],
-                        ["commands subscribe", commandTopic(workspace.project.id, protocolDevice.id)],
-                        ["command status", commandStatusTopic(workspace.project.id, protocolDevice.id)],
-                      ].map(([label, topic]) => (
-                        <div key={label}>
-                          <p className="mb-1 text-faint">{label}</p>
-                          <code className="block break-all rounded-sm bg-elevated p-2 text-ink">{topic}</code>
-                        </div>
-                      ))
-                    ) : (
-                      <p className="text-muted">No device selected.</p>
-                    )}
-                  </div>
-                </section>
-                <section className="panel-in rounded-md border border-line bg-panel">
-                  <div className="border-b border-line px-4 py-3">
-                    <h2 className="text-base font-semibold text-ink">Audit</h2>
-                    <p className="text-sm text-muted">Recent scoped control-plane writes.</p>
-                  </div>
-                  <div className="divide-y divide-line">
-                    {projectData.audit.slice(0, 6).map((entry) => (
-                      <article key={entry.id} className="px-4 py-3">
-                        <p className="truncate text-sm font-medium text-ink">{entry.action}</p>
-                        <p className="truncate text-xs text-faint">{entry.resource}</p>
-                      </article>
-                    ))}
-                    {projectData.audit.length === 0 ? (
-                      <div className="px-4 py-6 text-center text-sm text-muted">No audit entries yet.</div>
-                    ) : null}
-                  </div>
-                </section>
-              </div>
-            </aside>
-          </div>
-          {workspace ? (
-            <WorkspaceManagement
-              currentOrg={workspace.org}
-              currentProject={workspace.project}
-              orgs={orgs}
-              projects={projects}
-              apiKeys={apiKeys}
-              apiKeyError={apiKeyError}
-              audit={projectData.audit}
-              createdApiKey={createdApiKey}
-              busy={busy}
-              setSectionRef={setManagementSectionRef}
-              onCreateOrg={handleCreateOrg}
-              onSelectOrg={handleSelectOrg}
-              onCreateProject={handleCreateProject}
-              onSelectProject={handleSelectProject}
-              onCreateApiKey={handleCreateApiKey}
-              onRevokeApiKey={handleRevokeApiKey}
-            />
-          ) : null}
-        </div>
-      </div>
-    </main>
+  const value = useMemo<ConsoleRuntimeValue>(
+    () => ({
+      theme,
+      apiBaseUrl,
+      authMode,
+      email,
+      password,
+      displayName,
+      session,
+      workspace,
+      orgs,
+      projects,
+      projectFeatures,
+      remoteShellSessions,
+      remoteShellEnabled,
+      activeRemoteShell,
+      apiKeys,
+      apiKeyError,
+      createdApiKey,
+      projectData,
+      selectedDeviceId,
+      selectedDeviceRow,
+      deviceRows,
+      filteredDeviceRows,
+      telemetryValues,
+      streamSummaries,
+      actionSummaries,
+      allActionSummaries,
+      alertSummaries,
+      dashboardStats,
+      metrics,
+      devAuthConfig,
+      search,
+      busy,
+      error,
+      notice,
+      protocolDeviceName: protocolDevice?.name,
+      protocolTopics,
+      sidebarUserLabel,
+      setApiBaseUrl,
+      setAuthMode,
+      setEmail,
+      setPassword,
+      setDisplayName,
+      setSearch,
+      setSelectedDeviceId,
+      getRemoteShellDisabledReason,
+      handleAuthenticate,
+      handleToggleTheme,
+      handleLogout,
+      handleRefresh,
+      handleBootstrapDemo,
+      handleCreateOrg,
+      handleSelectOrg,
+      handleCreateProject,
+      handleSelectProject,
+      handleCreateApiKey,
+      handleRevokeApiKey,
+      handleCreateDevice,
+      handleDownloadDevAuth,
+      handleIngestSample,
+      handleCreateDiagnostics,
+      handleCreateOta,
+      handleToggleRemoteShellFeature,
+      handleOpenRemoteShell,
+      handleCloseRemoteShell,
+      handleDismissRemoteShell,
+      handleCompleteLatest,
+      handleCreateDefaultAlert,
+    }),
+    [
+      actionSummaries,
+      allActionSummaries,
+      alertSummaries,
+      activeRemoteShell,
+      apiBaseUrl,
+      apiKeyError,
+      apiKeys,
+      authMode,
+      busy,
+      createdApiKey,
+      dashboardStats,
+      devAuthConfig,
+      deviceRows,
+      displayName,
+      email,
+      error,
+      filteredDeviceRows,
+      getRemoteShellDisabledReason,
+      handleBootstrapDemo,
+      handleCompleteLatest,
+      handleCreateApiKey,
+      handleCreateDefaultAlert,
+      handleCreateDevice,
+      handleCreateDiagnostics,
+      handleCreateOta,
+      handleCreateOrg,
+      handleDownloadDevAuth,
+      handleCloseRemoteShell,
+      handleDismissRemoteShell,
+      handleOpenRemoteShell,
+      handleToggleRemoteShellFeature,
+      handleIngestSample,
+      handleLogout,
+      handleRefresh,
+      handleRevokeApiKey,
+      handleSelectOrg,
+      handleSelectProject,
+      handleToggleTheme,
+      metrics,
+      notice,
+      orgs,
+      password,
+      projectFeatures,
+      projectData,
+      projects,
+      protocolDevice?.name,
+      protocolTopics,
+      search,
+      selectedDeviceId,
+      selectedDeviceRow,
+      session,
+      sidebarUserLabel,
+      remoteShellEnabled,
+      remoteShellSessions,
+      streamSummaries,
+      telemetryValues,
+      theme,
+      workspace,
+    ],
   );
+
+  return <ConsoleRuntimeContext.Provider value={value}>{children}</ConsoleRuntimeContext.Provider>;
+}
+
+export function useConsoleRuntime() {
+  const runtime = useContext(ConsoleRuntimeContext);
+  if (!runtime) {
+    throw new Error("useConsoleRuntime must be used within ConsoleRuntimeProvider");
+  }
+  return runtime;
 }

@@ -6,11 +6,13 @@ edition = "2024"
 
 [dependencies]
 bytes = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
 flume = { workspace = true }
 rumqttc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_with = "3.3.0"
+tailscale-localapi = "0.6.0"
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
@@ -51,6 +53,7 @@ replace_with = "0.1.7"
 futures-util = { workspace = true }
 hex = "0.4"
 human_bytes = "0.4"
+portable-pty = "0.8"
 reqwest = { version = "0.11", default-features = false, features = [
     "stream",
     "rustls-tls",
@@ -62,6 +65,10 @@ sysinfo = { git = "https://github.com/bytebeamio/sysinfo", rev = "fe6ee39f08123f
 lazy_static = "1.4.0"
 # installer
 tar = "0.4"
+tokio-tungstenite = { version = "0.26", default-features = false, features = [
+    "connect",
+    "rustls-tls-webpki-roots",
+] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 time = "0.3"

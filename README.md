@@ -92,7 +92,7 @@ cd device-agent
 RUSTUP_TOOLCHAIN=stable cargo test --workspace
 ```
 
-The device agent accepts auth JSON with `broker`, `port`, `project_id`, `device_id`, and nested `authentication` containing CA certificate, device certificate, and either inline `device_private_key` or `device_private_key_path`. Production provisioning should use `/api/v1/devices/{device_id}/provision/csr`; `/api/v1/devices/{device_id}/provision/dev-auth` is for local development and batch experiments only.
+The device agent accepts auth JSON with `project_id`, `device_id`, optional static `broker`/`port` fallback, and nested `authentication` containing CA certificate, device certificate, and either inline `device_private_key` or `device_private_key_path`. By default it can discover the Excalibur server through the local Tailscale daemon when the server node is tagged `tag:excalibur-server`. Production provisioning should use `/api/v1/devices/{device_id}/provision/csr`; `/api/v1/devices/{device_id}/provision/dev-auth` is for local development and batch experiments only.
 
 Infrastructure:
 

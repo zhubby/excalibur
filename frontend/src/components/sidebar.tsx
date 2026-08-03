@@ -2,21 +2,26 @@
 
 import { useEffect, useRef, useState } from "react";
 import { Boxes, ChevronUp, LogOut, UserCircle } from "lucide-react";
-import { managementNavItems, navItems, type NavSectionId } from "@/lib/data";
+import Link from "next/link";
+import { usePathname } from "next/navigation";
+import { managementNavItems, navItems } from "@/lib/data";
 
 type SidebarProps = {
-  activeSection: NavSectionId;
   orgName: string;
   projectName: string;
   userLabel: string;
-  onNavigate: (section: NavSectionId) => void;
   onLogout: () => void;
 };
 
-export function Sidebar({ activeSection, orgName, projectName, userLabel, onNavigate, onLogout }: SidebarProps) {
+function isActiveHref(pathname: string, href: string) {
+  return href === "/" ? pathname === "/" : pathname === href || pathname.startsWith(`${href}/`);
+}
+
+export function Sidebar({ orgName, projectName, userLabel, onLogout }: SidebarProps) {
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement | null>(null);
-  const managementActive = managementNavItems.some((item) => item.id === activeSection);
+  const pathname = usePathname();
+  const managementActive = managementNavItems.some((item) => isActiveHref(pathname, item.href));
 
   useEffect(() => {
     if (!menuOpen) {
@@ -40,16 +45,11 @@ export function Sidebar({ activeSection, orgName, projectName, userLabel, onNavi
     };
   }, [menuOpen]);
 
-  const navigateFromMenu = (section: NavSectionId) => {
-    onNavigate(section);
-    setMenuOpen(false);
-  };
-
   return (
     <>
       <aside className="hidden h-screen w-64 shrink-0 bg-rail text-ink shadow-rail lg:sticky lg:top-0 lg:flex lg:flex-col">
         <div className="border-b border-line/70 px-5 py-5">
-          <div className="flex items-center gap-3">
+          <Link className="flex items-center gap-3 rounded-md transition hover:text-ink" href="/">
             <div className="grid h-9 w-9 place-items-center rounded-md bg-brand text-ink">
               <Boxes className="h-5 w-5" aria-hidden="true" />
             </div>
@@ -57,23 +57,22 @@ export function Sidebar({ activeSection, orgName, projectName, userLabel, onNavi
               <p className="text-sm font-semibold leading-5">Excalibur</p>
               <p className="text-xs text-muted">IoT control plane</p>
             </div>
-          </div>
+          </Link>
         </div>
 
         <nav className="flex-1 space-y-1 px-3 py-4" aria-label="Main navigation">
           {navItems.map((item) => (
-            <button
+            <Link
               key={item.id}
               className={`flex w-full items-center gap-3 rounded-md px-3 py-2.5 text-left text-sm transition ${
-                activeSection === item.id ? "bg-brand text-ink" : "text-muted hover:bg-elevated hover:text-ink"
+                isActiveHref(pathname, item.href) ? "bg-brand text-ink" : "text-muted hover:bg-elevated hover:text-ink"
               }`}
-              type="button"
-              aria-current={activeSection === item.id ? "page" : undefined}
-              onClick={() => onNavigate(item.id)}
+              href={item.href}
+              aria-current={isActiveHref(pathname, item.href) ? "page" : undefined}
             >
               <item.icon className="h-4 w-4" aria-hidden="true" />
               <span>{item.label}</span>
-            </button>
+            </Link>
           ))}
         </nav>
 
@@ -106,18 +105,18 @@ export function Sidebar({ activeSection, orgName, projectName, userLabel, onNavi
               </div>
               <div className="p-1">
                 {managementNavItems.map((item) => (
-                  <button
+                  <Link
                     key={item.id}
                     className={`flex w-full items-center gap-3 rounded-sm px-3 py-2.5 text-left text-sm transition ${
-                      activeSection === item.id ? "bg-brand text-ink" : "text-muted hover:bg-elevated hover:text-ink"
+                      isActiveHref(pathname, item.href) ? "bg-brand text-ink" : "text-muted hover:bg-elevated hover:text-ink"
                     }`}
-                    type="button"
-                    aria-current={activeSection === item.id ? "page" : undefined}
-                    onClick={() => navigateFromMenu(item.id)}
+                    href={item.href}
+                    aria-current={isActiveHref(pathname, item.href) ? "page" : undefined}
+                    onClick={() => setMenuOpen(false)}
                   >
                     <item.icon className="h-4 w-4" aria-hidden="true" />
                     <span>{item.label}</span>
-                  </button>
+                  </Link>
                 ))}
               </div>
               <div className="border-t border-line p-1">
@@ -139,23 +138,24 @@ export function Sidebar({ activeSection, orgName, projectName, userLabel, onNavi
       </aside>
 
       <nav
-        className="fixed inset-x-3 bottom-3 z-40 grid grid-cols-5 rounded-md border border-line bg-rail p-1 text-ink shadow-lg lg:hidden"
+        className="fixed inset-x-3 bottom-3 z-40 overflow-x-auto rounded-md border border-line bg-rail p-1 text-ink shadow-lg lg:hidden"
         aria-label="Mobile navigation"
       >
-        {navItems.map((item) => (
-          <button
-            key={item.id}
-            className={`flex min-h-12 flex-col items-center justify-center gap-1 rounded-sm px-1 text-[11px] transition ${
-              activeSection === item.id ? "bg-brand text-ink" : "text-muted hover:bg-elevated hover:text-ink"
-            }`}
-            type="button"
-            aria-current={activeSection === item.id ? "page" : undefined}
-            onClick={() => onNavigate(item.id)}
-          >
-            <item.icon className="h-4 w-4" aria-hidden="true" />
-            <span className="truncate">{item.label}</span>
-          </button>
-        ))}
+        <div className="flex min-w-max gap-1">
+          {navItems.map((item) => (
+            <Link
+              key={item.id}
+              className={`flex min-h-12 w-20 flex-col items-center justify-center gap-1 rounded-sm px-1 text-[11px] transition ${
+                isActiveHref(pathname, item.href) ? "bg-brand text-ink" : "text-muted hover:bg-elevated hover:text-ink"
+              }`}
+              href={item.href}
+              aria-current={isActiveHref(pathname, item.href) ? "page" : undefined}
+            >
+              <item.icon className="h-4 w-4" aria-hidden="true" />
+              <span className="truncate">{item.label}</span>
+            </Link>
+          ))}
+        </div>
       </nav>
     </>
   );

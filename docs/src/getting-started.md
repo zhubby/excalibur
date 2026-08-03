@@ -130,7 +130,7 @@ RUSTUP_TOOLCHAIN=stable cargo fmt --all
 RUSTUP_TOOLCHAIN=stable cargo test --workspace
 ```
 
-最小运行形态需要 auth JSON：
+本地开发最小运行形态可以继续使用静态 MQTT broker：
 
 ```json
 {
@@ -145,6 +145,30 @@ RUSTUP_TOOLCHAIN=stable cargo test --workspace
   }
 }
 ```
+
+生产设备默认启用 Tailscale 上游发现，可以省略 `broker` 和 `port`。Excalibur server 节点需要在同一 tailnet 中带 `tag:excalibur-server`，agent 会通过本机 `tailscaled` LocalAPI 查找该节点，并在 `/ready` 和 MQTT TCP 探测都通过后连接它的 Tailscale IPv4 地址：
+
+```json
+{
+  "project_id": "018f4c5c-9b4d-7cc2-a62a-44590f671001",
+  "device_id": "018f4c5c-9b4d-7cc2-a62a-44590f671101",
+  "certificate_fingerprint_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "authentication": {
+    "ca_certificate": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----",
+    "device_certificate": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----",
+    "device_private_key_path": "/etc/excalibur/device.key"
+  }
+}
+```
+
+mTLS auth 存在时 discovery 默认连接 MQTT `8883`；没有 mTLS auth 时默认连接 `1883`。如果需要旧行为，可在 agent TOML 中设置：
+
+```toml
+[upstream_discovery]
+enabled = false
+```
+
+此时 auth JSON 中的 `broker` 和 `port` 仍然必填。若 discovery 启用但没有找到可用 tagged peer，agent 会在 auth JSON 包含 `broker`/`port` 时 fallback 到静态 broker。
 
 生产路径应由设备本地生成私钥和 CSR，再调用 API 签发证书。开发和批量实验可以使用 dev auth JSON，但该路径会返回 inline private key，不应进入生产 fleet。
 

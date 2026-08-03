@@ -1,4 +1,5 @@
 import type { Metadata, Viewport } from "next";
+import { ConsoleChrome } from "@/components/console-shell";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -31,7 +32,7 @@ export default function RootLayout({
     <html lang="en" data-theme="dark" suppressHydrationWarning>
       <body>
         <script dangerouslySetInnerHTML={{ __html: themeScript }} />
-        {children}
+        <ConsoleChrome>{children}</ConsoleChrome>
       </body>
     </html>
   );

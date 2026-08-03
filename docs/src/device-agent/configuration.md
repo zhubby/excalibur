@@ -2,15 +2,15 @@
 
 `device-agent` 使用两个配置文件：
 
-- auth JSON：设备身份、broker、证书。
-- TOML config：stream、MQTT client、collector、downloader、console、remote shell 等运行配置。
+- auth JSON：设备身份、可选 broker fallback、证书。
+- TOML config：stream、MQTT client、上游发现、collector、downloader、console、remote shell 等运行配置。
 
 ## Auth JSON 字段
 
 | 字段 | 必需 | 说明 |
 | --- | --- | --- |
-| `broker` | 是 | MQTT broker host。 |
-| `port` | 是 | MQTT TLS 端口，通常是 `8883`。 |
+| `broker` | discovery 关闭时必需 | MQTT broker host。启用上游发现时可省略，或作为 discovery 失败后的 fallback。 |
+| `port` | discovery 关闭时必需 | MQTT port。启用上游发现时可省略，或作为 discovery 失败后的 fallback。 |
 | `project_id` | 是 | Excalibur project ID。 |
 | `device_id` | 是 | Excalibur device ID。 |
 | `authentication.ca_certificate` | 建议 | Broker CA PEM。 |
@@ -19,6 +19,8 @@
 | `authentication.device_private_key_path` | 生产推荐 | 本地 private key path。 |
 
 如果同时存在 inline key 和 key path，agent 当前优先使用 inline key，然后回退到 path。
+
+默认启用 Tailscale 上游发现时，auth JSON 可以只包含 `project_id`、`device_id` 和证书字段。若 `[upstream_discovery] enabled = false`，`broker` 和 `port` 会恢复为必填字段，agent 使用静态地址，不访问 Tailscale LocalAPI。
 
 ## 默认配置重点
 
@@ -50,6 +52,32 @@ network_timeout = 30
 - `max_packet_size` 与服务端 broker limit 对齐。
 - `max_inflight` 根据网络质量和 broker backpressure 调整。
 - `keep_alive` 保持在能及时发现断线但不过度 ping 的范围。
+
+## Tailscale 上游发现
+
+默认配置：
+
+```toml
+[upstream_discovery]
+enabled = true
+server_tag = "tag:excalibur-server"
+api_ready_port = 8080
+mqtt_plaintext_port = 1883
+mqtt_tls_port = 8883
+probe_timeout_ms = 2000
+# socket_path = "/var/run/tailscale/tailscaled.sock"
+```
+
+启用后，agent 启动时会通过 `tailscale-localapi` 读取本机 `tailscaled` status，要求 Tailscale backend state 为 `Running`，并在同一 tailnet 中查找在线、非本机、带 `tag:excalibur-server` 的 peer。生产 tailnet 必须把 Excalibur server 节点标记为该 tag；不使用 hostname 匹配或端口扫描。
+
+候选 peer 必须同时通过：
+
+- `GET http://<tailscale-ip>:8080/ready`
+- MQTT TCP connect
+
+agent 优先使用 Tailscale IPv4 地址作为内存中的 broker host。存在 mTLS auth 时默认探测 MQTT `8883`，否则探测 `1883`。mTLS 部署需要确保 broker server certificate 覆盖该 Tailscale IPv4 SAN，或在部署设计中明确提供匹配的 TLS server name；否则 discovery 可通过 TCP 探测但实际 TLS 连接会失败。如果发现失败但 auth JSON 同时包含 `broker` 和 `port`，agent 会记录 fallback 并按旧静态配置连接；如果没有 fallback，则启动失败并输出明确错误。若多个 tagged peer 同时通过探测，v1 会启动失败，避免非确定性路由，即使 auth JSON 提供了静态 fallback 也不会吞掉该歧义。
+
+`socket_path` 可指定本机 tailscaled Unix socket。未配置时依次尝试 `/var/run/tailscale/tailscaled.sock` 和 `/run/tailscale/tailscaled.sock`。
 
 ## Streams
 

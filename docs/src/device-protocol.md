@@ -140,7 +140,7 @@ Command 是单个 JSON object：
 }
 ```
 
-`device-agent` 当前反序列化需要 `broker`、`port`、`project_id`、`device_id` 和可选 `authentication`。后端 `DeviceAgentAuthConfig` 还会返回 `certificate_id`、`certificate_fingerprint_sha256`、`certificate_not_after`、`provisioning_mode` 与 `production`，用于区分 CSR 生产路径和 dev-generated keypair 路径。rumqttd peer-cert hook 完成前，agent 会在该字段存在时把 `certificate_fingerprint_sha256` 设置为 MQTT username。
+`device-agent` 当前输入解析需要 `project_id`、`device_id` 和可选 `authentication`。默认启用 Tailscale 上游发现时，agent 侧 auth JSON 可以省略 `broker` 和 `port`；关闭 discovery 时它们仍然必填，并且启用 discovery 但发现失败时也可作为 fallback。当前后端 provisioning API 和 OpenAPI schema 仍会返回静态 `broker`/`port` fallback 字段，便于旧 agent 兼容和 discovery 失败回退。后端 `DeviceAgentAuthConfig` 还会返回 `certificate_id`、`certificate_fingerprint_sha256`、`certificate_not_after`、`provisioning_mode` 与 `production`，用于区分 CSR 生产路径和 dev-generated keypair 路径。rumqttd peer-cert hook 完成前，agent 会在该字段存在时把 `certificate_fingerprint_sha256` 设置为 MQTT username。
 
 ## 协议测试位置
 

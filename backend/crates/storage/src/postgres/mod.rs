@@ -8,8 +8,8 @@ use excalibur_domain::{
     Action, ActionDispatchTarget, ActionState, ActionStatusUpdate, ActionTargetStatusChange,
     ActionTargetTransition, AlertEvent, AlertEventState, AlertRule, ApiKey, AuditLog, Dashboard,
     Device, DeviceCertificate, DiagnosticsSession, FirmwareArtifact, FirmwareRollout, Id,
-    Membership, Org, Project, Role, StreamDefinition, TelemetryAggregateBucket, TelemetryPoint,
-    User, UserSession,
+    Membership, Org, Project, ProjectFeature, RemoteShellSession, RemoteShellSessionState, Role,
+    StreamDefinition, TelemetryAggregateBucket, TelemetryPoint, User, UserSession,
 };
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, QueryBuilder, Row, postgres::PgPoolOptions};
@@ -28,8 +28,9 @@ use crate::{
             certificate_status_to_db, device_status_to_db, diagnostics_session_state_to_db,
             firmware_rollout_state_to_db, map_action_row, map_alert, map_alert_event, map_api_key,
             map_audit, map_certificate, map_dashboard, map_device, map_diagnostics_session,
-            map_firmware, map_firmware_rollout, map_membership, map_org, map_project, map_stream,
-            map_telemetry, map_user, map_user_session, role_from_db, role_to_db,
+            map_firmware, map_firmware_rollout, map_membership, map_org, map_project,
+            map_project_feature, map_remote_shell_session, map_stream, map_telemetry, map_user,
+            map_user_session, remote_shell_session_state_to_db, role_from_db, role_to_db,
         },
     },
     telemetry::{TelemetryDedupeKey, telemetry_dedupe_key},
@@ -80,6 +81,8 @@ impl PgStore {
                 to_regclass('public.alert_events') IS NOT NULL AS alert_events,
                 to_regclass('public.diagnostics_sessions') IS NOT NULL AS diagnostics_sessions,
                 to_regclass('public.firmware_rollouts') IS NOT NULL AS firmware_rollouts,
+                to_regclass('public.project_features') IS NOT NULL AS project_features,
+                to_regclass('public.remote_shell_sessions') IS NOT NULL AS remote_shell_sessions,
                 to_regclass('public.audit_logs') IS NOT NULL AS audit_logs,
                 to_regclass('public.users_email_lower_unique_idx') IS NOT NULL AS users_email_lower_unique_idx,
                 to_regclass('public.telemetry_points_project_device_stream_ts_idx') IS NOT NULL AS telemetry_index,
@@ -87,6 +90,9 @@ impl PgStore {
                 to_regclass('public.alert_events_open_dedupe_idx') IS NOT NULL AS alert_events_open_dedupe_idx,
                 to_regclass('public.diagnostics_sessions_project_state_idx') IS NOT NULL AS diagnostics_sessions_project_state_idx,
                 to_regclass('public.firmware_rollouts_project_state_idx') IS NOT NULL AS firmware_rollouts_project_state_idx,
+                to_regclass('public.project_features_project_enabled_idx') IS NOT NULL AS project_features_project_enabled_idx,
+                to_regclass('public.remote_shell_sessions_project_state_idx') IS NOT NULL AS remote_shell_sessions_project_state_idx,
+                to_regclass('public.remote_shell_sessions_one_active_device_idx') IS NOT NULL AS remote_shell_sessions_one_active_device_idx,
                 EXISTS (
                     SELECT 1
                     FROM information_schema.columns
@@ -164,6 +170,8 @@ impl PgStore {
                 "alert_events",
                 "diagnostics_sessions",
                 "firmware_rollouts",
+                "project_features",
+                "remote_shell_sessions",
                 "audit_logs",
                 "users_email_lower_unique_idx",
                 "telemetry_index",
@@ -171,6 +179,9 @@ impl PgStore {
                 "alert_events_open_dedupe_idx",
                 "diagnostics_sessions_project_state_idx",
                 "firmware_rollouts_project_state_idx",
+                "project_features_project_enabled_idx",
+                "remote_shell_sessions_project_state_idx",
+                "remote_shell_sessions_one_active_device_idx",
                 "firmware_content_type",
                 "firmware_signature",
                 "firmware_uploaded_at",
@@ -712,6 +723,73 @@ impl PgStore {
         } else {
             Err(StoreError::TenantScope)
         }
+    }
+
+    pub async fn list_project_features(&self, project_id: Id) -> StoreResult<Vec<ProjectFeature>> {
+        self.ensure_project_exists(project_id).await?;
+        let rows = sqlx::query(
+            "SELECT project_id, feature, enabled, updated_by, created_at, updated_at
+             FROM project_features
+             WHERE project_id = $1
+             ORDER BY feature",
+        )
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "project feature"))?;
+        rows.iter().map(map_project_feature).collect()
+    }
+
+    pub async fn get_project_feature(
+        &self,
+        project_id: Id,
+        feature: &str,
+    ) -> StoreResult<Option<ProjectFeature>> {
+        self.ensure_project_exists(project_id).await?;
+        let row = sqlx::query(
+            "SELECT project_id, feature, enabled, updated_by, created_at, updated_at
+             FROM project_features
+             WHERE project_id = $1 AND feature = $2",
+        )
+        .bind(project_id)
+        .bind(feature)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "project feature"))?;
+        row.as_ref().map(map_project_feature).transpose()
+    }
+
+    pub async fn set_project_feature(
+        &self,
+        project_id: Id,
+        feature: &str,
+        enabled: bool,
+        updated_by: Option<Id>,
+        ts: DateTime<Utc>,
+    ) -> StoreResult<ProjectFeature> {
+        self.ensure_project_exists(project_id).await?;
+        if feature.trim().is_empty() {
+            return Err(StoreError::Conflict("project feature"));
+        }
+        let row = sqlx::query(
+            "INSERT INTO project_features
+                (project_id, feature, enabled, updated_by, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $5)
+             ON CONFLICT (project_id, feature) DO UPDATE
+                SET enabled = EXCLUDED.enabled,
+                    updated_by = EXCLUDED.updated_by,
+                    updated_at = EXCLUDED.updated_at
+             RETURNING project_id, feature, enabled, updated_by, created_at, updated_at",
+        )
+        .bind(project_id)
+        .bind(feature)
+        .bind(enabled)
+        .bind(updated_by)
+        .bind(ts)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "project feature"))?;
+        map_project_feature(&row)
     }
 
     pub async fn create_device(&self, device: Device) -> StoreResult<Device> {
@@ -1633,6 +1711,257 @@ impl PgStore {
             .await
             .map_err(|error| map_sqlx_error(error, "action target"))?;
         Ok(changes)
+    }
+
+    pub async fn create_remote_shell_session(
+        &self,
+        session: RemoteShellSession,
+    ) -> StoreResult<RemoteShellSession> {
+        self.ensure_project_exists(session.project_id).await?;
+        self.get_device(session.project_id, session.device_id)
+            .await?;
+        sqlx::query(
+            "UPDATE remote_shell_sessions
+             SET state = 'expired',
+                 closed_at = expires_at,
+                 close_reason = COALESCE(close_reason, 'remote shell session expired'),
+                 last_activity_at = expires_at
+             WHERE project_id = $1
+               AND device_id = $2
+               AND state IN ('opening', 'active')
+               AND closed_at IS NULL
+               AND expires_at <= $3",
+        )
+        .bind(session.project_id)
+        .bind(session.device_id)
+        .bind(Utc::now())
+        .execute(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "remote shell session"))?;
+        let row = sqlx::query(
+            "INSERT INTO remote_shell_sessions
+                (id, project_id, device_id, action_id, state, operator_token_hash, device_token_hash,
+                 expires_at, opened_by, opened_at, closed_at, close_reason, bytes_from_operator,
+                 bytes_from_device, last_activity_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+             RETURNING id, project_id, device_id, action_id, state, operator_token_hash,
+                       device_token_hash, expires_at, opened_by, opened_at, closed_at,
+                       close_reason, bytes_from_operator, bytes_from_device, last_activity_at",
+        )
+        .bind(session.id)
+        .bind(session.project_id)
+        .bind(session.device_id)
+        .bind(session.action_id)
+        .bind(remote_shell_session_state_to_db(&session.state))
+        .bind(&session.operator_token_hash)
+        .bind(&session.device_token_hash)
+        .bind(session.expires_at)
+        .bind(session.opened_by)
+        .bind(session.opened_at)
+        .bind(session.closed_at)
+        .bind(&session.close_reason)
+        .bind(session.bytes_from_operator)
+        .bind(session.bytes_from_device)
+        .bind(session.last_activity_at)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "remote shell session"))?;
+        map_remote_shell_session(&row)
+    }
+
+    pub async fn attach_remote_shell_action(
+        &self,
+        project_id: Id,
+        session_id: Id,
+        action_id: Id,
+    ) -> StoreResult<RemoteShellSession> {
+        let row = sqlx::query(
+            "UPDATE remote_shell_sessions
+             SET action_id = $3,
+                 last_activity_at = now()
+             WHERE project_id = $1 AND id = $2
+             RETURNING id, project_id, device_id, action_id, state, operator_token_hash,
+                       device_token_hash, expires_at, opened_by, opened_at, closed_at,
+                       close_reason, bytes_from_operator, bytes_from_device, last_activity_at",
+        )
+        .bind(project_id)
+        .bind(session_id)
+        .bind(action_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "remote shell session"))?
+        .ok_or(StoreError::NotFound("remote shell session"))?;
+        map_remote_shell_session(&row)
+    }
+
+    pub async fn get_remote_shell_session(
+        &self,
+        session_id: Id,
+    ) -> StoreResult<RemoteShellSession> {
+        let row = sqlx::query(
+            "SELECT id, project_id, device_id, action_id, state, operator_token_hash,
+                    device_token_hash, expires_at, opened_by, opened_at, closed_at,
+                    close_reason, bytes_from_operator, bytes_from_device, last_activity_at
+             FROM remote_shell_sessions
+             WHERE id = $1",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "remote shell session"))?
+        .ok_or(StoreError::NotFound("remote shell session"))?;
+        map_remote_shell_session(&row)
+    }
+
+    pub async fn list_remote_shell_sessions(
+        &self,
+        project_id: Id,
+    ) -> StoreResult<Vec<RemoteShellSession>> {
+        self.ensure_project_exists(project_id).await?;
+        let rows = sqlx::query(
+            "SELECT id, project_id, device_id, action_id, state, operator_token_hash,
+                    device_token_hash, expires_at, opened_by, opened_at, closed_at,
+                    close_reason, bytes_from_operator, bytes_from_device, last_activity_at
+             FROM remote_shell_sessions
+             WHERE project_id = $1
+             ORDER BY opened_at DESC, id",
+        )
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "remote shell session"))?;
+        rows.iter().map(map_remote_shell_session).collect()
+    }
+
+    pub async fn find_active_remote_shell_session_for_device(
+        &self,
+        project_id: Id,
+        device_id: Id,
+        now: DateTime<Utc>,
+    ) -> StoreResult<Option<RemoteShellSession>> {
+        self.get_device(project_id, device_id).await?;
+        let row = sqlx::query(
+            "SELECT id, project_id, device_id, action_id, state, operator_token_hash,
+                    device_token_hash, expires_at, opened_by, opened_at, closed_at,
+                    close_reason, bytes_from_operator, bytes_from_device, last_activity_at
+             FROM remote_shell_sessions
+             WHERE project_id = $1
+               AND device_id = $2
+               AND state IN ('opening', 'active')
+               AND closed_at IS NULL
+               AND expires_at > $3
+             ORDER BY opened_at DESC, id
+             LIMIT 1",
+        )
+        .bind(project_id)
+        .bind(device_id)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "remote shell session"))?;
+        row.as_ref().map(map_remote_shell_session).transpose()
+    }
+
+    pub async fn count_active_remote_shell_sessions(
+        &self,
+        project_id: Id,
+        now: DateTime<Utc>,
+    ) -> StoreResult<i64> {
+        self.ensure_project_exists(project_id).await?;
+        let row = sqlx::query(
+            "SELECT COUNT(*)::BIGINT AS count
+             FROM remote_shell_sessions
+             WHERE project_id = $1
+               AND state IN ('opening', 'active')
+               AND closed_at IS NULL
+               AND expires_at > $2",
+        )
+        .bind(project_id)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "remote shell session"))?;
+        row.try_get("count").map_err(map_decode_error)
+    }
+
+    pub async fn mark_remote_shell_session_active(
+        &self,
+        session_id: Id,
+        ts: DateTime<Utc>,
+    ) -> StoreResult<RemoteShellSession> {
+        let row = sqlx::query(
+            "UPDATE remote_shell_sessions
+             SET state = 'active',
+                 last_activity_at = $2
+             WHERE id = $1 AND closed_at IS NULL
+             RETURNING id, project_id, device_id, action_id, state, operator_token_hash,
+                       device_token_hash, expires_at, opened_by, opened_at, closed_at,
+                       close_reason, bytes_from_operator, bytes_from_device, last_activity_at",
+        )
+        .bind(session_id)
+        .bind(ts)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "remote shell session"))?
+        .ok_or(StoreError::NotFound("remote shell session"))?;
+        map_remote_shell_session(&row)
+    }
+
+    pub async fn record_remote_shell_session_bytes(
+        &self,
+        session_id: Id,
+        bytes_from_operator: i64,
+        bytes_from_device: i64,
+        ts: DateTime<Utc>,
+    ) -> StoreResult<RemoteShellSession> {
+        let row = sqlx::query(
+            "UPDATE remote_shell_sessions
+             SET bytes_from_operator = bytes_from_operator + $2,
+                 bytes_from_device = bytes_from_device + $3,
+                 last_activity_at = $4
+             WHERE id = $1
+             RETURNING id, project_id, device_id, action_id, state, operator_token_hash,
+                       device_token_hash, expires_at, opened_by, opened_at, closed_at,
+                       close_reason, bytes_from_operator, bytes_from_device, last_activity_at",
+        )
+        .bind(session_id)
+        .bind(bytes_from_operator.max(0))
+        .bind(bytes_from_device.max(0))
+        .bind(ts)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "remote shell session"))?
+        .ok_or(StoreError::NotFound("remote shell session"))?;
+        map_remote_shell_session(&row)
+    }
+
+    pub async fn close_remote_shell_session(
+        &self,
+        session_id: Id,
+        state: RemoteShellSessionState,
+        reason: &str,
+        ts: DateTime<Utc>,
+    ) -> StoreResult<RemoteShellSession> {
+        let row = sqlx::query(
+            "UPDATE remote_shell_sessions
+             SET state = CASE WHEN closed_at IS NULL THEN $2 ELSE state END,
+                 closed_at = COALESCE(closed_at, $4),
+                 close_reason = COALESCE(close_reason, $3),
+                 last_activity_at = $4
+             WHERE id = $1
+             RETURNING id, project_id, device_id, action_id, state, operator_token_hash,
+                       device_token_hash, expires_at, opened_by, opened_at, closed_at,
+                       close_reason, bytes_from_operator, bytes_from_device, last_activity_at",
+        )
+        .bind(session_id)
+        .bind(remote_shell_session_state_to_db(&state))
+        .bind(reason)
+        .bind(ts)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "remote shell session"))?
+        .ok_or(StoreError::NotFound("remote shell session"))?;
+        map_remote_shell_session(&row)
     }
 
     pub async fn create_firmware(
