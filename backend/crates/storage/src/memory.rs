@@ -8,8 +8,8 @@ use excalibur_domain::{
     Action, ActionDispatchTarget, ActionState, ActionStatusUpdate, ActionTargetStatusChange,
     ActionTargetTransition, AlertEvent, AlertEventState, AlertRule, ApiKey, AuditLog,
     CertificateStatus, Dashboard, Device, DeviceCertificate, DeviceStatus, DiagnosticsSession,
-    FirmwareArtifact, FirmwareRollout, Id, Membership, Org, Project, Role, StreamDefinition,
-    TelemetryAggregateBucket, TelemetryPoint, User, UserSession,
+    FirmwareArtifact, FirmwareRollout, Id, Membership, MembershipWithUser, Org, Project, Role,
+    StreamDefinition, TelemetryAggregateBucket, TelemetryPoint, User, UserSession,
 };
 use serde_json::Value;
 use tokio::sync::RwLock;
@@ -133,6 +133,29 @@ impl MemoryStore {
             .get(id)
             .cloned()
             .ok_or(StoreError::NotFound("user"))
+    }
+
+    pub async fn get_user(&self, user_id: Id) -> StoreResult<User> {
+        let state = self.state.read().await;
+        state
+            .users
+            .get(&user_id)
+            .cloned()
+            .ok_or(StoreError::NotFound("user"))
+    }
+
+    pub async fn update_user_display_name(
+        &self,
+        user_id: Id,
+        display_name: String,
+    ) -> StoreResult<User> {
+        let mut state = self.state.write().await;
+        let user = state
+            .users
+            .get_mut(&user_id)
+            .ok_or(StoreError::NotFound("user"))?;
+        user.display_name = display_name;
+        Ok(user.clone())
     }
 
     pub async fn create_session(&self, session: UserSession) -> StoreResult<UserSession> {
@@ -333,6 +356,9 @@ impl MemoryStore {
 
     pub async fn create_org(&self, org: Org, owner_id: Id) -> StoreResult<Org> {
         let mut state = self.state.write().await;
+        if !state.users.contains_key(&owner_id) {
+            return Err(StoreError::NotFound("user"));
+        }
         if state
             .orgs
             .values()
@@ -364,6 +390,102 @@ impl MemoryStore {
         Ok(membership)
     }
 
+    pub async fn list_memberships(&self, org_id: Id) -> StoreResult<Vec<MembershipWithUser>> {
+        let state = self.state.read().await;
+        if !state.orgs.contains_key(&org_id) {
+            return Err(StoreError::NotFound("org"));
+        }
+        let mut memberships = Vec::new();
+        for membership in state
+            .memberships
+            .iter()
+            .filter(|membership| membership.org_id == org_id)
+        {
+            let user = state
+                .users
+                .get(&membership.user_id)
+                .ok_or(StoreError::NotFound("user"))?;
+            memberships.push(MembershipWithUser {
+                membership: membership.clone(),
+                email: user.email.clone(),
+                display_name: user.display_name.clone(),
+                email_verified: user.email_verified,
+            });
+        }
+        memberships.sort_by(|left, right| {
+            right
+                .membership
+                .created_at
+                .cmp(&left.membership.created_at)
+                .then_with(|| left.email.cmp(&right.email))
+        });
+        Ok(memberships)
+    }
+
+    pub async fn update_membership_role(
+        &self,
+        org_id: Id,
+        membership_id: Id,
+        expected_current_role: Role,
+        role: Role,
+    ) -> StoreResult<Membership> {
+        let mut state = self.state.write().await;
+        if !state.orgs.contains_key(&org_id) {
+            return Err(StoreError::NotFound("org"));
+        }
+        let index = state
+            .memberships
+            .iter()
+            .position(|membership| membership.org_id == org_id && membership.id == membership_id)
+            .ok_or(StoreError::NotFound("membership"))?;
+        if state.memberships[index].role != expected_current_role {
+            return Err(StoreError::Conflict("membership role changed"));
+        }
+        if state.memberships[index].role == Role::Owner && role != Role::Owner {
+            let owner_count = state
+                .memberships
+                .iter()
+                .filter(|membership| membership.org_id == org_id && membership.role == Role::Owner)
+                .count();
+            if owner_count <= 1 {
+                return Err(StoreError::Conflict("last owner"));
+            }
+        }
+        state.memberships[index].role = role;
+        Ok(state.memberships[index].clone())
+    }
+
+    pub async fn remove_membership(
+        &self,
+        org_id: Id,
+        membership_id: Id,
+        expected_current_role: Role,
+    ) -> StoreResult<Membership> {
+        let mut state = self.state.write().await;
+        if !state.orgs.contains_key(&org_id) {
+            return Err(StoreError::NotFound("org"));
+        }
+        let index = state
+            .memberships
+            .iter()
+            .position(|membership| membership.org_id == org_id && membership.id == membership_id)
+            .ok_or(StoreError::NotFound("membership"))?;
+        if state.memberships[index].role != expected_current_role {
+            return Err(StoreError::Conflict("membership role changed"));
+        }
+        if state.memberships[index].role == Role::Owner {
+            let owner_count = state
+                .memberships
+                .iter()
+                .filter(|membership| membership.org_id == org_id && membership.role == Role::Owner)
+                .count();
+            if owner_count <= 1 {
+                return Err(StoreError::Conflict("last owner"));
+            }
+        }
+        Ok(state.memberships.remove(index))
+    }
+
     pub async fn list_orgs_for_user(&self, user_id: Id) -> Vec<Org> {
         let state = self.state.read().await;
         state
@@ -382,6 +504,38 @@ impl MemoryStore {
             .iter()
             .find(|membership| membership.org_id == org_id && membership.user_id == user_id)
             .map(|membership| membership.role)
+    }
+
+    pub async fn update_org(
+        &self,
+        org_id: Id,
+        name: Option<String>,
+        slug: Option<String>,
+    ) -> StoreResult<Org> {
+        let mut state = self.state.write().await;
+        if !state.orgs.contains_key(&org_id) {
+            return Err(StoreError::NotFound("org"));
+        }
+        if let Some(slug) = &slug {
+            if state
+                .orgs
+                .values()
+                .any(|existing| existing.id != org_id && existing.slug == *slug)
+            {
+                return Err(StoreError::Conflict("org"));
+            }
+        }
+        let org = state
+            .orgs
+            .get_mut(&org_id)
+            .ok_or(StoreError::NotFound("org"))?;
+        if let Some(name) = name {
+            org.name = name;
+        }
+        if let Some(slug) = slug {
+            org.slug = slug;
+        }
+        Ok(org.clone())
     }
 
     pub async fn create_project(&self, project: Project) -> StoreResult<Project> {
@@ -417,6 +571,40 @@ impl MemoryStore {
             .get(&project_id)
             .cloned()
             .ok_or(StoreError::NotFound("project"))
+    }
+
+    pub async fn update_project(
+        &self,
+        project_id: Id,
+        name: Option<String>,
+        slug: Option<String>,
+    ) -> StoreResult<Project> {
+        let mut state = self.state.write().await;
+        let current = state
+            .projects
+            .get(&project_id)
+            .cloned()
+            .ok_or(StoreError::NotFound("project"))?;
+        if let Some(slug) = &slug {
+            if state.projects.values().any(|existing| {
+                existing.id != project_id
+                    && existing.org_id == current.org_id
+                    && existing.slug == *slug
+            }) {
+                return Err(StoreError::Conflict("project"));
+            }
+        }
+        let project = state
+            .projects
+            .get_mut(&project_id)
+            .ok_or(StoreError::NotFound("project"))?;
+        if let Some(name) = name {
+            project.name = name;
+        }
+        if let Some(slug) = slug {
+            project.slug = slug;
+        }
+        Ok(project.clone())
     }
 
     pub async fn get_project_for_user(&self, project_id: Id, user_id: Id) -> StoreResult<Project> {

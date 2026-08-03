@@ -9,7 +9,11 @@ import { MetricStrip } from "@/components/metric-strip";
 import { ProjectHeader } from "@/components/project-header";
 import { Sidebar } from "@/components/sidebar";
 import { TelemetryPanel } from "@/components/telemetry-panel";
-import { WorkspaceManagement, type ApiKeyCreateInput } from "@/components/workspace-management";
+import {
+  WorkspaceManagement,
+  type ApiKeyCreateInput,
+  type MembershipCreateInput,
+} from "@/components/workspace-management";
 import {
   ExcaliburApiError,
   createExcaliburApi,
@@ -18,10 +22,13 @@ import {
   type ApiKey,
   type AuditLog,
   type AuthResponse,
+  type CurrentUser,
   type Device,
   type DeviceConfig,
   type FirmwareArtifact,
   type JsonValue,
+  type MemberRole,
+  type Membership,
   type Org,
   type Project,
   type StreamDefinition,
@@ -37,8 +44,9 @@ import type {
   NavSectionId,
   StreamSummary,
 } from "@/lib/data";
+import { managementNavItems } from "@/lib/data";
 import { commandStatusTopic, commandTopic, shadowTopic, telemetryTopic } from "@/lib/protocol";
-import { getApiKeyScopePreset, slugifyWorkspaceName } from "@/lib/workspace-management";
+import { canEditProject, getApiKeyScopePreset, slugifyWorkspaceName } from "@/lib/workspace-management";
 
 type Session = {
   expiresAt: string;
@@ -49,6 +57,11 @@ type Session = {
 type ThemeMode = "dark" | "light";
 
 type Workspace = {
+  org: Org;
+  project: Project | null;
+};
+
+type ProjectWorkspace = {
   org: Org;
   project: Project;
 };
@@ -360,6 +373,21 @@ async function ensureProject(api: Api, org: Org) {
   return retry[0];
 }
 
+async function getInitialProject(api: Api, org: Org, role: MemberRole | null) {
+  const existing = await api.listProjects(org.id);
+  if (existing[0]) {
+    return existing[0];
+  }
+  if (!canEditProject(role)) {
+    return null;
+  }
+  return ensureProject(api, org);
+}
+
+function isManagementSection(section: NavSectionId): section is ManagementSectionId {
+  return managementNavItems.some((item) => item.id === section);
+}
+
 async function ensureDefaultControlPlane(api: Api, projectId: string) {
   const [streams, alerts, dashboards] = await Promise.all([
     api.listStreams(projectId),
@@ -484,8 +512,12 @@ export function ConsoleApp() {
   const [displayName, setDisplayName] = useState("");
   const [session, setSession] = useState<Session | null>(null);
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
+  const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
+  const [currentOrgRole, setCurrentOrgRole] = useState<MemberRole | null>(null);
   const [orgs, setOrgs] = useState<Org[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
+  const [memberships, setMemberships] = useState<Membership[]>([]);
+  const [membershipError, setMembershipError] = useState<string | null>(null);
   const [apiKeys, setApiKeys] = useState<ApiKey[]>([]);
   const [apiKeyError, setApiKeyError] = useState<string | null>(null);
   const [createdApiKey, setCreatedApiKey] = useState<ApiKey | null>(null);
@@ -498,7 +530,10 @@ export function ConsoleApp() {
   const [notice, setNotice] = useState<string | null>(null);
   const [activeSection, setActiveSection] = useState<NavSectionId>("fleet");
   const initializedSessionKey = useRef<string | null>(null);
-  const workspaceSessionKey = session && workspace ? `${session.userId}:${session.expiresAt}:${workspace.org.id}:${workspace.project.id}` : null;
+  const workspaceSessionKey =
+    session && workspace
+      ? `${session.userId}:${session.expiresAt}:${workspace.org.id}:${workspace.project?.id ?? "org-only"}`
+      : null;
   const workspaceSessionKeyRef = useRef<string | null>(null);
   const sectionRefs = useRef<Record<NavSectionId, HTMLElement | null>>({
     fleet: null,
@@ -506,9 +541,11 @@ export function ConsoleApp() {
     actions: null,
     firmware: null,
     security: null,
-    organization: null,
+    account: null,
+    organizations: null,
+    members: null,
     projects: null,
-    permissions: null,
+    apiKeys: null,
     audit: null,
   });
 
@@ -530,6 +567,7 @@ export function ConsoleApp() {
     setActiveSection(section);
     sectionRefs.current[section]?.scrollIntoView({ behavior: "smooth", block: "start" });
   }, []);
+  const activeManagementView = isManagementSection(activeSection) ? activeSection : "account";
 
   useEffect(() => {
     workspaceSessionKeyRef.current = workspaceSessionKey;
@@ -584,14 +622,42 @@ export function ConsoleApp() {
     );
   }, []);
 
+  const loadOrgOnlyData = useCallback(async (api: Api, orgId: string) => {
+    let audit: AuditLog[] = [];
+    try {
+      audit = await api.listAudit(orgId);
+    } catch {
+      audit = [];
+    }
+    setProjectData({ ...emptyProjectData, audit });
+    setSelectedDeviceId(undefined);
+    setDevAuthConfig(null);
+  }, []);
+
   const refreshWorkspaceManagement = useCallback(async (api: Api, activeWorkspace: Workspace) => {
-    const [nextOrgs, nextProjects] = await Promise.all([
+    const [nextOrgs, nextProjects, nextOrgRole] = await Promise.all([
       api.listOrgs(),
       api.listProjects(activeWorkspace.org.id),
+      api.getOrgRole(activeWorkspace.org.id),
     ]);
     setOrgs(nextOrgs);
     setProjects(nextProjects);
+    setCurrentOrgRole(nextOrgRole.role);
 
+    try {
+      const nextMemberships = await api.listMemberships(activeWorkspace.org.id);
+      setMemberships(nextMemberships);
+      setMembershipError(null);
+    } catch (membershipListError) {
+      setMemberships([]);
+      setMembershipError(formatError(membershipListError));
+    }
+
+    if (!activeWorkspace.project) {
+      setApiKeys([]);
+      setApiKeyError(null);
+      return;
+    }
     try {
       const nextApiKeys = await api.listApiKeys(activeWorkspace.org.id, activeWorkspace.project.id);
       setApiKeys(nextApiKeys);
@@ -602,6 +668,18 @@ export function ConsoleApp() {
     }
   }, []);
 
+  const refreshActiveWorkspace = useCallback(
+    async (api: Api, activeWorkspace: Workspace) => {
+      await Promise.all([
+        refreshWorkspaceManagement(api, activeWorkspace),
+        activeWorkspace.project
+          ? loadProjectData(api, activeWorkspace.org.id, activeWorkspace.project.id)
+          : loadOrgOnlyData(api, activeWorkspace.org.id),
+      ]);
+    },
+    [loadOrgOnlyData, loadProjectData, refreshWorkspaceManagement],
+  );
+
   const initializeWorkspace = useCallback(
     async (activeSession: Session) => {
       setBusy(true);
@@ -609,15 +687,18 @@ export function ConsoleApp() {
       setNotice("Loading workspace");
       try {
         const api = await getApiForSession(activeSession);
+        const user = await api.getMe();
         const org = await ensureOrg(api, activeSession.userId);
-        const project = await ensureProject(api, org);
-        await ensureDefaultControlPlane(api, project.id);
+        const role = await api.getOrgRole(org.id);
+        const project = await getInitialProject(api, org, role.role);
+        if (project && canEditProject(role.role)) {
+          await ensureDefaultControlPlane(api, project.id);
+        }
         const nextWorkspace = { org, project };
+        setCurrentUser(user);
+        setCurrentOrgRole(role.role);
         setWorkspace(nextWorkspace);
-        await Promise.all([
-          refreshWorkspaceManagement(api, nextWorkspace),
-          loadProjectData(api, org.id, project.id),
-        ]);
+        await refreshActiveWorkspace(api, nextWorkspace);
         setNotice("Workspace ready");
         return true;
       } catch (loadError) {
@@ -627,7 +708,7 @@ export function ConsoleApp() {
         setBusy(false);
       }
     },
-    [getApiForSession, loadProjectData, refreshWorkspaceManagement],
+    [getApiForSession, refreshActiveWorkspace],
   );
 
   useEffect(() => {
@@ -674,8 +755,12 @@ export function ConsoleApp() {
     } else {
       initializedSessionKey.current = null;
       setWorkspace(null);
+      setCurrentUser(null);
+      setCurrentOrgRole(null);
       setOrgs([]);
       setProjects([]);
+      setMemberships([]);
+      setMembershipError(null);
       setApiKeys([]);
       setApiKeyError(null);
       setCreatedApiKey(null);
@@ -686,20 +771,22 @@ export function ConsoleApp() {
   }, [apiBaseUrl, initializeWorkspace, session]);
 
   const runProjectMutation = useCallback(
-    async (success: string, work: (api: Api, workspace: Workspace) => Promise<void>) => {
+    async (success: string, work: (api: Api, workspace: ProjectWorkspace) => Promise<void>) => {
       if (!session || !workspace) {
         return;
       }
+      if (!workspace.project) {
+        setError("Select or create a project first");
+        return;
+      }
+      const activeWorkspace = { org: workspace.org, project: workspace.project };
       setBusy(true);
       setError(null);
       setCreatedApiKey(null);
       try {
         const api = await getApiForSession(session);
-        await work(api, workspace);
-        await Promise.all([
-          loadProjectData(api, workspace.org.id, workspace.project.id),
-          refreshWorkspaceManagement(api, workspace),
-        ]);
+        await work(api, activeWorkspace);
+        await refreshActiveWorkspace(api, activeWorkspace);
         setNotice(success);
       } catch (mutationError) {
         setError(formatError(mutationError));
@@ -707,22 +794,21 @@ export function ConsoleApp() {
         setBusy(false);
       }
     },
-    [getApiForSession, loadProjectData, refreshWorkspaceManagement, session, workspace],
+    [getApiForSession, refreshActiveWorkspace, session, workspace],
   );
 
   const activateWorkspace = useCallback(
-    async (api: Api, nextWorkspace: Workspace, success: string) => {
-      await ensureDefaultControlPlane(api, nextWorkspace.project.id);
+    async (api: Api, nextWorkspace: Workspace, success: string, roleForBootstrap: MemberRole | null = currentOrgRole) => {
+      if (nextWorkspace.project && canEditProject(roleForBootstrap)) {
+        await ensureDefaultControlPlane(api, nextWorkspace.project.id);
+      }
       setWorkspace(nextWorkspace);
       setCreatedApiKey(null);
       setDevAuthConfig(null);
-      await Promise.all([
-        refreshWorkspaceManagement(api, nextWorkspace),
-        loadProjectData(api, nextWorkspace.org.id, nextWorkspace.project.id),
-      ]);
+      await refreshActiveWorkspace(api, nextWorkspace);
       setNotice(success);
     },
-    [loadProjectData, refreshWorkspaceManagement],
+    [currentOrgRole, refreshActiveWorkspace],
   );
 
   const selectedDevice = useMemo(
@@ -858,8 +944,53 @@ export function ConsoleApp() {
       void initializeWorkspace(session);
       return;
     }
+    if (session && workspace && !workspace.project) {
+      setBusy(true);
+      setError(null);
+      setCreatedApiKey(null);
+      void (async () => {
+        try {
+          const api = await getApiForSession(session);
+          await refreshActiveWorkspace(api, workspace);
+          setNotice("Refreshed");
+        } catch (refreshError) {
+          setError(formatError(refreshError));
+        } finally {
+          setBusy(false);
+        }
+      })();
+      return;
+    }
     void runProjectMutation("Refreshed", async () => {});
-  }, [initializeWorkspace, runProjectMutation, session, workspace]);
+  }, [getApiForSession, initializeWorkspace, refreshActiveWorkspace, runProjectMutation, session, workspace]);
+
+  const handleUpdateUser = useCallback(
+    (nextDisplayName: string) => {
+      if (!session) {
+        return;
+      }
+      setBusy(true);
+      setError(null);
+      void (async () => {
+        try {
+          const api = await getApiForSession(session);
+          const user = await api.updateMe({ display_name: nextDisplayName });
+          setCurrentUser(user);
+          setMemberships((current) =>
+            current.map((membership) =>
+              membership.user_id === user.id ? { ...membership, display_name: user.display_name } : membership,
+            ),
+          );
+          setNotice("Account updated");
+        } catch (accountError) {
+          setError(formatError(accountError));
+        } finally {
+          setBusy(false);
+        }
+      })();
+    },
+    [getApiForSession, session],
+  );
 
   const handleCreateOrg = useCallback(
     (name: string) => {
@@ -876,8 +1007,10 @@ export function ConsoleApp() {
             name,
             slug: slugifyWorkspaceName(name, "org"),
           });
-          const project = await ensureProject(api, org);
-          await activateWorkspace(api, { org, project }, `Organization ${org.name} created`);
+          const role = await api.getOrgRole(org.id);
+          const project = await getInitialProject(api, org, role.role);
+          setCurrentOrgRole(role.role);
+          await activateWorkspace(api, { org, project }, `Organization ${org.name} created`, role.role);
         } catch (orgError) {
           setError(formatError(orgError));
         } finally {
@@ -903,8 +1036,10 @@ export function ConsoleApp() {
       void (async () => {
         try {
           const api = await getApiForSession(session);
-          const project = await ensureProject(api, org);
-          await activateWorkspace(api, { org, project }, `Switched to ${org.name}`);
+          const role = await api.getOrgRole(org.id);
+          const project = await getInitialProject(api, org, role.role);
+          setCurrentOrgRole(role.role);
+          await activateWorkspace(api, { org, project }, `Switched to ${org.name}`, role.role);
         } catch (orgError) {
           setError(formatError(orgError));
         } finally {
@@ -913,6 +1048,34 @@ export function ConsoleApp() {
       })();
     },
     [activateWorkspace, getApiForSession, orgs, session, workspace?.org.id],
+  );
+
+  const handleUpdateOrg = useCallback(
+    (orgId: string, input: { name: string; slug: string }) => {
+      if (!session || !workspace) {
+        return;
+      }
+      setBusy(true);
+      setError(null);
+      setCreatedApiKey(null);
+      void (async () => {
+        try {
+          const api = await getApiForSession(session);
+          const updatedOrg = await api.updateOrg(orgId, input);
+          const nextWorkspace =
+            workspace.org.id === updatedOrg.id ? { ...workspace, org: updatedOrg } : workspace;
+          setWorkspace(nextWorkspace);
+          setOrgs((current) => current.map((org) => (org.id === updatedOrg.id ? updatedOrg : org)));
+          await refreshActiveWorkspace(api, nextWorkspace);
+          setNotice("Organization updated");
+        } catch (orgError) {
+          setError(formatError(orgError));
+        } finally {
+          setBusy(false);
+        }
+      })();
+    },
+    [getApiForSession, refreshActiveWorkspace, session, workspace],
   );
 
   const handleCreateProject = useCallback(
@@ -944,7 +1107,7 @@ export function ConsoleApp() {
 
   const handleSelectProject = useCallback(
     (projectId: string) => {
-      if (!session || !workspace || workspace.project.id === projectId) {
+      if (!session || !workspace || workspace.project?.id === projectId) {
         return;
       }
       const project = projects.find((candidate) => candidate.id === projectId);
@@ -967,11 +1130,116 @@ export function ConsoleApp() {
     [activateWorkspace, getApiForSession, projects, session, workspace],
   );
 
-  const handleCreateApiKey = useCallback(
-    (input: ApiKeyCreateInput) => {
+  const handleUpdateProject = useCallback(
+    (projectId: string, input: { name: string; slug: string }) => {
       if (!session || !workspace) {
         return;
       }
+      setBusy(true);
+      setError(null);
+      setCreatedApiKey(null);
+      void (async () => {
+        try {
+          const api = await getApiForSession(session);
+          const updatedProject = await api.updateProject(projectId, input);
+          const nextWorkspace =
+            workspace.project?.id === updatedProject.id ? { ...workspace, project: updatedProject } : workspace;
+          setWorkspace(nextWorkspace);
+          setProjects((current) =>
+            current.map((project) => (project.id === updatedProject.id ? updatedProject : project)),
+          );
+          await refreshActiveWorkspace(api, nextWorkspace);
+          setNotice("Project updated");
+        } catch (projectError) {
+          setError(formatError(projectError));
+        } finally {
+          setBusy(false);
+        }
+      })();
+    },
+    [getApiForSession, refreshActiveWorkspace, session, workspace],
+  );
+
+  const handleCreateMembership = useCallback(
+    (input: MembershipCreateInput) => {
+      if (!session || !workspace) {
+        return false;
+      }
+      setBusy(true);
+      setError(null);
+      setCreatedApiKey(null);
+      return (async () => {
+        try {
+          const api = await getApiForSession(session);
+          await api.createMembership(workspace.org.id, input);
+          await refreshActiveWorkspace(api, workspace);
+          setNotice("Member added");
+          return true;
+        } catch (membershipCreateError) {
+          setError(formatError(membershipCreateError));
+          return false;
+        } finally {
+          setBusy(false);
+        }
+      })();
+    },
+    [getApiForSession, refreshActiveWorkspace, session, workspace],
+  );
+
+  const handleUpdateMembershipRole = useCallback(
+    (membershipId: string, role: MemberRole) => {
+      if (!session || !workspace) {
+        return;
+      }
+      setBusy(true);
+      setError(null);
+      setCreatedApiKey(null);
+      void (async () => {
+        try {
+          const api = await getApiForSession(session);
+          await api.updateMembershipRole(workspace.org.id, membershipId, { role });
+          await refreshActiveWorkspace(api, workspace);
+          setNotice("Member role updated");
+        } catch (membershipUpdateError) {
+          setError(formatError(membershipUpdateError));
+        } finally {
+          setBusy(false);
+        }
+      })();
+    },
+    [getApiForSession, refreshActiveWorkspace, session, workspace],
+  );
+
+  const handleRemoveMembership = useCallback(
+    (membershipId: string) => {
+      if (!session || !workspace) {
+        return;
+      }
+      setBusy(true);
+      setError(null);
+      setCreatedApiKey(null);
+      void (async () => {
+        try {
+          const api = await getApiForSession(session);
+          await api.removeMembership(workspace.org.id, membershipId);
+          await refreshActiveWorkspace(api, workspace);
+          setNotice("Member removed");
+        } catch (membershipRemoveError) {
+          setError(formatError(membershipRemoveError));
+        } finally {
+          setBusy(false);
+        }
+      })();
+    },
+    [getApiForSession, refreshActiveWorkspace, session, workspace],
+  );
+
+  const handleCreateApiKey = useCallback(
+    (input: ApiKeyCreateInput) => {
+      if (!session || !workspace?.project) {
+        return;
+      }
+      const activeWorkspace = { org: workspace.org, project: workspace.project };
       setBusy(true);
       setError(null);
       setCreatedApiKey(null);
@@ -985,8 +1253,8 @@ export function ConsoleApp() {
               ? null
               : new Date(Date.now() + input.expiresInDays * 24 * 60 * 60 * 1000).toISOString();
           const created = await api.createApiKey({
-            org_id: workspace.org.id,
-            project_id: workspace.project.id,
+            org_id: activeWorkspace.org.id,
+            project_id: activeWorkspace.project.id,
             name: input.name,
             scopes: [...preset.scopes],
             expires_at: expiresAt,
@@ -994,10 +1262,7 @@ export function ConsoleApp() {
           if (workspaceSessionKeyRef.current !== mutationWorkspaceKey) {
             return;
           }
-          await Promise.all([
-            refreshWorkspaceManagement(api, workspace),
-            loadProjectData(api, workspace.org.id, workspace.project.id),
-          ]);
+          await refreshActiveWorkspace(api, activeWorkspace);
           if (workspaceSessionKeyRef.current !== mutationWorkspaceKey) {
             return;
           }
@@ -1013,17 +1278,18 @@ export function ConsoleApp() {
         }
       })();
     },
-    [getApiForSession, loadProjectData, refreshWorkspaceManagement, session, workspace],
+    [getApiForSession, refreshActiveWorkspace, session, workspace],
   );
 
   const handleRevokeApiKey = useCallback(
     (apiKeyId: string) => {
-      if (!session || !workspace) {
+      if (!session || !workspace?.project) {
         return;
       }
+      const activeWorkspace = { org: workspace.org, project: workspace.project };
       const apiKey = apiKeys.find((candidate) => candidate.id === apiKeyId);
       const label = apiKey?.name ?? apiKeyId;
-      if (!window.confirm(`Revoke API key "${label}" for ${workspace.project.name}?`)) {
+      if (!window.confirm(`Revoke API key "${label}" for ${activeWorkspace.project.name}?`)) {
         return;
       }
       setBusy(true);
@@ -1031,12 +1297,9 @@ export function ConsoleApp() {
       void (async () => {
         try {
           const api = await getApiForSession(session);
-          await api.revokeApiKey(apiKeyId, workspace.org.id);
+          await api.revokeApiKey(apiKeyId, activeWorkspace.org.id);
           setCreatedApiKey(null);
-          await Promise.all([
-            refreshWorkspaceManagement(api, workspace),
-            loadProjectData(api, workspace.org.id, workspace.project.id),
-          ]);
+          await refreshActiveWorkspace(api, activeWorkspace);
           setNotice("API key revoked");
         } catch (apiKeyErrorValue) {
           setError(formatError(apiKeyErrorValue));
@@ -1045,7 +1308,7 @@ export function ConsoleApp() {
         }
       })();
     },
-    [apiKeys, getApiForSession, loadProjectData, refreshWorkspaceManagement, session, workspace],
+    [apiKeys, getApiForSession, refreshActiveWorkspace, session, workspace],
   );
 
   const handleCreateDevice = useCallback(() => {
@@ -1081,7 +1344,7 @@ export function ConsoleApp() {
   const handleIngestSample = useCallback(
     (deviceId?: string) => {
       const targetDevice = projectData.devices.find((device) => device.id === (deviceId ?? selectedDeviceId));
-      if (!targetDevice || !workspace) {
+      if (!targetDevice || !workspace?.project) {
         return;
       }
       void runProjectMutation("Sample telemetry ingested", async (api, activeWorkspace) => {
@@ -1225,7 +1488,9 @@ export function ConsoleApp() {
   }, [runProjectMutation]);
 
   const protocolDevice = selectedDevice ?? projectData.devices[0];
-  const sidebarUserLabel = session?.userId.slice(0, 8) ?? "User";
+  const currentProjectName = workspace ? (workspace.project?.name ?? "No project") : "Loading project";
+  const projectAvailable = Boolean(workspace?.project);
+  const sidebarUserLabel = currentUser?.display_name || currentUser?.email || session?.userId.slice(0, 8) || "User";
 
   if (!session) {
     return (
@@ -1330,7 +1595,7 @@ export function ConsoleApp() {
       <Sidebar
         activeSection={activeSection}
         orgName={workspace?.org.name ?? "Loading org"}
-        projectName={workspace?.project.name ?? "Loading project"}
+        projectName={currentProjectName}
         userLabel={sidebarUserLabel}
         onNavigate={handleNavigate}
         onLogout={handleLogout}
@@ -1338,14 +1603,15 @@ export function ConsoleApp() {
       <div className="min-w-0 flex-1">
         <ProjectHeader
           orgName={workspace?.org.name ?? "Loading org"}
-          projectName={workspace?.project.name ?? "Loading project"}
+          projectName={currentProjectName}
           apiBaseUrl={apiBaseUrl}
           search={search}
           busy={busy}
+          projectReady={projectAvailable}
           onSearch={setSearch}
           onToggleTheme={handleToggleTheme}
           onOpenProjects={() => handleNavigate("projects")}
-          onOpenPermissions={() => handleNavigate("permissions")}
+          onOpenApiKeys={() => handleNavigate("apiKeys")}
           onRefresh={handleRefresh}
           onBootstrapDemo={handleBootstrapDemo}
           onLogout={handleLogout}
@@ -1380,7 +1646,7 @@ export function ConsoleApp() {
               <DeviceTable
                 data={filteredDeviceRows}
                 selectedDeviceId={selectedDeviceId}
-                busy={busy}
+                busy={busy || !projectAvailable}
                 onCreateDevice={handleCreateDevice}
                 onSelectDevice={setSelectedDeviceId}
                 onDownloadDevAuth={handleDownloadDevAuth}
@@ -1389,7 +1655,7 @@ export function ConsoleApp() {
               <div id="firmware" ref={setSectionRef("firmware")} className="scroll-mt-5">
                 <DeviceAgentPanel
                   device={selectedDeviceRow}
-                  projectId={workspace?.project.id}
+                  projectId={workspace?.project?.id}
                   devAuthConfig={devAuthConfig}
                   busy={busy}
                   onDownloadDevAuth={() => handleDownloadDevAuth()}
@@ -1405,18 +1671,18 @@ export function ConsoleApp() {
                 <ActionQueuePanel
                   actions={actionSummaries}
                   busy={busy}
-                  canRunDeviceAction={Boolean(selectedDeviceId)}
+                  canRunDeviceAction={Boolean(selectedDeviceId && projectAvailable)}
                   onCreateDiagnostics={handleCreateDiagnostics}
                   onCreateOta={handleCreateOta}
                   onCompleteLatest={handleCompleteLatest}
                 />
               </div>
-              <AlertPanel rules={alertSummaries} busy={busy} onCreateDefault={handleCreateDefaultAlert} />
+              <AlertPanel rules={alertSummaries} busy={busy || !projectAvailable} onCreateDefault={handleCreateDefaultAlert} />
               <div id="security" ref={setSectionRef("security")} className="scroll-mt-5 space-y-5">
                 <section className="panel-in rounded-md border border-line bg-rail p-4 text-ink">
                   <h2 className="text-base font-semibold">Protocol</h2>
                   <div className="mt-3 space-y-3 text-xs text-muted">
-                    {protocolDevice && workspace ? (
+                    {protocolDevice && workspace?.project ? (
                       [
                         ["telemetry publish", telemetryTopic(workspace.project.id, protocolDevice.id, SYSTEM_STREAM)],
                         ["shadow publish", shadowTopic(workspace.project.id, protocolDevice.id)],
@@ -1455,20 +1721,32 @@ export function ConsoleApp() {
           </div>
           {workspace ? (
             <WorkspaceManagement
+              activeView={activeManagementView}
+              currentUser={currentUser}
+              currentOrgRole={currentOrgRole}
               currentOrg={workspace.org}
               currentProject={workspace.project}
               orgs={orgs}
               projects={projects}
+              memberships={memberships}
+              membershipError={membershipError}
               apiKeys={apiKeys}
               apiKeyError={apiKeyError}
               audit={projectData.audit}
               createdApiKey={createdApiKey}
               busy={busy}
               setSectionRef={setManagementSectionRef}
+              onViewChange={handleNavigate}
+              onUpdateUser={handleUpdateUser}
               onCreateOrg={handleCreateOrg}
               onSelectOrg={handleSelectOrg}
+              onUpdateOrg={handleUpdateOrg}
               onCreateProject={handleCreateProject}
               onSelectProject={handleSelectProject}
+              onUpdateProject={handleUpdateProject}
+              onCreateMembership={handleCreateMembership}
+              onUpdateMembershipRole={handleUpdateMembershipRole}
+              onRemoveMembership={handleRemoveMembership}
               onCreateApiKey={handleCreateApiKey}
               onRevokeApiKey={handleRevokeApiKey}
             />

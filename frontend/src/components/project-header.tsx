@@ -6,10 +6,11 @@ type ProjectHeaderProps = {
   apiBaseUrl: string;
   search: string;
   busy?: boolean;
+  projectReady?: boolean;
   onSearch: (value: string) => void;
   onToggleTheme: () => void;
   onOpenProjects: () => void;
-  onOpenPermissions: () => void;
+  onOpenApiKeys: () => void;
   onRefresh: () => void;
   onBootstrapDemo: () => void;
   onLogout: () => void;
@@ -21,10 +22,11 @@ export function ProjectHeader({
   apiBaseUrl,
   search,
   busy = false,
+  projectReady = true,
   onSearch,
   onToggleTheme,
   onOpenProjects,
-  onOpenPermissions,
+  onOpenApiKeys,
   onRefresh,
   onBootstrapDemo,
   onLogout,
@@ -67,15 +69,15 @@ export function ProjectHeader({
           <button
             className="inline-flex h-10 items-center justify-center gap-2 rounded-md border border-line bg-elevated px-3 text-sm text-muted transition hover:bg-line hover:text-ink"
             type="button"
-            onClick={onOpenPermissions}
+            onClick={onOpenApiKeys}
           >
             <ShieldCheck className="h-4 w-4 text-success" aria-hidden="true" />
-            <span>RBAC</span>
+            <span>API keys</span>
           </button>
           <button
             className="inline-flex h-10 items-center justify-center gap-2 rounded-md bg-brand px-3 text-sm font-medium text-ink transition hover:bg-brand-hover disabled:cursor-not-allowed disabled:bg-elevated disabled:text-faint"
             type="button"
-            disabled={busy}
+            disabled={busy || !projectReady}
             onClick={onBootstrapDemo}
           >
             <PlayCircle className="h-4 w-4" aria-hidden="true" />

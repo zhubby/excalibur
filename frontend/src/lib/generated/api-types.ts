@@ -159,6 +159,11 @@ export type CreateFirmwareRequest = {
   "version": string;
 };
 
+export type CreateMembershipRequest = {
+  "email": string;
+  "role": RoleResponse;
+};
+
 export type CreateOrgRequest = {
   "name": string;
   "slug": string;
@@ -335,11 +340,27 @@ export type LogoutResponse = {
   "status": string;
 };
 
+export type MembershipResponse = {
+  "created_at": DateTime;
+  "display_name": string;
+  "email": string;
+  "email_verified": boolean;
+  "id": Uuid;
+  "org_id": Uuid;
+  "role": RoleResponse;
+  "user_id": Uuid;
+};
+
 export type OrgResponse = {
   "created_at": DateTime;
   "id": string;
   "name": string;
   "slug": string;
+};
+
+export type OrgRoleResponse = {
+  "org_id": Uuid;
+  "role": RoleResponse;
 };
 
 export type ProjectResponse = {
@@ -361,6 +382,8 @@ export type RegisterRequest = {
   "email": string;
   "password": string;
 };
+
+export type RoleResponse = "Owner" | "Admin" | "Operator" | "Viewer";
 
 export type SignedObjectUrl = {
   "expires_at": DateTime;
@@ -413,4 +436,29 @@ export type TelemetryPointResponse = {
   "sequence": number;
   "stream": string;
   "ts": DateTime;
+};
+
+export type UpdateMembershipRoleRequest = {
+  "role": RoleResponse;
+};
+
+export type UpdateOrgRequest = {
+  "name"?: string | null;
+  "slug"?: string | null;
+};
+
+export type UpdateProjectRequest = {
+  "name"?: string | null;
+  "slug"?: string | null;
+};
+
+export type UpdateUserRequest = {
+  "display_name": string;
+};
+
+export type UserResponse = {
+  "display_name": string;
+  "email": string;
+  "email_verified": boolean;
+  "id": Uuid;
 };

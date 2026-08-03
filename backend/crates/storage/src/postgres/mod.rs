@@ -8,8 +8,8 @@ use excalibur_domain::{
     Action, ActionDispatchTarget, ActionState, ActionStatusUpdate, ActionTargetStatusChange,
     ActionTargetTransition, AlertEvent, AlertEventState, AlertRule, ApiKey, AuditLog, Dashboard,
     Device, DeviceCertificate, DiagnosticsSession, FirmwareArtifact, FirmwareRollout, Id,
-    Membership, Org, Project, Role, StreamDefinition, TelemetryAggregateBucket, TelemetryPoint,
-    User, UserSession,
+    Membership, MembershipWithUser, Org, Project, Role, StreamDefinition, TelemetryAggregateBucket,
+    TelemetryPoint, User, UserSession,
 };
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, QueryBuilder, Row, postgres::PgPoolOptions};
@@ -28,8 +28,9 @@ use crate::{
             certificate_status_to_db, device_status_to_db, diagnostics_session_state_to_db,
             firmware_rollout_state_to_db, map_action_row, map_alert, map_alert_event, map_api_key,
             map_audit, map_certificate, map_dashboard, map_device, map_diagnostics_session,
-            map_firmware, map_firmware_rollout, map_membership, map_org, map_project, map_stream,
-            map_telemetry, map_user, map_user_session, role_from_db, role_to_db,
+            map_firmware, map_firmware_rollout, map_membership, map_membership_with_user, map_org,
+            map_project, map_stream, map_telemetry, map_user, map_user_session, role_from_db,
+            role_to_db,
         },
     },
     telemetry::{TelemetryDedupeKey, telemetry_dedupe_key},
@@ -228,6 +229,40 @@ impl PgStore {
              WHERE lower(email) = lower($1)",
         )
         .bind(email)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "user"))?
+        .ok_or(StoreError::NotFound("user"))?;
+        map_user(&row)
+    }
+
+    pub async fn get_user(&self, user_id: Id) -> StoreResult<User> {
+        let row = sqlx::query(
+            "SELECT id, email, display_name, password_hash, email_verified, created_at
+             FROM users
+             WHERE id = $1",
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "user"))?
+        .ok_or(StoreError::NotFound("user"))?;
+        map_user(&row)
+    }
+
+    pub async fn update_user_display_name(
+        &self,
+        user_id: Id,
+        display_name: String,
+    ) -> StoreResult<User> {
+        let row = sqlx::query(
+            "UPDATE users
+             SET display_name = $2
+             WHERE id = $1
+             RETURNING id, email, display_name, password_hash, email_verified, created_at",
+        )
+        .bind(user_id)
+        .bind(display_name)
         .fetch_optional(&self.pool)
         .await
         .map_err(|error| map_sqlx_error(error, "user"))?
@@ -621,6 +656,158 @@ impl PgStore {
         map_membership(&row)
     }
 
+    pub async fn list_memberships(&self, org_id: Id) -> StoreResult<Vec<MembershipWithUser>> {
+        self.ensure_org_exists(org_id).await?;
+        let rows = sqlx::query(
+            "SELECT m.id, m.org_id, m.user_id, m.role::text AS role, m.created_at,
+                    u.email, u.display_name, u.email_verified
+             FROM memberships m
+             JOIN users u ON u.id = m.user_id
+             WHERE m.org_id = $1
+             ORDER BY m.created_at DESC, m.id",
+        )
+        .bind(org_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "membership"))?;
+        rows.iter().map(map_membership_with_user).collect()
+    }
+
+    pub async fn update_membership_role(
+        &self,
+        org_id: Id,
+        membership_id: Id,
+        expected_current_role: Role,
+        role: Role,
+    ) -> StoreResult<Membership> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| map_sqlx_error(error, "membership"))?;
+        sqlx::query("SELECT id FROM orgs WHERE id = $1 FOR UPDATE")
+            .bind(org_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|error| map_sqlx_error(error, "org"))?
+            .ok_or(StoreError::NotFound("org"))?;
+        let current_row = sqlx::query(
+            "SELECT id, org_id, user_id, role::text AS role, created_at
+             FROM memberships
+             WHERE org_id = $1 AND id = $2
+             FOR UPDATE",
+        )
+        .bind(org_id)
+        .bind(membership_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| map_sqlx_error(error, "membership"))?
+        .ok_or(StoreError::NotFound("membership"))?;
+        let current = map_membership(&current_row)?;
+        if current.role != expected_current_role {
+            return Err(StoreError::Conflict("membership role changed"));
+        }
+        if current.role == Role::Owner && role != Role::Owner {
+            let owner_rows = sqlx::query(
+                "SELECT id
+                 FROM memberships
+                 WHERE org_id = $1 AND role = 'owner'::member_role
+                 FOR UPDATE",
+            )
+            .bind(org_id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|error| map_sqlx_error(error, "membership"))?;
+            if owner_rows.len() <= 1 {
+                return Err(StoreError::Conflict("last owner"));
+            }
+        }
+        let row = sqlx::query(
+            "UPDATE memberships
+             SET role = $3::member_role
+             WHERE org_id = $1 AND id = $2
+             RETURNING id, org_id, user_id, role::text AS role, created_at",
+        )
+        .bind(org_id)
+        .bind(membership_id)
+        .bind(role_to_db(role))
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| map_sqlx_error(error, "membership"))?
+        .ok_or(StoreError::NotFound("membership"))?;
+        let membership = map_membership(&row)?;
+        tx.commit()
+            .await
+            .map_err(|error| map_sqlx_error(error, "membership"))?;
+        Ok(membership)
+    }
+
+    pub async fn remove_membership(
+        &self,
+        org_id: Id,
+        membership_id: Id,
+        expected_current_role: Role,
+    ) -> StoreResult<Membership> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| map_sqlx_error(error, "membership"))?;
+        sqlx::query("SELECT id FROM orgs WHERE id = $1 FOR UPDATE")
+            .bind(org_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|error| map_sqlx_error(error, "org"))?
+            .ok_or(StoreError::NotFound("org"))?;
+        let current_row = sqlx::query(
+            "SELECT id, org_id, user_id, role::text AS role, created_at
+             FROM memberships
+             WHERE org_id = $1 AND id = $2
+             FOR UPDATE",
+        )
+        .bind(org_id)
+        .bind(membership_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| map_sqlx_error(error, "membership"))?
+        .ok_or(StoreError::NotFound("membership"))?;
+        let current = map_membership(&current_row)?;
+        if current.role != expected_current_role {
+            return Err(StoreError::Conflict("membership role changed"));
+        }
+        if current.role == Role::Owner {
+            let owner_rows = sqlx::query(
+                "SELECT id
+                 FROM memberships
+                 WHERE org_id = $1 AND role = 'owner'::member_role
+                 FOR UPDATE",
+            )
+            .bind(org_id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|error| map_sqlx_error(error, "membership"))?;
+            if owner_rows.len() <= 1 {
+                return Err(StoreError::Conflict("last owner"));
+            }
+        }
+        let row = sqlx::query(
+            "DELETE FROM memberships
+             WHERE org_id = $1 AND id = $2
+             RETURNING id, org_id, user_id, role::text AS role, created_at",
+        )
+        .bind(org_id)
+        .bind(membership_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| map_sqlx_error(error, "membership"))?
+        .ok_or(StoreError::NotFound("membership"))?;
+        let membership = map_membership(&row)?;
+        tx.commit()
+            .await
+            .map_err(|error| map_sqlx_error(error, "membership"))?;
+        Ok(membership)
+    }
+
     pub async fn list_orgs_for_user(&self, user_id: Id) -> StoreResult<Vec<Org>> {
         let rows = sqlx::query(
             "SELECT o.id, o.name, o.slug, o.created_at
@@ -652,6 +839,29 @@ impl PgStore {
             role_from_db(&role)
         })
         .transpose()
+    }
+
+    pub async fn update_org(
+        &self,
+        org_id: Id,
+        name: Option<String>,
+        slug: Option<String>,
+    ) -> StoreResult<Org> {
+        let row = sqlx::query(
+            "UPDATE orgs
+             SET name = COALESCE($2, name),
+                 slug = COALESCE($3, slug)
+             WHERE id = $1
+             RETURNING id, name, slug, created_at",
+        )
+        .bind(org_id)
+        .bind(name)
+        .bind(slug)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "org"))?
+        .ok_or(StoreError::NotFound("org"))?;
+        map_org(&row)
     }
 
     pub async fn create_project(&self, project: Project) -> StoreResult<Project> {
@@ -694,6 +904,29 @@ impl PgStore {
                 .await
                 .map_err(|error| map_sqlx_error(error, "project"))?
                 .ok_or(StoreError::NotFound("project"))?;
+        map_project(&row)
+    }
+
+    pub async fn update_project(
+        &self,
+        project_id: Id,
+        name: Option<String>,
+        slug: Option<String>,
+    ) -> StoreResult<Project> {
+        let row = sqlx::query(
+            "UPDATE projects
+             SET name = COALESCE($2, name),
+                 slug = COALESCE($3, slug)
+             WHERE id = $1
+             RETURNING id, org_id, name, slug, created_at",
+        )
+        .bind(project_id)
+        .bind(name)
+        .bind(slug)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error(error, "project"))?
+        .ok_or(StoreError::NotFound("project"))?;
         map_project(&row)
     }
 

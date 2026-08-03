@@ -6,6 +6,7 @@ import type {
   ApiKeyResponse,
   AuditLogResponse,
   AuthResponse,
+  CreateMembershipRequest,
   CreateApiKeyRequest,
   ActionStatusRequest,
   ActionTransitionRequest,
@@ -25,20 +26,29 @@ import type {
   JsonValue,
   LoginRequest,
   LogoutResponse,
+  MembershipResponse,
   OrgResponse,
+  OrgRoleResponse,
   ProjectResponse,
   RefreshRequest,
   RegisterRequest,
+  RoleResponse,
   SignedObjectUrl,
   StreamDefinitionResponse,
   StreamFieldDto,
   StreamFieldTypeDto,
   TelemetryAggregateBucketResponse,
   TelemetryPointResponse,
+  UpdateMembershipRoleRequest,
+  UpdateOrgRequest,
+  UpdateProjectRequest,
+  UpdateUserRequest,
+  UserResponse,
 } from "./generated/api-types";
 
 export type {
   AuthResponse,
+  CreateMembershipRequest,
   CreateApiKeyRequest,
   ActionStatusRequest,
   ActionTransitionRequest,
@@ -52,9 +62,15 @@ export type {
   JsonValue,
   LoginRequest,
   LogoutResponse,
+  OrgRoleResponse,
   RefreshRequest,
   RegisterRequest,
+  RoleResponse,
   SignedObjectUrl,
+  UpdateMembershipRoleRequest,
+  UpdateOrgRequest,
+  UpdateProjectRequest,
+  UpdateUserRequest,
 } from "./generated/api-types";
 
 export type Action = ActionResponse;
@@ -70,6 +86,10 @@ export type DiagnosticsSession = DiagnosticsSessionResponse;
 export type DiagnosticsSessionCreate = DiagnosticsSessionCreateResponse;
 export type FirmwareArtifact = FirmwareArtifactResponse;
 export type FirmwareRollout = FirmwareRolloutResponse;
+export type CurrentUser = UserResponse;
+export type MemberRole = RoleResponse;
+export type Membership = MembershipResponse;
+export type OrgRole = OrgRoleResponse;
 export type Org = OrgResponse;
 export type Project = ProjectResponse;
 export type StreamDefinition = StreamDefinitionResponse;
@@ -180,6 +200,9 @@ export function createExcaliburApi(options: ApiClientOptions = {}) {
         ...(body ? { bodyJson: body } : {}),
       }),
     logout: () => request<LogoutResponse>("/api/v1/auth/logout", { method: "POST" }),
+    getMe: () => request<CurrentUser>("/api/v1/me"),
+    updateMe: (body: UpdateUserRequest) =>
+      request<CurrentUser>("/api/v1/me", { method: "PATCH", bodyJson: body }),
     listApiKeys: (orgId: string, projectId?: string) =>
       request<ApiKey[]>("/api/v1/api-keys", {
         query: { org_id: orgId, project_id: projectId },
@@ -194,10 +217,27 @@ export function createExcaliburApi(options: ApiClientOptions = {}) {
     listOrgs: () => request<Org[]>("/api/v1/orgs"),
     createOrg: (body: { name: string; slug: string }) =>
       request<Org>("/api/v1/orgs", { method: "POST", bodyJson: body }),
+    updateOrg: (orgId: string, body: UpdateOrgRequest) =>
+      request<Org>(`/api/v1/orgs/${orgId}`, { method: "PATCH", bodyJson: body }),
+    getOrgRole: (orgId: string) =>
+      request<OrgRole>(`/api/v1/orgs/${orgId}/role`),
+    listMemberships: (orgId: string) =>
+      request<Membership[]>(`/api/v1/orgs/${orgId}/memberships`),
+    createMembership: (orgId: string, body: CreateMembershipRequest) =>
+      request<Membership>(`/api/v1/orgs/${orgId}/memberships`, { method: "POST", bodyJson: body }),
+    updateMembershipRole: (orgId: string, membershipId: string, body: UpdateMembershipRoleRequest) =>
+      request<Membership>(`/api/v1/orgs/${orgId}/memberships/${membershipId}`, {
+        method: "PATCH",
+        bodyJson: body,
+      }),
+    removeMembership: (orgId: string, membershipId: string) =>
+      request<Membership>(`/api/v1/orgs/${orgId}/memberships/${membershipId}`, { method: "DELETE" }),
     listProjects: (orgId: string) =>
       request<Project[]>("/api/v1/projects", { query: { org_id: orgId } }),
     createProject: (body: { org_id: string; name: string; slug: string }) =>
       request<Project>("/api/v1/projects", { method: "POST", bodyJson: body }),
+    updateProject: (projectId: string, body: UpdateProjectRequest) =>
+      request<Project>(`/api/v1/projects/${projectId}`, { method: "PATCH", bodyJson: body }),
     listDevices: (projectId: string) =>
       request<Device[]>("/api/v1/devices", { query: { project_id: projectId } }),
     createDevice: (body: { project_id: string; name: string; metadata: JsonValue }) =>

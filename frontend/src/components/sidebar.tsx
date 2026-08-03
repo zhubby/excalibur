@@ -139,7 +139,7 @@ export function Sidebar({ activeSection, orgName, projectName, userLabel, onNavi
       </aside>
 
       <nav
-        className="fixed inset-x-3 bottom-3 z-40 grid grid-cols-5 rounded-md border border-line bg-rail p-1 text-ink shadow-lg lg:hidden"
+        className="fixed inset-x-3 bottom-3 z-40 grid grid-cols-6 rounded-md border border-line bg-rail p-1 text-ink shadow-lg lg:hidden"
         aria-label="Mobile navigation"
       >
         {navItems.map((item) => (
@@ -156,6 +156,17 @@ export function Sidebar({ activeSection, orgName, projectName, userLabel, onNavi
             <span className="truncate">{item.label}</span>
           </button>
         ))}
+        <button
+          className={`flex min-h-12 flex-col items-center justify-center gap-1 rounded-sm px-1 text-[11px] transition ${
+            managementActive ? "bg-brand text-ink" : "text-muted hover:bg-elevated hover:text-ink"
+          }`}
+          type="button"
+          aria-current={managementActive ? "page" : undefined}
+          onClick={() => onNavigate("account")}
+        >
+          <UserCircle className="h-4 w-4" aria-hidden="true" />
+          <span className="truncate">Manage</span>
+        </button>
       </nav>
     </>
   );
