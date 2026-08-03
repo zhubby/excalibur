@@ -9,9 +9,10 @@ idf_component_register(
         "src/core_sdk/excalibur_stream.c"
         "src/core_sdk/excalibur_ota.c"
         "src/core_sdk/excalibur_log.c"
+    REQUIRES
+        "mqtt"
     PRIV_REQUIRES
         "json"
-        "mqtt"
         "nvs_flash"
         "esp_https_ota"
         "app_update"

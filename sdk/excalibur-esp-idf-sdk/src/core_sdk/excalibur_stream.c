@@ -224,6 +224,10 @@ void excalibur_mqtt_thread_entry(void *pv)
     static int batch_size = 0;
 
     while (1) {
+        if (batch_mqtt_semaphore == NULL) {
+            vTaskDelete(NULL);
+            return;
+        }
         if (batch_mqtt_semaphore != NULL && xSemaphoreTake(batch_mqtt_semaphore, portMAX_DELAY) == pdTRUE) {
             if (batch_size == 0) {
                 memset(batch_json_data, 0, sizeof(batch_json_data));

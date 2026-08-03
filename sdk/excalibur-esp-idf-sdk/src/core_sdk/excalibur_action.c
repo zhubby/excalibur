@@ -102,10 +102,10 @@ int excalibur_handle_command(char *command_received, excalibur_client_t *excalib
             continue;
         }
         if (strcmp(excalibur_client->action_funcs[action_iterator].name, name->valuestring) == 0) {
-            excalibur_client->action_funcs[action_iterator].func(excalibur_client, payload_string, action_id);
+            int handler_ret = excalibur_client->action_funcs[action_iterator].func(excalibur_client, payload_string, action_id);
             free(payload_string);
             cJSON_Delete(root);
-            return 0;
+            return handler_ret == 0 ? 0 : -1;
         }
     }
 

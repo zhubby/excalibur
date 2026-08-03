@@ -26,6 +26,9 @@ static int ota_img_data_len = 0;
 static int ota_update_completed = 0;
 static char ota_action_id_str[EXCALIBUR_ACTION_ID_STR_LEN] = "";
 static excalibur_client_t *ota_client = NULL;
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 0, 0)
+static wl_handle_t fatfs_wl_handle = -1;
+#endif
 
 static const char *TAG = "EXCALIBUR_HAL";
 
@@ -201,11 +204,15 @@ int excalibur_hal_init(excalibur_client_t *excalibur_client)
 
     esp_err_t err = esp_mqtt_client_register_event(excalibur_client->client, ESP_EVENT_ANY_ID, mqtt_event_handler, excalibur_client);
     if (err != ESP_OK) {
+        esp_mqtt_client_destroy(excalibur_client->client);
+        excalibur_client->client = NULL;
         return -1;
     }
 
     err = nvs_flash_init();
     if (err != ESP_OK) {
+        esp_mqtt_client_destroy(excalibur_client->client);
+        excalibur_client->client = NULL;
         return -1;
     }
 
@@ -233,6 +240,9 @@ int excalibur_hal_init(excalibur_client_t *excalibur_client)
 
 int excalibur_hal_destroy(excalibur_client_t *excalibur_client)
 {
+    if (excalibur_client == NULL || excalibur_client->client == NULL) {
+        return 0;
+    }
     return esp_mqtt_client_destroy(excalibur_client->client) == ESP_OK ? 0 : -1;
 }
 
@@ -243,8 +253,12 @@ int excalibur_hal_start_mqtt(excalibur_client_t *excalibur_client)
         return -1;
     }
 
+#if CONFIG_EXCALIBUR_ENABLE_DEFAULT_SHADOW_TASK
     xTaskCreate(excalibur_user_thread_entry, "Excalibur Shadow Thread", 4 * 1024, excalibur_client, 2, NULL);
+#endif
+#if CONFIG_EXCALIBUR_ENABLE_MQTT_BATCH_TASK
     xTaskCreate(excalibur_mqtt_thread_entry, "Excalibur MQTT Batch Thread", 8 * 1024, NULL, 2, NULL);
+#endif
     return 0;
 }
 
@@ -259,7 +273,7 @@ int excalibur_hal_spiffs_mount(void)
         .base_path = "/spiffs",
         .partition_label = NULL,
         .max_files = 5,
-        .format_if_mount_failed = true
+        .format_if_mount_failed = false
     };
     return esp_vfs_spiffs_register(&conf) == ESP_OK ? 0 : -1;
 }
@@ -276,12 +290,25 @@ int excalibur_hal_fatfs_mount(void)
         .format_if_mount_failed = false,
         .allocation_unit_size = CONFIG_WL_SECTOR_SIZE
     };
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
     return esp_vfs_fat_spiflash_mount_ro("/spiflash", "storage", &conf) == ESP_OK ? 0 : -1;
+#else
+    return esp_vfs_fat_spiflash_mount("/spiflash", "storage", &conf, &fatfs_wl_handle) == ESP_OK ? 0 : -1;
+#endif
 }
 
 int excalibur_hal_fatfs_unmount(void)
 {
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
     return esp_vfs_fat_spiflash_unmount_ro("/spiflash", "storage") == ESP_OK ? 0 : -1;
+#else
+    if (fatfs_wl_handle < 0) {
+        return -1;
+    }
+    esp_err_t err = esp_vfs_fat_spiflash_unmount("/spiflash", fatfs_wl_handle);
+    fatfs_wl_handle = -1;
+    return err == ESP_OK ? 0 : -1;
+#endif
 }
 
 unsigned long long excalibur_hal_get_epoch_millis(void)

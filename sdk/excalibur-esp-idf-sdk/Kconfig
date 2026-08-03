@@ -27,6 +27,10 @@ menu "Excalibur"
         config EXCALIBUR_SHADOW_PUSH_INTERVAL
             int "Shadow push interval in seconds"
             default 40
+
+        config EXCALIBUR_ENABLE_DEFAULT_SHADOW_TASK
+            bool "Start default SDK shadow task"
+            default y
     endmenu
 
     menu "Device Provisioning"
@@ -93,4 +97,8 @@ menu "Excalibur"
     config EXCALIBUR_MQTT_BATCH_ELEMENT_SIZE
         int "MQTT batch element size in bytes"
         default 250
+
+    config EXCALIBUR_ENABLE_MQTT_BATCH_TASK
+        bool "Start MQTT batch task"
+        default y
 endmenu
